@@ -331,8 +331,8 @@ pub fn execute_with_lind(
             // shared table. GOT entries are patched through the shared LindGOT.
             lind_log!(DYLINK, "library {} instantiate", name);
             let mut got_guard = lind_got.lock().unwrap();
-            let force_interposed = preload_modes.get(path.as_str())
-                == Some(&crate::cli::PreloadMode::Interposed);
+            let force_interposed =
+                preload_modes.get(path.as_str()) == Some(&crate::cli::PreloadMode::Interposed);
             lib_linker
                 .module_with_preload(
                     &mut wstore,

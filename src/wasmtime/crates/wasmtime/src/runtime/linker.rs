@@ -67,18 +67,18 @@ fn is_lind_runtime_glue(name: &str) -> bool {
     matches!(
         name,
         "__libc_setup_tls"
-        | "__wasi_init_tp"
-        | "__ctype_init"
-        | "__lind_init_addr_translation"
-        | "copy_data_between_cages"
-        | "copy_handler_table_to_cage"
-        | "make_threei_call"
-        | "register_handler"
-        | "saveSetjmp"
-        | "testSetjmp"
-        | "getTempRet0"
-        | "setTempRet0"
-        | "__wasm_longjmp"
+            | "__wasi_init_tp"
+            | "__ctype_init"
+            | "__lind_init_addr_translation"
+            | "copy_data_between_cages"
+            | "copy_handler_table_to_cage"
+            | "make_threei_call"
+            | "register_handler"
+            | "saveSetjmp"
+            | "testSetjmp"
+            | "getTempRet0"
+            | "setTempRet0"
+            | "__wasm_longjmp"
     )
 }
 
@@ -1114,7 +1114,13 @@ impl<T> Linker<T> {
                             let errno_location_func = self
                                 .get(&mut store, "env", "__errno_location")
                                 .ok()
-                                .and_then(|e| if let Extern::Func(f) = e { Some(f) } else { None });
+                                .and_then(|e| {
+                                    if let Extern::Func(f) = e {
+                                        Some(f)
+                                    } else {
+                                        None
+                                    }
+                                });
                             let portal = Func::new(
                                 &mut store,
                                 func_ty,
@@ -1153,14 +1159,25 @@ impl<T> Linker<T> {
                                                     m
                                                 };
                                                 let seed = match mem {
-                                                    Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
+                                                    Some(
+                                                        crate::runtime::vm::ExportMemory::Unshared(
+                                                            mem,
+                                                        ),
+                                                    ) => {
                                                         let mut buf = [0u8; 4];
                                                         mem.read(&caller, addr, &mut buf)
                                                             .ok()
                                                             .map(|_| i32::from_le_bytes(buf))
                                                     }
-                                                    Some(crate::runtime::vm::ExportMemory::Shared(vm_shared, _)) => {
-                                                        let def = unsafe { vm_shared.vmmemory_ptr().as_ref() };
+                                                    Some(
+                                                        crate::runtime::vm::ExportMemory::Shared(
+                                                            vm_shared,
+                                                            _,
+                                                        ),
+                                                    ) => {
+                                                        let def = unsafe {
+                                                            vm_shared.vmmemory_ptr().as_ref()
+                                                        };
                                                         let len = def.current_length.load(
                                                             core::sync::atomic::Ordering::Relaxed,
                                                         );
@@ -1213,9 +1230,7 @@ impl<T> Linker<T> {
                                     // export it, just skips this.
                                     if let Some(errno_val) = threei::take_last_grate_errno() {
                                         if let Some(errno_loc) = errno_location_func {
-                                            if let Ok(typed) =
-                                                errno_loc.typed::<(), i32>(&caller)
-                                            {
+                                            if let Ok(typed) = errno_loc.typed::<(), i32>(&caller) {
                                                 if let Ok(addr) = typed.call(&mut caller, ()) {
                                                     // addr is a wasm32 pointer; zero-extend through u32
                                                     // first, since `i32 as usize` sign-extends and a high
@@ -1230,13 +1245,15 @@ impl<T> Linker<T> {
                                                     // directly, matching the remote-lib
                                                     // wrapper's memory lookup above.
                                                     let mem = {
-                                                        let mut it =
-                                                            caller.as_context_mut().0.all_memories();
+                                                        let mut it = caller
+                                                            .as_context_mut()
+                                                            .0
+                                                            .all_memories();
                                                         let m = it.next();
                                                         drop(it);
                                                         m
                                                     };
-                                                                    match mem {
+                                                    match mem {
                                                         Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
                                                             let _ = mem.write(
                                                                 &mut caller,
@@ -1850,7 +1867,15 @@ impl<T> Linker<T> {
                     }
                 }
 
-                self.instance_dylink(store, module_name, instance, Some(cageid), vec![], None, false)
+                self.instance_dylink(
+                    store,
+                    module_name,
+                    instance,
+                    Some(cageid),
+                    vec![],
+                    None,
+                    false,
+                )
             }
         }
     }
