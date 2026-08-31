@@ -51,6 +51,28 @@ missing="$(match_ordered_lines "$out" "[Cage] PASS" "[Grate] intercepted: n=1")"
 check "missing evidence line is reported" "$missing" "[Grate] intercepted: n=1"
 
 echo ""
+echo "=== find_forbidden_lines ==="
+
+# The comment-2 scenario: a rejection test whose oracle is only "caller got
+# GRATE_ERR" can false-pass if the handler actually ran (e.g. it dereferenced
+# foreign data and trapped itself, producing the same caller-visible error).
+# find_forbidden_lines must catch the handler's own marker being present.
+out=$'[Grate] memcpy handler ran (should not happen)\n[Cage] PASS: arena rejected (GRATE_ERR)'
+find_forbidden_lines "$out" "[Grate] memcpy handler ran (should not happen)" >/dev/null
+check "handler-ran marker present is caught" "$?" "1"
+
+# The correct-rejection case: the marker genuinely never appears.
+out=$'[Cage] PASS: arena rejected (GRATE_ERR)'
+find_forbidden_lines "$out" "[Grate] memcpy handler ran (should not happen)" >/dev/null
+check "absent marker passes" "$?" "0"
+
+# Order doesn't matter for a forbidden check (unlike match_ordered_lines) --
+# only presence anywhere.
+out=$'z\ny\nFORBIDDEN\nx'
+find_forbidden_lines "$out" "FORBIDDEN" >/dev/null
+check "forbidden line found regardless of position" "$?" "1"
+
+echo ""
 echo "=== decide_outcome ==="
 
 # The original issue #14 bug: output contains PASS, but the process exited

@@ -5,11 +5,19 @@
 // and provides a lind_marshal_spec describing each argument.  The runtime does
 // the rest: shadow allocation, copy-in, handler call, copy-out, return translation.
 //
+// Fail-closed: a marshalling contract violation (unrecognized/unconfigured
+// pointer size, shadow-arena exhaustion, a failed cross-cage copy, or an
+// invalid/exhausted handle) traps immediately (see _lind_marshal_abort)
+// rather than ever handing the handler a foreign-cage pointer or an
+// unvalidated field.
+//
 // --- Argument kinds ---
 //   LIND_ARG_SCALAR  — pass value directly; no memory copy
 //   LIND_ARG_PTR     — shadow buffer; direction + size_kind control copy behavior
 //                      NULL → passed through as-is, no alloc/copy
 //   LIND_ARG_HANDLE  — opaque token; value translated through handle table; pointee never copied
+//                      0 → passed through as-is (no handle); a nonzero token
+//                      that fails to translate traps
 //
 // --- Size kinds (for LIND_ARG_PTR) ---
 //   LIND_SIZE_CONST           — const_size bytes
@@ -32,8 +40,10 @@
 //   use the same arg_spec recursion; size_arg_index refers to a sibling field index.
 //
 // --- Handle table (per-grate static) ---
-//   lind_register_handle(class, real_ptr) → app_token
+//   lind_register_handle(class, real_ptr) → app_token (0 = table full)
 //   lind_translate_handle(class, app_token) → real_ptr (or 0 if not found)
+//   lind_translate_handle_checked(class, app_token, &found) → real_ptr,
+//     with *found distinguishing lookup failure from a genuine 0 result
 //   lind_release_handle(class, app_token)
 //
 // --- Handler signature ---
@@ -187,14 +197,23 @@ static uint64_t _lind_marshal_grate_cage  = 0;
 // Shadow memory bump allocator
 // ---------------------------------------------------------------------------
 
+#ifndef LIND_MARSHAL_ARENA_SIZE
 #define LIND_MARSHAL_ARENA_SIZE (128 * 1024)
+#endif
 
 static char   _lind_marshal_arena[LIND_MARSHAL_ARENA_SIZE];
 static size_t _lind_marshal_arena_used = 0;
 
 static inline void *_lind_marshal_alloc(size_t size) {
-    size_t aligned = (size + 7u) & ~7u;
-    if (_lind_marshal_arena_used + aligned > LIND_MARSHAL_ARENA_SIZE)
+    // size + 7u can overflow for a size near SIZE_MAX, wrapping `aligned`
+    // to a small value and letting a huge request pass the space check as
+    // if it were tiny. Reject that first, then compare against the actual
+    // remaining space via subtraction (not used+aligned, which could
+    // itself overflow) -- _lind_marshal_arena_used <= LIND_MARSHAL_ARENA_SIZE
+    // is an invariant this function maintains, so the subtraction is safe.
+    if (size > (size_t)-1 - 7u) return NULL;
+    size_t aligned = (size + 7u) & ~(size_t)7u;
+    if (aligned > LIND_MARSHAL_ARENA_SIZE - _lind_marshal_arena_used)
         return NULL;
     void *ptr = _lind_marshal_arena + _lind_marshal_arena_used;
     _lind_marshal_arena_used += aligned;
@@ -203,6 +222,46 @@ static inline void *_lind_marshal_alloc(size_t size) {
 
 static inline void _lind_marshal_reset(void) {
     _lind_marshal_arena_used = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed abort.
+//
+// A marshalling contract violation -- an unrecognized/unconfigured pointer
+// size, shadow-arena exhaustion, a failed cross-cage copy, or an invalid or
+// exhausted handle -- must never let a foreign-cage pointer, an
+// unvalidated field, or partial data reach the handler. There is no
+// generic, per-function-safe way to report this back to the calling cage
+// (every real function has its own error-return convention), so fail
+// closed: trap immediately rather than ever guessing.
+// ---------------------------------------------------------------------------
+
+static inline void _lind_marshal_abort(const char *reason) {
+    (void)reason;  // for readability at call sites; not logged (no libc
+                    // header dependency assumed at this point in the file)
+    __builtin_trap();
+}
+
+// Wraps copy_data_between_cages() with the fail-closed check every call
+// site needs: a failed cross-cage copy must never be treated as if it
+// succeeded (stale/partial shadow data reaching the handler, or a silently
+// lost copy-back). See threei::copy_data_between_cages' doc: returns
+// destaddr on success, ELINDAPIABORTED on failure -- truncated to the C
+// `int` ABI this import uses, well above any real wasm32 address in this
+// port's linear memory, so a straight equality check is unambiguous.
+#define LIND_API_ABORTED ((int)0xE0010001)
+
+static inline void _lind_copy_or_abort(
+    uint64_t thiscage, uint64_t targetcage,
+    uint64_t srcaddr, uint64_t srccage,
+    uint64_t destaddr, uint64_t destcage,
+    uint64_t len, uint64_t copytype)
+{
+    int ret = copy_data_between_cages(thiscage, targetcage, srcaddr, srccage,
+                                       destaddr, destcage, len, copytype);
+    if (ret == LIND_API_ABORTED) {
+        _lind_marshal_abort("copy_data_between_cages failed");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,14 +293,27 @@ static inline uint64_t lind_register_handle(uint32_t cls, uint64_t real_obj) {
     return 0;  // table full
 }
 
-static inline uint64_t lind_translate_handle(uint32_t cls, uint64_t app_token) {
+// *found distinguishes "translates to a real object of 0" (never happens in
+// practice -- handles register real pointers -- but not assumed) from
+// "lookup failed" (stale/forged/wrong-class token), so callers that must
+// fail closed on a bad token can tell the two apart rather than silently
+// treating a failed lookup as if it were a valid NULL.
+static inline uint64_t lind_translate_handle_checked(uint32_t cls, uint64_t app_token, int *found) {
     for (int i = 0; i < LIND_HANDLE_TABLE_SIZE; i++) {
         if (_lind_handle_table[i].in_use &&
             _lind_handle_table[i].app_token   == app_token &&
-            _lind_handle_table[i].handle_class == cls)
+            _lind_handle_table[i].handle_class == cls) {
+            *found = 1;
             return _lind_handle_table[i].real_object;
+        }
     }
+    *found = 0;
     return 0;
+}
+
+static inline uint64_t lind_translate_handle(uint32_t cls, uint64_t app_token) {
+    int found;
+    return lind_translate_handle_checked(cls, app_token, &found);
 }
 
 static inline void lind_release_handle(uint32_t cls, uint64_t app_token) {
@@ -268,7 +340,7 @@ static inline size_t _lind_measure_cstr(uint64_t src_ptr,
         size_t to_copy = sizeof(chunk);
         if (total + to_copy > LIND_MARSHAL_CSTR_CAP)
             to_copy = LIND_MARSHAL_CSTR_CAP - total;
-        copy_data_between_cages(grate_cage, source_cage,
+        _lind_copy_or_abort(grate_cage, source_cage,
             src_ptr + (uint64_t)total, source_cage,
             (uint64_t)(uintptr_t)chunk, grate_cage,
             (uint64_t)to_copy, 0);
@@ -321,16 +393,25 @@ static void _lind_post_struct(const struct _lind_shadow *s,
 static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *elem,
                                   uint64_t source_cage, uint64_t grate_cage);
 
+// Every current caller passes a fixed 6-element raw_args array (the
+// lind_handler6_t convention: LIND_DEFINE_MARSHAL_HANDLER's `_raw[6]`,
+// lind_marshal_dispatch's own handler_args[16] slice). size_arg_index comes
+// from the spec, not the calling cage, but a misconfigured or corrupt spec
+// must not turn into an out-of-bounds read of this array -- fail closed.
+#define LIND_RAW_ARGS_MAX 6
+
 // ---------------------------------------------------------------------------
-// Compute size for a PTR arg given context.
-//   raw_or_sibling: top-level → raw_args array; struct → shadow of parent struct
-//   in_struct      : 0 = top-level, 1 = inside struct field
+// Compute size for a top-level PTR arg from the raw_args array.
+//
+// (There is no in-struct variant of this function: a nested field's sibling
+// size lives at a *field-table index*, not a raw_args slot -- see the
+// LIND_SIZE_FROM_ARG case in _lind_pre_ptr's struct walk below, which is
+// the only place nested sibling sizes are actually computed.)
 // ---------------------------------------------------------------------------
 
 static inline size_t _lind_compute_size(
     const struct lind_arg_spec *as,
-    const uint64_t *raw_or_sibling,
-    int in_struct,
+    const uint64_t *raw_args,
     uint64_t source_cage, uint64_t grate_cage)
 {
     switch (as->size_kind) {
@@ -338,21 +419,19 @@ static inline size_t _lind_compute_size(
             return (size_t)as->const_size;
 
         case LIND_SIZE_FROM_ARG:
-            if (!in_struct)
-                return (size_t)raw_or_sibling[as->size_arg_index];
-            // In struct context: sibling field value is already in shadow at its offset.
-            // The sibling is assumed to be a uint32_t scalar.
-            return (size_t)(*(uint32_t *)((const uint8_t *)raw_or_sibling + as->size_arg_index));
+            if (as->size_arg_index >= LIND_RAW_ARGS_MAX)
+                _lind_marshal_abort("size_arg_index out of range");
+            return (size_t)raw_args[as->size_arg_index];
 
         case LIND_SIZE_FROM_ARG_POINTEE: {
             // Read uint32_t from source cage at the address stored in raw_args[i].
+            if (as->size_arg_index >= LIND_RAW_ARGS_MAX)
+                _lind_marshal_abort("size_arg_index out of range");
             uint32_t size_val = 0;
-            if (!in_struct) {
-                copy_data_between_cages(grate_cage, source_cage,
-                    raw_or_sibling[as->size_arg_index], source_cage,
-                    (uint64_t)(uintptr_t)&size_val, grate_cage,
-                    sizeof(uint32_t), 0);
-            }
+            _lind_copy_or_abort(grate_cage, source_cage,
+                raw_args[as->size_arg_index], source_cage,
+                (uint64_t)(uintptr_t)&size_val, grate_cage,
+                sizeof(uint32_t), 0);
             return (size_t)size_val;
         }
 
@@ -387,16 +466,26 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
         return _lind_pre_ptr_array(src_ptr, as->element, source_cage, grate_cage);
     }
 
-    // Compute size
+    // Compute size. A pointer arg's size_kind must be one the marshaller
+    // actually knows how to size; anything else means the spec is
+    // incomplete or corrupt, with no safe way to know how much to copy --
+    // fail closed rather than ever handing the handler a source-cage
+    // pointer. A recognized kind computing to a genuine runtime 0 (e.g. an
+    // empty buffer) is not an error: it still gets a real, grate-owned
+    // shadow below, just with nothing copied into it.
     size_t size;
-    if (as->size_kind == LIND_SIZE_CSTR) {
-        size = _lind_measure_cstr(src_ptr, source_cage, grate_cage);
-    } else {
-        size = _lind_compute_size(as, raw_or_sibling, in_struct, source_cage, grate_cage);
-        if (size == 0 && as->layout == NULL) {
-            // No size and no layout: treat as opaque, pass through.
-            return (void *)(uintptr_t)src_ptr;
-        }
+    switch (as->size_kind) {
+        case LIND_SIZE_CSTR:
+            size = _lind_measure_cstr(src_ptr, source_cage, grate_cage);
+            break;
+        case LIND_SIZE_CONST:
+        case LIND_SIZE_FROM_ARG:
+        case LIND_SIZE_FROM_ARG_POINTEE:
+            size = _lind_compute_size(as, raw_or_sibling, source_cage, grate_cage);
+            break;
+        default:
+            _lind_marshal_abort("pointer arg has no computable size");
+            return NULL;  // unreachable (abort traps)
     }
 
     // Determine allocation size: structured types use layout->struct_size.
@@ -404,11 +493,14 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
     if (alloc_size == 0) alloc_size = size;
 
     void *shadow = _lind_marshal_alloc(alloc_size);
-    if (!shadow) return (void *)(uintptr_t)src_ptr;  // arena exhausted fallback
+    if (!shadow) _lind_marshal_abort("shadow arena exhausted");
 
-    // Copy-in for IN and INOUT (copy the raw bytes first).
-    if (as->ptr_direction == LIND_PTR_IN || as->ptr_direction == LIND_PTR_INOUT) {
-        copy_data_between_cages(grate_cage, source_cage,
+    // Copy-in for IN and INOUT (copy the raw bytes first). Skip for a
+    // genuinely empty buffer -- nothing to copy, and a 0-length request
+    // isn't a copy failure worth aborting over.
+    if (alloc_size > 0 &&
+        (as->ptr_direction == LIND_PTR_IN || as->ptr_direction == LIND_PTR_INOUT)) {
+        _lind_copy_or_abort(grate_cage, source_cage,
             src_ptr, source_cage,
             (uint64_t)(uintptr_t)shadow, grate_cage,
             (uint64_t)alloc_size, 0);
@@ -418,9 +510,19 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
     if (as->layout != NULL && as->layout->kind == LIND_LO_STRUCT) {
         const struct lind_layout *lo = as->layout;
         uint32_t max_ptr_fields = lo->nfields;
+        // nfields comes from the spec, not the calling cage, but an
+        // unchecked allocation failure here would silently disable
+        // pointer-field tracking -- and with it, OUT/INOUT copy-back for
+        // every nested pointer field -- rather than failing the call.
+        // Guard the multiplication too: it's a size_t computation on a
+        // wasm32 (32-bit size_t) target, so a large-enough nfields could
+        // overflow it before _lind_marshal_alloc ever sees the request.
+        if (max_ptr_fields > (size_t)-1 / sizeof(struct _lind_ptr_field_track))
+            _lind_marshal_abort("pointer-field tracking count overflow");
         struct _lind_ptr_field_track *ptf =
             (struct _lind_ptr_field_track *)_lind_marshal_alloc(
-                max_ptr_fields * sizeof(struct _lind_ptr_field_track));
+                (size_t)max_ptr_fields * sizeof(struct _lind_ptr_field_track));
+        if (!ptf) _lind_marshal_abort("pointer-field tracking arena exhausted");
         uint32_t n = 0;
 
         for (uint32_t f = 0; f < lo->nfields; f++) {
@@ -428,16 +530,34 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
             if (!field->touched) continue;
             const struct lind_arg_spec *fspec = field->spec;
 
+            // field->offset comes from the spec, not the calling cage, but
+            // a misconfigured/corrupt spec must not turn into an
+            // out-of-bounds read/write of this struct's own shadow buffer.
+            // Every field below is read/written as a uint32_t (a raw
+            // pointer, handle token, or scalar slot).
+            if (fspec->kind != LIND_ARG_SCALAR &&
+                (size_t)field->offset + sizeof(uint32_t) > alloc_size) {
+                _lind_marshal_abort("struct field offset out of range");
+            }
+
             if (fspec->kind == LIND_ARG_SCALAR) {
                 // Already copied in the raw blit above.
                 continue;
             }
 
             if (fspec->kind == LIND_ARG_HANDLE) {
-                // Translate handle value in place.
+                // Translate handle value in place. A 0 token is "no handle"
+                // (like a NULL pointer) and passes through; a nonzero token
+                // that fails to translate is a stale/forged/wrong-class
+                // token -- fail closed rather than silently hand the
+                // handler a 0 it can't distinguish from a real NULL.
                 uint32_t tok = *(uint32_t *)((uint8_t *)shadow + field->offset);
-                uint64_t real = lind_translate_handle(fspec->handle_class, (uint64_t)tok);
-                *(uint32_t *)((uint8_t *)shadow + field->offset) = (uint32_t)real;
+                if (tok != 0) {
+                    int found;
+                    uint64_t real = lind_translate_handle_checked(fspec->handle_class, (uint64_t)tok, &found);
+                    if (!found) _lind_marshal_abort("nested handle field: invalid token");
+                    *(uint32_t *)((uint8_t *)shadow + field->offset) = (uint32_t)real;
+                }
                 continue;
             }
 
@@ -448,29 +568,52 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
                 uint64_t child_src = (uint64_t)child_src_u32;
                 if (child_src == 0) continue;
 
-                // Size uses shadow as "sibling" context.
+                // Size uses shadow as "sibling" context. An unrecognized
+                // size_kind here is a spec bug -- fail closed rather than
+                // leave this field holding the raw source-cage pointer that
+                // was copied in by the struct's initial raw blit above.
                 size_t child_size;
-                if (fspec->size_kind == LIND_SIZE_CSTR) {
-                    child_size = _lind_measure_cstr(child_src, source_cage, grate_cage);
-                } else if (fspec->size_kind == LIND_SIZE_FROM_ARG) {
-                    // Sibling field at index = size_arg_index; read uint32 from shadow.
-                    uint32_t sib_off = lo->fields[fspec->size_arg_index].offset;
-                    child_size = (size_t)(*(uint32_t *)((uint8_t *)shadow + sib_off));
-                } else {
-                    child_size = _lind_compute_size(fspec, NULL, 0, source_cage, grate_cage);
-                    if (child_size == 0 && fspec->layout == NULL) {
-                        // No size: leave field as-is.
-                        continue;
+                switch (fspec->size_kind) {
+                    case LIND_SIZE_CSTR:
+                        child_size = _lind_measure_cstr(child_src, source_cage, grate_cage);
+                        break;
+                    case LIND_SIZE_FROM_ARG: {
+                        // Sibling field at index = size_arg_index; read uint32 from shadow.
+                        // Both the field-table index and the resulting byte
+                        // offset come from the spec, not the calling cage,
+                        // but a misconfigured/corrupt spec must not turn
+                        // into an out-of-bounds read of this struct's own
+                        // shadow -- fail closed rather than guess.
+                        if (fspec->size_arg_index >= lo->nfields)
+                            _lind_marshal_abort("nested size_arg_index out of range");
+                        uint32_t sib_off = lo->fields[fspec->size_arg_index].offset;
+                        if ((size_t)sib_off + sizeof(uint32_t) > alloc_size)
+                            _lind_marshal_abort("nested sibling field offset out of range");
+                        child_size = (size_t)(*(uint32_t *)((uint8_t *)shadow + sib_off));
+                        break;
                     }
+                    case LIND_SIZE_CONST:
+                        child_size = (size_t)fspec->const_size;
+                        break;
+                    case LIND_SIZE_FROM_ARG_POINTEE:
+                        // Not supported for nested fields: there is no
+                        // raw_args array to index in this context (only
+                        // top-level args have one). Fail closed rather
+                        // than dereference a NULL/garbage pointer.
+                        _lind_marshal_abort("nested pointer field: FROM_ARG_POINTEE unsupported");
+                        return NULL;  // unreachable (abort traps)
+                    default:
+                        _lind_marshal_abort("nested pointer field has no computable size");
+                        return NULL;  // unreachable (abort traps)
                 }
-                if (child_size == 0) continue;
 
                 void *child_shadow = _lind_marshal_alloc(child_size);
-                if (!child_shadow) continue;
+                if (!child_shadow) _lind_marshal_abort("nested shadow arena exhausted");
 
-                if (fspec->ptr_direction == LIND_PTR_IN ||
-                    fspec->ptr_direction == LIND_PTR_INOUT) {
-                    copy_data_between_cages(grate_cage, source_cage,
+                if (child_size > 0 &&
+                    (fspec->ptr_direction == LIND_PTR_IN ||
+                     fspec->ptr_direction == LIND_PTR_INOUT)) {
+                    _lind_copy_or_abort(grate_cage, source_cage,
                         child_src, source_cage,
                         (uint64_t)(uintptr_t)child_shadow, grate_cage,
                         (uint64_t)child_size, 0);
@@ -516,7 +659,7 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
     uint32_t n = 0;
     while (n < LIND_PTR_ARRAY_MAX) {
         uint32_t p = 0;
-        copy_data_between_cages(grate_cage, source_cage,
+        _lind_copy_or_abort(grate_cage, source_cage,
             src_ptr + (uint64_t)n * 4, source_cage,
             (uint64_t)(uintptr_t)&p, grate_cage, 4, 0);
         if (p == 0) break;
@@ -525,7 +668,7 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
 
     // Allocate the shadow array: n element pointers + a NULL terminator.
     uint32_t *shadow = (uint32_t *)_lind_marshal_alloc((size_t)(n + 1) * 4);
-    if (!shadow) return (void *)(uintptr_t)src_ptr;  // arena exhausted fallback
+    if (!shadow) _lind_marshal_abort("pointer-array shadow arena exhausted");
 
     // Marshal each element per its spec (e.g. each is a cstr pointer -> copy the string).
     for (uint32_t i = 0; i < n; i++) {
@@ -589,7 +732,7 @@ static void _lind_post_struct(const struct _lind_shadow *s,
             }
 
             if (copy_back_size > 0) {
-                copy_data_between_cages(grate_cage, source_cage,
+                _lind_copy_or_abort(grate_cage, source_cage,
                     (uint64_t)(uintptr_t)ptf->shadow_start, grate_cage,
                     ptf->orig_src_ptr, source_cage,
                     (uint64_t)copy_back_size, 0);
@@ -599,10 +742,12 @@ static void _lind_post_struct(const struct _lind_shadow *s,
 
     // Step 2: copy the whole struct shadow back to source (writes scalar fields +
     //         whatever ptr values the handler left).
-    copy_data_between_cages(grate_cage, source_cage,
-        (uint64_t)(uintptr_t)s->shadow_ptr, grate_cage,
-        s->source_ptr, source_cage,
-        (uint64_t)s->size, 0);
+    if (s->size > 0) {
+        _lind_copy_or_abort(grate_cage, source_cage,
+            (uint64_t)(uintptr_t)s->shadow_ptr, grate_cage,
+            s->source_ptr, source_cage,
+            (uint64_t)s->size, 0);
+    }
 
     // Step 3: fix up ptr fields — overwrite with source-cage addresses, not shadow addrs.
     for (uint32_t p = 0; p < s->n_ptr_fields; p++) {
@@ -618,7 +763,7 @@ static void _lind_post_struct(const struct _lind_shadow *s,
         uint32_t new_src_u32 = (uint32_t)(int32_t)
             ((int64_t)(int32_t)(uint32_t)ptf->orig_src_ptr + delta);
 
-        copy_data_between_cages(grate_cage, source_cage,
+        _lind_copy_or_abort(grate_cage, source_cage,
             (uint64_t)(uintptr_t)&new_src_u32, grate_cage,
             s->source_ptr + ptf->offset, source_cage,
             sizeof(uint32_t), 0);
@@ -682,7 +827,16 @@ static inline uint64_t lind_marshal_dispatch(
                 break;
 
             case LIND_ARG_HANDLE:
-                handler_args[i] = lind_translate_handle(as->handle_class, raw_args[i]);
+                // 0 is "no handle" (like NULL) and passes through; a
+                // nonzero token that fails to translate is stale, forged,
+                // or the wrong class -- fail closed.
+                if (raw_args[i] == 0) {
+                    handler_args[i] = 0;
+                } else {
+                    int found;
+                    handler_args[i] = lind_translate_handle_checked(as->handle_class, raw_args[i], &found);
+                    if (!found) _lind_marshal_abort("handle arg: invalid token");
+                }
                 break;
 
             case LIND_ARG_PTR: {
@@ -699,7 +853,7 @@ static inline uint64_t lind_marshal_dispatch(
 
                 size_t shadow_size = (as->layout != NULL)
                     ? as->layout->struct_size
-                    : _lind_compute_size(as, raw_args, 0, source_cage, grate_cage);
+                    : _lind_compute_size(as, raw_args, source_cage, grate_cage);
                 if (as->size_kind == LIND_SIZE_CSTR && shadow_size == 0)
                     shadow_size = _lind_measure_cstr(src_ptr, source_cage, grate_cage);
 
@@ -752,7 +906,7 @@ static inline uint64_t lind_marshal_dispatch(
                     }
                 }
             }
-            copy_data_between_cages(grate_cage, source_cage,
+            _lind_copy_or_abort(grate_cage, source_cage,
                 (uint64_t)(uintptr_t)&translated, grate_cage,
                 shadows[s].source_ptr, source_cage, 4, 0);
             continue;
@@ -760,9 +914,10 @@ static inline uint64_t lind_marshal_dispatch(
 
         if (shadows[s].layout != NULL) {
             _lind_post_struct(&shadows[s], source_cage, grate_cage);
-        } else if (shadows[s].direction == LIND_PTR_OUT ||
-                   shadows[s].direction == LIND_PTR_INOUT) {
-            copy_data_between_cages(grate_cage, source_cage,
+        } else if (shadows[s].size > 0 &&
+                   (shadows[s].direction == LIND_PTR_OUT ||
+                    shadows[s].direction == LIND_PTR_INOUT)) {
+            _lind_copy_or_abort(grate_cage, source_cage,
                 (uint64_t)(uintptr_t)shadows[s].shadow_ptr, grate_cage,
                 shadows[s].source_ptr, source_cage,
                 (uint64_t)shadows[s].size, 0);
@@ -802,7 +957,11 @@ static inline uint64_t lind_marshal_dispatch(
         }
 
         case LIND_RET_HANDLE:
+            // 0 means the handle table is full -- app_token is documented
+            // as never 0, so returning 0 to the source cage here would be
+            // indistinguishable from a real token. Fail closed instead.
             result = lind_register_handle(spec->ret.handle_class, handler_ret);
+            if (result == 0) _lind_marshal_abort("handle table exhausted");
             break;
 
         case LIND_RET_FORCE_LOCAL:
