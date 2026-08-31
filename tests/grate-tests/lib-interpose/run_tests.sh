@@ -620,6 +620,65 @@ run_test "fail-closed-widesig" \
     -- "    1: lib-3i portal: env.toy_wide_sum7 has 7 raw ABI argument slots, exceeding the interposition transport's 6-slot capacity" \
     -- "[Cage|widesig] FAIL: call returned normally" "[Grate|widesig] toy_wide_sum7 handler ran (should not happen)"
 
+# fail-closed-provenance-*: post-call pointer-provenance validation (issue
+# #7). provenance_grate.c's three handlers deliberately fabricate the values
+# a buggy or adversarial interposed library might leave behind -- before the
+# shadow's base, past its one-past-the-end, wildly out of range, and
+# pointing at a real but unrelated grate address -- across the three
+# post-call translation paths (LIND_RET_PTR_INTO_ARG, out_ptr_into_arg1, and
+# struct-field OUT/cursor copy-back+fixup). Each target loops over every one
+# of its modes in a single cage invocation and reports one aggregate PASS
+# line; a _lind_marshal_abort trap only fails the one call it's in (see
+# threei::GRATE_ERR's doc), so invalid modes don't stop the cage from
+# reaching its later, valid ones. The per-mode "handler ran" lines are
+# evidence every mode actually executed, not skipped.
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-provenance-scan" \
+    "fail-closed/provenance_cage.c" \
+    "fail-closed/provenance_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/provenance_cage.cwasm" "scan" \
+    -- "[Grate|provenance] registered 3/3 handlers" "[Cage|provenance] PASS: scan (all 8 modes)" \
+    -- "[Grate|provenance] toy_scan_buf handler ran, mode=0" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=1" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=2" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=3" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=4" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=5" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=6" \
+       "[Grate|provenance] toy_scan_buf handler ran, mode=7"
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-provenance-strtol" \
+    "fail-closed/provenance_cage.c" \
+    "fail-closed/provenance_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/provenance_cage.cwasm" "strtol" \
+    -- "[Grate|provenance] registered 3/3 handlers" "[Cage|provenance] PASS: strtol (all 8 modes)" \
+    -- "[Grate|provenance] toy_strtol_like handler ran, mode='0'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='1'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='2'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='3'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='4'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='5'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='6'" \
+       "[Grate|provenance] toy_strtol_like handler ran, mode='7'"
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-provenance-stream" \
+    "fail-closed/provenance_cage.c" \
+    "fail-closed/provenance_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/provenance_cage.cwasm" "stream" \
+    -- "[Grate|provenance] registered 3/3 handlers" "[Cage|provenance] PASS: stream (all 7 modes)" \
+    -- "[Grate|provenance] toy_stream_process handler ran, mode=0" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=1" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=2" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=3" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=4" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=5" \
+       "[Grate|provenance] toy_stream_process handler ran, mode=6"
+
 DECLARED_TESTS+=("fail-closed")
 
 # --------------------------------------------------------------------------

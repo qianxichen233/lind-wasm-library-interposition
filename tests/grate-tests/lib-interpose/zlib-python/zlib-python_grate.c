@@ -76,6 +76,10 @@ static struct lind_arg_spec _next_out_fspec = {
     .ptr_direction  = LIND_PTR_OUT,
     .size_kind      = LIND_SIZE_FROM_ARG,
     .size_arg_index = 4,   // sibling field index 4 = avail_out
+    // A completely filled output buffer is the normal outcome, not an edge
+    // case: next_out legitimately ends up one-past-the-end of the shadow
+    // whenever the handler writes exactly avail_out bytes.
+    .flags          = LIND_ARGSPEC_ALLOW_ONE_PAST,
 };
 
 static struct lind_field _zstream_fields[6] = {

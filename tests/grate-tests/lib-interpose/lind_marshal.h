@@ -160,13 +160,31 @@ struct lind_arg_spec {
     // pointer from grate-shadow offset to the source cage's buffer.
     // 1-based so the designated-init default (0) means "not applicable".
     uint32_t                out_ptr_into_arg1;
+    // Bitmask -- see LIND_ARGSPEC_ALLOW_ONE_PAST. Zero-initializes to "no
+    // flags set" under designated init, so an unset spec gets the strict
+    // (one-past rejected) default.
     uint32_t                flags;
 };
+
+// A callee-written pointer landing exactly at base+len ("one-past-the-end",
+// a valid pointer VALUE per C semantics even though it can't be
+// dereferenced) is the normal, expected outcome for some APIs -- a
+// cursor-advance OUT buffer that ends up completely filled (zlib's
+// next_out) -- but meaningless or never legitimately reachable for others
+// (a memchr-style scan, whose one-past result would be the byte just past
+// the searched region, never a matched byte). Whether one-past is even
+// possible depends entirely on the specific pointer relationship the spec
+// describes, so it is never assumed: a field/arg/return spec must opt in
+// explicitly via this flag, or a genuinely-one-past value from the callee
+// is rejected as being outside its shadow the same as anything else out of
+// range.
+#define LIND_ARGSPEC_ALLOW_ONE_PAST 0x1u
 
 struct lind_return_spec {
     enum lind_return_kind kind;
     uint32_t              alias_arg_index;  // PTR_ALIAS_ARG / PTR_INTO_ARG / HANDLE
     uint32_t              handle_class;     // RET_HANDLE: class for new handle registration
+    uint32_t               flags;           // LIND_ARGSPEC_ALLOW_ONE_PAST (PTR_INTO_ARG only)
 };
 
 struct lind_marshal_spec {
@@ -262,6 +280,103 @@ static inline void _lind_copy_or_abort(
     if (ret == LIND_API_ABORTED) {
         _lind_marshal_abort("copy_data_between_cages failed");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shadow pointer provenance (post-call: validating what the interposed
+// library wrote or returned)
+//
+// Every OUT-direction shadow buffer this dispatch call creates is owned by
+// it alone; the ONLY legitimate values a callee may leave behind in a
+// pointer-typed shadow field, or return through a LIND_RET_PTR_INTO_ARG
+// return, are addresses within that specific allocation -- from `base`
+// (the interior) up to and including `base + len` (one-past-the-end, valid
+// as a pointer VALUE per C semantics even though it can't be dereferenced).
+// A buggy or adversarial library returning anything else -- an address
+// before base, past one-past-the-end, or belonging to a different shadow
+// entirely -- must never be translated and hand back a fabricated or
+// out-of-bounds source-cage address; every call site below fails closed via
+// _lind_marshal_abort instead.
+// ---------------------------------------------------------------------------
+
+// Validates that `candidate` lies within [base, base+len) of a shadow
+// allocation -- or, if `allow_one_past` is set, within [base, base+len]
+// (see LIND_ARGSPEC_ALLOW_ONE_PAST's doc). Guards the base+len computation
+// itself against overflow (a real allocation's bounds can never wrap the
+// address space, so an overflow here means `base`/`len` themselves are
+// bogus). Returns 1 and sets *out_offset on success; returns 0 without
+// touching *out_offset otherwise.
+static inline int _lind_validate_shadow_offset(uintptr_t base, size_t len,
+                                                uintptr_t candidate,
+                                                int allow_one_past,
+                                                uint64_t *out_offset)
+{
+    if (len > (size_t)-1 - base)
+        return 0;
+    uintptr_t end = base + len;
+    if (candidate < base) return 0;
+    if (candidate == end) {
+        if (!allow_one_past) return 0;
+    } else if (candidate > end) {
+        return 0;
+    }
+    *out_offset = (uint64_t)(candidate - base);
+    return 1;
+}
+
+// Every wasm32 address (this port's only target) fits in 32 bits; both a
+// candidate pointer VALUE from the callee and a source-cage address this
+// module itself computed must fit before either takes part in pointer
+// arithmetic. Skipping this and narrowing straight to uintptr_t (32-bit
+// here) would let a fabricated 64-bit candidate with high bits set alias
+// into a valid shadow range purely by truncation, and would let a bogus
+// source_ptr make an overflow check that subtracts it from UINT32_MAX wrap
+// instead of catching it.
+static inline void _lind_check_fits_wasm32_addr(uint64_t v, const char *reason) {
+    if (v > (uint64_t)UINT32_MAX)
+        _lind_marshal_abort(reason);
+}
+
+// Every shadow allocation belongs to exactly the (source_cage, grate_cage)
+// pair this dispatch call was invoked with -- the arena is reset at the top
+// of every lind_marshal_dispatch call (_lind_marshal_reset), so today this
+// can only ever fail if a record were somehow read across two different
+// dispatch calls. Checked anyway, unconditionally, at every site that
+// trusts a shadow/ptr_field_track record: the record itself carries no
+// other proof of which call created it, and that stops being a paper
+// guarantee the moment any future change relaxes the per-call arena reset
+// (e.g. concurrent dispatch, or shadows outliving a single call).
+static inline void _lind_check_shadow_owner(uint64_t rec_source_cage,
+                                             uint64_t rec_grate_cage,
+                                             uint64_t source_cage,
+                                             uint64_t grate_cage,
+                                             const char *reason)
+{
+    if (rec_source_cage != source_cage || rec_grate_cage != grate_cage)
+        _lind_marshal_abort(reason);
+}
+
+// Translates a grate-shadow pointer VALUE the callee wrote or returned into
+// its equivalent source-cage address, aborting if it doesn't resolve to a
+// valid position within the given shadow allocation. NULL is a legitimate
+// value at every call site this is used from (e.g. strtol's endptr when no
+// conversion happened, or a "not found" return) and always passes through
+// unchanged, bypassing provenance validation entirely -- there is no shadow
+// offset to compute for it.
+static inline uint64_t _lind_translate_shadow_ptr_or_abort(
+    uintptr_t base, size_t len, int allow_one_past, uint64_t source_ptr,
+    uint64_t candidate, const char *reason)
+{
+    if (candidate == 0)
+        return 0;
+    _lind_check_fits_wasm32_addr(candidate, reason);
+    _lind_check_fits_wasm32_addr(source_ptr, reason);
+    uint64_t offset;
+    if (!_lind_validate_shadow_offset(base, len, (uintptr_t)candidate, allow_one_past, &offset))
+        _lind_marshal_abort(reason);
+    if (offset > (uint64_t)UINT32_MAX - source_ptr)
+        _lind_marshal_abort("translated pointer overflows the source cage's address space");
+    return source_ptr + offset;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +476,12 @@ struct _lind_ptr_field_track {
     uint32_t  offset;           // byte offset of this field within the parent struct
     uint64_t  orig_src_ptr;     // original source-cage ptr stored in this field
     uint8_t  *shadow_start;     // start of the child shadow buffer
+    size_t    shadow_len;       // allocated length of the child shadow buffer --
+                                 // the only trustworthy bound on how far the
+                                 // callee may legitimately advance a pointer
+                                 // into it (see _lind_validate_shadow_offset)
+    uint64_t  source_cage;      // cages this allocation belongs to -- see
+    uint64_t  grate_cage;       // _lind_check_shadow_owner's doc
     const struct lind_arg_spec *spec;  // field spec (for recursive post-call)
 };
 
@@ -370,6 +491,8 @@ struct _lind_shadow {
     void                  *shadow_ptr;
     size_t                 size;
     enum lind_ptr_direction direction;
+    uint64_t                source_cage;  // cages this allocation belongs to
+    uint64_t                grate_cage;   // -- see _lind_check_shadow_owner
     // Nested struct support (NULL layout = flat buffer):
     const struct lind_layout      *layout;
     struct _lind_ptr_field_track  *ptr_fields;
@@ -628,6 +751,9 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
                     ptf[n].offset        = field->offset;
                     ptf[n].orig_src_ptr  = child_src;
                     ptf[n].shadow_start  = (uint8_t *)child_shadow;
+                    ptf[n].shadow_len    = child_size;
+                    ptf[n].source_cage   = source_cage;
+                    ptf[n].grate_cage    = grate_cage;
                     ptf[n].spec          = fspec;
                     n++;
                 }
@@ -691,82 +817,132 @@ static void _lind_post_struct(const struct _lind_shadow *s,
 {
     if (s->direction != LIND_PTR_OUT && s->direction != LIND_PTR_INOUT)
         return;
+    _lind_check_shadow_owner(s->source_cage, s->grate_cage, source_cage, grate_cage,
+                              "struct shadow does not belong to this call's cages");
 
     const struct lind_layout *lo = s->layout;
+    uint32_t nptf = s->n_ptr_fields;
 
-    // Step 1: copy the child pointer data back to source cage, then fix up ptr fields.
-    for (uint32_t p = 0; p < s->n_ptr_fields; p++) {
+    // Phase 1 (validate + compute only -- no writes to the source cage
+    // yet): for every tracked pointer field, confirm its shadow ownership
+    // and the position the callee left it at, then compute both its
+    // copy-back size and its translated source-cage value into scratch
+    // memory. A callee that corrupts one field must never be able to leak
+    // another field's -- or its own -- raw grate pointer into caller memory
+    // before the abort catches it, so nothing is written to the source
+    // cage until every field here has validated.
+    size_t   *copy_back_size = NULL;
+    uint32_t *new_src        = NULL;
+    if (nptf > 0) {
+        if (nptf > (size_t)-1 / sizeof(size_t) || nptf > (size_t)-1 / sizeof(uint32_t))
+            _lind_marshal_abort("pointer-field post-validation count overflow");
+        copy_back_size = (size_t *)_lind_marshal_alloc(nptf * sizeof(size_t));
+        new_src        = (uint32_t *)_lind_marshal_alloc(nptf * sizeof(uint32_t));
+        if (!copy_back_size || !new_src)
+            _lind_marshal_abort("post-call field validation arena exhausted");
+    }
+
+    for (uint32_t p = 0; p < nptf; p++) {
         const struct _lind_ptr_field_track *ptf = &s->ptr_fields[p];
+        _lind_check_shadow_owner(ptf->source_cage, ptf->grate_cage, source_cage, grate_cage,
+                                  "struct field shadow does not belong to this call's cages");
+
+        // cur_shadow_u32 is whatever the callee left in this field --
+        // entirely untrusted. 0 is a legitimate "no output here" value
+        // (e.g. an optional nested out-pointer the library chose not to
+        // fill) and passes straight through with no copy-back and no
+        // provenance check; anything else must land within this field's
+        // own shadow allocation (up to one-past-the-end only if the field's
+        // spec opts into LIND_ARGSPEC_ALLOW_ONE_PAST).
+        uint32_t cur_shadow_u32 =
+            *(uint32_t *)((uint8_t *)s->shadow_ptr + ptf->offset);
+        if (cur_shadow_u32 == 0) {
+            copy_back_size[p] = 0;
+            new_src[p] = 0;
+            continue;
+        }
+
+        int allow_one_past = (ptf->spec->flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0;
+        uint64_t adv_offset;
+        if (!_lind_validate_shadow_offset((uintptr_t)ptf->shadow_start,
+                                           ptf->shadow_len,
+                                           (uintptr_t)cur_shadow_u32,
+                                           allow_one_past,
+                                           &adv_offset))
+            _lind_marshal_abort("struct field: OUT pointer left outside its own shadow buffer");
+
+        // How many bytes to copy back: from shadow_start up to wherever the
+        // handler left the pointer (may be advanced for INOUT/cursor
+        // buffers, e.g. zlib's next_out). Only meaningful for OUT/INOUT
+        // fields -- an IN-only field's data was never meant to be written
+        // back, though its pointer is still translated below like any
+        // other tracked field.
+        size_t cbsize = 0;
         if (ptf->spec->ptr_direction == LIND_PTR_OUT ||
             ptf->spec->ptr_direction == LIND_PTR_INOUT) {
+            cbsize = (size_t)adv_offset;
 
-            // Determine the size to copy back.
-            // Read current shadow ptr from the struct shadow at this field's offset.
-            uint32_t cur_shadow_u32 =
-                *(uint32_t *)((uint8_t *)s->shadow_ptr + ptf->offset);
-            uint8_t *cur_shadow_ptr = (uint8_t *)(uintptr_t)cur_shadow_u32;
-
-            // How many bytes to copy: from original shadow_start up to wherever
-            // the handler left the pointer (may be advanced for INOUT buffers).
-            size_t copy_back_size;
-            if (cur_shadow_ptr >= ptf->shadow_start) {
-                copy_back_size = (size_t)(cur_shadow_ptr - ptf->shadow_start);
-            } else {
-                copy_back_size = 0;
-            }
-
-            // Always copy at least the originally-allocated child buffer data back.
-            // Use the field's size if we can infer it.
-            if (copy_back_size == 0 && lo != NULL) {
-                // Find the sibling size field if available.
+            // Unchanged pointer: fall back to the field's nominal size
+            // instead of copying back zero bytes. That size may itself
+            // come from a sibling field the callee could also have
+            // modified during the call (e.g. reporting a bogus "bytes
+            // written" count without ever advancing the pointer) -- clamp
+            // to the buffer's actual allocated length so a stationary
+            // pointer can never trigger an oversized copy either,
+            // regardless of what the callee claims.
+            if (cbsize == 0 && lo != NULL) {
                 const struct lind_field *fld = NULL;
                 for (uint32_t f = 0; f < lo->nfields; f++) {
                     if (lo->fields[f].offset == ptf->offset) { fld = &lo->fields[f]; break; }
                 }
                 if (fld && ptf->spec->size_kind == LIND_SIZE_FROM_ARG) {
                     uint32_t sib_off = lo->fields[ptf->spec->size_arg_index].offset;
-                    copy_back_size = (size_t)(*(uint32_t *)((uint8_t *)s->shadow_ptr + sib_off));
+                    cbsize = (size_t)(*(uint32_t *)((uint8_t *)s->shadow_ptr + sib_off));
                 } else if (ptf->spec->size_kind == LIND_SIZE_CONST) {
-                    copy_back_size = (size_t)ptf->spec->const_size;
+                    cbsize = (size_t)ptf->spec->const_size;
                 }
-            }
-
-            if (copy_back_size > 0) {
-                _lind_copy_or_abort(grate_cage, source_cage,
-                    (uint64_t)(uintptr_t)ptf->shadow_start, grate_cage,
-                    ptf->orig_src_ptr, source_cage,
-                    (uint64_t)copy_back_size, 0);
+                if (cbsize > ptf->shadow_len)
+                    cbsize = ptf->shadow_len;
             }
         }
+        copy_back_size[p] = cbsize;
+
+        _lind_check_fits_wasm32_addr(ptf->orig_src_ptr,
+            "struct field: source pointer overflows the source cage's address space");
+        if (adv_offset > (uint64_t)UINT32_MAX - ptf->orig_src_ptr)
+            _lind_marshal_abort("struct field: translated pointer overflows the source cage's address space");
+        new_src[p] = (uint32_t)(ptf->orig_src_ptr + adv_offset);
     }
 
-    // Step 2: copy the whole struct shadow back to source (writes scalar fields +
-    //         whatever ptr values the handler left).
+    // Phase 2 (still no cage writes): sanitize the struct shadow IN
+    // GRATE-LOCAL MEMORY, replacing each tracked pointer field's raw grate
+    // address with its already-validated, translated source-cage
+    // equivalent. Only this dispatch call's own shadow buffer is touched.
+    for (uint32_t p = 0; p < nptf; p++) {
+        const struct _lind_ptr_field_track *ptf = &s->ptr_fields[p];
+        *(uint32_t *)((uint8_t *)s->shadow_ptr + ptf->offset) = new_src[p];
+    }
+
+    // Phase 3: every field has validated and the struct shadow now holds
+    // only sanitized pointer values, so it's finally safe to write to the
+    // source cage -- each child buffer's data, then the whole struct in a
+    // single copy (which also carries the sanitized pointers and any plain
+    // scalar fields the handler updated). No raw grate pointer is ever
+    // written to caller memory at any point in this function.
+    for (uint32_t p = 0; p < nptf; p++) {
+        const struct _lind_ptr_field_track *ptf = &s->ptr_fields[p];
+        if (copy_back_size[p] > 0) {
+            _lind_copy_or_abort(grate_cage, source_cage,
+                (uint64_t)(uintptr_t)ptf->shadow_start, grate_cage,
+                ptf->orig_src_ptr, source_cage,
+                (uint64_t)copy_back_size[p], 0);
+        }
+    }
     if (s->size > 0) {
         _lind_copy_or_abort(grate_cage, source_cage,
             (uint64_t)(uintptr_t)s->shadow_ptr, grate_cage,
             s->source_ptr, source_cage,
             (uint64_t)s->size, 0);
-    }
-
-    // Step 3: fix up ptr fields — overwrite with source-cage addresses, not shadow addrs.
-    for (uint32_t p = 0; p < s->n_ptr_fields; p++) {
-        const struct _lind_ptr_field_track *ptf = &s->ptr_fields[p];
-
-        // Compute delta = how far the handler advanced the ptr.
-        uint32_t cur_shadow_u32 =
-            *(uint32_t *)((uint8_t *)s->shadow_ptr + ptf->offset);
-        uint8_t *cur_shadow_ptr = (uint8_t *)(uintptr_t)cur_shadow_u32;
-        int64_t delta = (int64_t)(cur_shadow_ptr - ptf->shadow_start);
-
-        // New source-cage ptr = original + delta.
-        uint32_t new_src_u32 = (uint32_t)(int32_t)
-            ((int64_t)(int32_t)(uint32_t)ptf->orig_src_ptr + delta);
-
-        _lind_copy_or_abort(grate_cage, source_cage,
-            (uint64_t)(uintptr_t)&new_src_u32, grate_cage,
-            s->source_ptr + ptf->offset, source_cage,
-            sizeof(uint32_t), 0);
     }
 }
 
@@ -870,6 +1046,8 @@ static inline uint64_t lind_marshal_dispatch(
                     shadows[nshadows].shadow_ptr   = shadow;
                     shadows[nshadows].size         = shadow_size;
                     shadows[nshadows].direction    = as->ptr_direction;
+                    shadows[nshadows].source_cage  = source_cage;
+                    shadows[nshadows].grate_cage   = grate_cage;
                     shadows[nshadows].layout       = as->layout;
                     shadows[nshadows].ptr_fields   = ptf;
                     shadows[nshadows].n_ptr_fields = n_ptf;
@@ -894,24 +1072,33 @@ static inline uint64_t lind_marshal_dispatch(
         const struct lind_arg_spec *sas = &spec->args[shadows[s].arg_index];
 
         // OUT pointer-to-pointer that aliases an arg (strtol's char** endptr):
-        // the callee wrote a pointer into arg[target]'s buffer; translate it from
-        // the grate shadow to the source cage and write it back to the outer slot.
+        // the callee wrote a pointer into arg[target]'s buffer; translate it
+        // from the grate shadow to the source cage and write it back to the
+        // outer slot. `inner` is entirely callee-controlled -- never expose
+        // it, or an address derived from it, to the source cage without
+        // confirming it's a valid position within the aliased argument's own
+        // shadow allocation; fail closed otherwise (an out-of-bounds value
+        // here is either a library bug or a deliberate attempt to leak a
+        // grate-process address to the source cage).
         if (sas->out_ptr_into_arg1 != 0) {
             uint32_t target = sas->out_ptr_into_arg1 - 1;
             uint32_t inner = *(uint32_t *)shadows[s].shadow_ptr;  // what the callee wrote
-            uint32_t translated = inner;                          // default: pass through (e.g. NULL)
+            uint32_t translated = 0;                              // default: NULL
             if (inner != 0) {
+                const struct _lind_shadow *tshadow = NULL;
                 for (uint32_t t = 0; t < nshadows; t++) {
-                    if (shadows[t].arg_index == target) {
-                        uintptr_t base = (uintptr_t)shadows[t].shadow_ptr;
-                        if ((uintptr_t)inner >= base &&
-                            (uintptr_t)inner <= base + shadows[t].size) {
-                            uint64_t off = (uintptr_t)inner - base;
-                            translated = (uint32_t)((uint32_t)shadows[t].source_ptr + off);
-                        }
-                        break;
-                    }
+                    if (shadows[t].arg_index == target) { tshadow = &shadows[t]; break; }
                 }
+                if (!tshadow)
+                    _lind_marshal_abort("OUT ptr-to-ptr: aliased argument has no shadow");
+                _lind_check_shadow_owner(tshadow->source_cage, tshadow->grate_cage,
+                                          source_cage, grate_cage,
+                                          "OUT ptr-to-ptr: aliased shadow does not belong to this call's cages");
+                translated = (uint32_t)_lind_translate_shadow_ptr_or_abort(
+                    (uintptr_t)tshadow->shadow_ptr, tshadow->size,
+                    (sas->flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
+                    tshadow->source_ptr, (uint64_t)inner,
+                    "OUT ptr-to-ptr: value outside the aliased argument's shadow buffer");
             }
             _lind_copy_or_abort(grate_cage, source_cage,
                 (uint64_t)(uintptr_t)&translated, grate_cage,
@@ -943,23 +1130,31 @@ static inline uint64_t lind_marshal_dispatch(
             break;
 
         case LIND_RET_PTR_INTO_ARG: {
-            // handler_ret is a pointer into a shadow buffer.
-            // Translate: result = source_ptr + (handler_ret - shadow_ptr).
+            // handler_ret is a pointer into a shadow buffer -- entirely
+            // callee-controlled. Translate it to the source cage's
+            // equivalent address only once confirmed to lie within the
+            // aliased argument's own shadow allocation; never fall back to
+            // exposing the raw handler_ret (a grate-process address) to the
+            // source cage.
             uint32_t idx = spec->ret.alias_arg_index;
             if (handler_ret == 0) {
                 result = 0;  // NULL return (not found)
                 break;
             }
+            const struct _lind_shadow *rshadow = NULL;
             for (uint32_t s = 0; s < nshadows; s++) {
-                if (shadows[s].arg_index == idx) {
-                    int64_t off = (int64_t)handler_ret
-                                - (int64_t)(uintptr_t)shadows[s].shadow_ptr;
-                    result = (uint64_t)((int64_t)(int32_t)(uint32_t)shadows[s].source_ptr
-                                       + off);
-                    goto done;
-                }
+                if (shadows[s].arg_index == idx) { rshadow = &shadows[s]; break; }
             }
-            result = handler_ret;  // fallback
+            if (!rshadow)
+                _lind_marshal_abort("pointer-into-arg return: aliased argument has no shadow");
+            _lind_check_shadow_owner(rshadow->source_cage, rshadow->grate_cage,
+                                      source_cage, grate_cage,
+                                      "pointer-into-arg return: aliased shadow does not belong to this call's cages");
+            result = _lind_translate_shadow_ptr_or_abort(
+                (uintptr_t)rshadow->shadow_ptr, rshadow->size,
+                (spec->ret.flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
+                rshadow->source_ptr, handler_ret,
+                "pointer-into-arg return: value outside the aliased argument's shadow buffer");
             break;
         }
 
@@ -977,7 +1172,6 @@ static inline uint64_t lind_marshal_dispatch(
             result = handler_ret;
             break;
     }
-done:
     _lind_marshal_reset();
     return result;
 }
