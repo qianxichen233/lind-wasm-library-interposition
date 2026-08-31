@@ -1571,7 +1571,8 @@ impl<T: Clone + Send + 'static + std::marker::Sync, U: Clone + Send + 'static + 
             // cage_finalize (which records the zombie and sends SIGCHLD) is never
             // called.  Mirror the fork-crash cleanup path (see fork_call error
             // handling) exactly.
-            if let Err(ref _e) = ret {
+            if let Err(ref e) = ret {
+                lind_log!(Default, "Exec'd child error: {:?}", e);
                 cage::cage_record_exit_status(cloned_cageid as u64, cage::ExitStatus::Exited(1));
                 if let Some(c) = cage::get_cage(cloned_cageid as u64) {
                     c.is_dead.store(true, std::sync::atomic::Ordering::Release);

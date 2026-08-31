@@ -809,6 +809,13 @@ static inline uint64_t lind_marshal_dispatch(
     const char                     *_dbg_name)
 {
     (void)_dbg_name;
+    // raw_args and the handler cast below are both fixed at LIND_RAW_ARGS_MAX
+    // slots (the pass_fptr_to_wt/register_lib_handler transport width); a
+    // spec with more args than that would read raw_args out of bounds and
+    // silently drop everything past slot 6 into the handler call.
+    if (spec->nargs > LIND_RAW_ARGS_MAX)
+        _lind_marshal_abort("marshal spec exceeds raw ABI slot capacity");
+
     _lind_marshal_reset();
     _lind_marshal_source_cage = source_cage;
     _lind_marshal_grate_cage  = grate_cage;

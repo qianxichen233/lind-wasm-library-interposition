@@ -48,6 +48,14 @@ void toy_ctx_close(void *ctx) {
     free(ctx);
 }
 
+// toy_wide_sum7: 7 scalar args -- one raw ABI slot beyond the 6-slot
+// interposition transport. Used to test that a portal for a wider-than-6
+// signature is rejected at link time rather than silently truncated.
+int toy_wide_sum7(int a, int b, int c, int d, int e, int f, int g) {
+    printf("[libtoy] toy_wide_sum7 — this should NOT print if interposed\n");
+    return a + b + c + d + e + f + g;
+}
+
 // toy_argv_len: sum of strlen of each element of a NULL-terminated argv array.
 // Used by the ptr_array (argv) marshalling test.
 int toy_argv_len(const char **argv) {

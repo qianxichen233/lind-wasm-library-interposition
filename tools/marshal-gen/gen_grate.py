@@ -47,6 +47,23 @@ SUPPORTED_RET = {"void", "scalar", "ptr_alias_arg", "ptr_into_arg", "handle"}
 SUPPORTED_SIZE = {None, "none", "na", "const", "from_arg", "from_arg_pointee",
                   "cstr", "ptr_array"}
 
+# The interposition runtime's call-site transport is fixed-arity at this many
+# raw wasm-level argument/cage-id pairs (pass_fptr_to_wt / register_lib_handler
+# / lind_marshal_dispatch — see tests/grate-tests/lib-interpose/lind_marshal.h's
+# LIND_RAW_ARGS_MAX). marshal-infer already force_locals anything wider
+# (tools/marshal-infer/src/Infer.cpp's kMaxRawArgSlots/enforceRawArgSlotCap),
+# so this check is normally redundant with a fresh <lib>.marshal.json — it
+# exists as this tool's OWN independent gate against stale, hand-edited, or
+# older JSON that still marks such a function "marshal": generating a handler
+# for one would compile fine and only abort (taking the whole grate process
+# down with it) on the function's first real call.
+#
+# This width is duplicated, not shared, across marshal-infer, gen_grate.py,
+# lind_marshal.h, and linker.rs — all four must be changed together;
+# tests/grate-tests/lib-interpose/check_raw_arg_slot_consistency.sh fails the
+# moment any of them disagree.
+LIND_RAW_ARGS_MAX = 6
+
 
 # Name substrings whose functions cannot be interposed in a static grate:
 #  - setjmp/longjmp: toolchain rejects taking setjmp's address; longjmp restores
@@ -145,6 +162,23 @@ def is_marshalable(f):
     name = f.get("name", "")
     if name in NEVER_INTERPOSE or name in FD_FUNCS \
             or any(s in name for s in NEVER_INTERPOSE_SUBSTR):
+        return False
+    # `args` is already one JSON entry per raw wasm-level ABI slot (sret and
+    # multi-slot params are pre-flattened by marshal-infer), so its length IS
+    # the raw slot count -- see LIND_RAW_ARGS_MAX. Inference should already
+    # have force_localed anything this wide; reaching "marshal" here means the
+    # JSON disagrees with the runtime's transport width (stale, hand-edited,
+    # or produced by an older marshal-infer). Loud and specific, unlike the
+    # generic "dropped" summary below: this is an input-correctness bug, not
+    # routine unsupported-feature filtering, and generating a handler for it
+    # would compile fine and only abort -- taking the whole grate process down
+    # with it -- on the function's first real call.
+    nargs = len(f.get("args", []))
+    if nargs > LIND_RAW_ARGS_MAX:
+        print(f"[gen_grate] REJECTING {name}: needs {nargs} raw ABI slots, "
+              f"exceeding the interposition transport's {LIND_RAW_ARGS_MAX}-slot "
+              f"capacity (marked \"marshal\" despite this -- stale or hand-edited JSON?)",
+              file=sys.stderr)
         return False
     ret = f.get("ret") or {}
     r = ret.get("kind")

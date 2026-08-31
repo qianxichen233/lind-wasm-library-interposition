@@ -1147,6 +1147,41 @@ void lowerAbiReturn(const Function &F, FunctionTrees &ft, bool trueSret,
         "synthetic leading pointer argument, not a return value");
 }
 
+// The interposition runtime's call-site transport is fixed-arity: the portal
+// (pass_fptr_to_wt) captures exactly LIND_RAW_ARGS_MAX=6 raw wasm-level
+// argument/cage-id pairs (tests/grate-tests/lib-interpose/lind_marshal.h),
+// and lind_marshal_dispatch aborts the whole grate process if a spec claims
+// more than that -- see the file's `if (spec->nargs > LIND_RAW_ARGS_MAX)
+// _lind_marshal_abort(...)` guard. THIS is the single authoritative source of
+// the "6" below; keep it in sync if that constant ever changes.
+//
+// A function's true raw-slot count is NOT its DWARF/C-level argument count --
+// it's post-ABI-lowering: the synthetic sret/fp128-return pointer (if any)
+// counts as one slot, and any argument with abiSlots>1 (fp128, see above)
+// counts as N slots, not one. Undercounting here is exactly the bug this
+// check exists to prevent: without it, marshal-infer marks a >6-slot function
+// "marshal", gen_grate.py happily registers a handler for it, and the FIRST
+// real call to it aborts the entire grate process at runtime -- taking down
+// every other function sharing that grate, not just the wide one.
+constexpr unsigned kMaxRawArgSlots = 6;
+
+void enforceRawArgSlotCap(FunctionTrees &ft) {
+  unsigned slots = ft.retSretArg ? 1 : 0;
+  for (const auto &p : ft.params)
+    slots += std::max<uint32_t>(1, p->abiSlots);
+  if (slots <= kMaxRawArgSlots)
+    return;
+  ft.forceLocal = true;
+  ft.warnings.push_back(
+      "function needs " + std::to_string(slots) + " raw ABI slots" +
+      (ft.retSretArg ? " (including a synthetic sret/fp128-return pointer)"
+                     : "") +
+      " but the interposition runtime's transport is fixed at " +
+      std::to_string(kMaxRawArgSlots) +
+      " (LIND_RAW_ARGS_MAX) — force_local (a wider spec would abort the "
+      "whole grate process on the first real call, not just fail this one)");
+}
+
 } // namespace
 
 void inferFunction(const Function &F, FunctionTrees &ft) {
@@ -1529,6 +1564,14 @@ void inferFunction(const Function &F, FunctionTrees &ft) {
       }
     }
   }
+
+  // Final, unconditional gate: regardless of how every individual argument/
+  // return classified, a function whose total raw ABI slot count exceeds the
+  // runtime's fixed transport width can never be safely marshalled. Runs last
+  // (not folded into the per-arg loop above) because it needs the FINAL
+  // abiSlots/retSretArg state, which per-arg classification only finishes
+  // determining by the time this function returns.
+  enforceRawArgSlotCap(ft);
 }
 
 } // namespace marshal

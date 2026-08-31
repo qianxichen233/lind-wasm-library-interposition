@@ -22,6 +22,7 @@
 extern void *memmove(void *dest, const void *src, size_t n);
 struct toy_buffer { const char *data; unsigned len; };
 extern int toy_buf_checksum(const struct toy_buffer *b);
+extern int toy_mul(int a, int b);
 
 // --- memmove: size_arg_index deliberately out of range (real memmove's n
 // is arg index 2; LIND_RAW_ARGS_MAX is 6, so 99 is unreachably out of
@@ -78,6 +79,32 @@ static uint64_t handler_buf_checksum(uint64_t b, uint64_t a1, uint64_t a2, uint6
 }
 LIND_DEFINE_MARSHAL_HANDLER(toy_buf_checksum, &buf_checksum_bad_spec, handler_buf_checksum)
 
+// --- toy_mul: real signature has 2 raw ABI slots, but the spec below
+// deliberately claims 7 -- exceeding LIND_RAW_ARGS_MAX (6), the transport's
+// actual capacity. This is a corrupt/misconfigured spec, distinct from
+// widesig_grate.c's toy_wide_sum7 (a REAL function whose own signature is
+// too wide, rejected earlier at link/portal-install time before any spec is
+// even consulted). This case is only reachable at all because toy_mul's
+// real signature is narrow enough for the portal to install normally --
+// it's lind_marshal_dispatch's own spec->nargs bound that must catch it. ---
+static struct lind_marshal_spec mul_bad_spec = {
+    .nargs = 7,
+    .args = {
+        { .kind = LIND_ARG_SCALAR }, { .kind = LIND_ARG_SCALAR },
+        { .kind = LIND_ARG_SCALAR }, { .kind = LIND_ARG_SCALAR },
+        { .kind = LIND_ARG_SCALAR }, { .kind = LIND_ARG_SCALAR },
+        { .kind = LIND_ARG_SCALAR },
+    },
+    .ret = { .kind = LIND_RET_SCALAR },
+};
+static uint64_t handler_mul(uint64_t a, uint64_t b, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    printf("[Grate|badspec] toy_mul handler ran (should not happen)\n");
+    fflush(stdout);
+    return LIND_RET_INT(toy_mul((int)a, (int)b));
+}
+LIND_DEFINE_MARSHAL_HANDLER(toy_mul, &mul_bad_spec, handler_mul)
+
 // ---------------------------------------------------------------------------
 // Standard grate dispatcher — required export in every grate.
 // ---------------------------------------------------------------------------
@@ -115,8 +142,10 @@ int main(int argc, char *argv[]) {
         if (ret != 0) { fprintf(stderr, "[Grate|badspec] register memmove failed\n"); assert(0); }
         ret = register_lib_handler(cageid, "env", "toy_buf_checksum", grateid, (uint64_t)(uintptr_t)&lind_mh_toy_buf_checksum);
         if (ret != 0) { fprintf(stderr, "[Grate|badspec] register toy_buf_checksum failed\n"); assert(0); }
+        ret = register_lib_handler(cageid, "env", "toy_mul", grateid, (uint64_t)(uintptr_t)&lind_mh_toy_mul);
+        if (ret != 0) { fprintf(stderr, "[Grate|badspec] register toy_mul failed\n"); assert(0); }
 
-        printf("[Grate|badspec] registered 2/2 handlers\n");
+        printf("[Grate|badspec] registered 3/3 handlers\n");
         fflush(stdout);
         if (execv(argv[1], &argv[1]) == -1) { perror("execv"); assert(0); }
     }
