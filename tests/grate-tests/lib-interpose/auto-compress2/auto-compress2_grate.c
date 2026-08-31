@@ -62,12 +62,14 @@ static uint64_t handler_compress2(uint64_t dest, uint64_t destLen,
     *(uint32_t *)LIND_AS_PTR(destLen) = 4;
 
     printf("[Grate|auto-compress2] compress2 intercepted — wrote \"LIND\", destLen=4\n");
+    fflush(stdout); // flush before returning control to the cage, or its own
+                     // stdout write can land ahead of this buffered line
     return 0;  // Z_OK
 }
 
 LIND_DEFINE_MARSHAL_HANDLER(compress2, &compress2_spec, handler_compress2)
 
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -75,10 +77,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg5, uint64_t arg5cage,
                     uint64_t arg6, uint64_t arg6cage) {
     if (fn_ptr_uint == 0) { fprintf(stderr, "[Grate|auto-compress2] invalid fn ptr\n"); assert(0); }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,

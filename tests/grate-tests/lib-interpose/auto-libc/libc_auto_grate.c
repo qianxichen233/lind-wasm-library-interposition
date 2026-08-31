@@ -107,7 +107,7 @@ static struct reg_entry g_table[] = {
 #define G_TABLE_N ((int)(sizeof(g_table)/sizeof(g_table[0])))
 
 // --- generic dispatcher: registered value is a struct libctx* ---
-int pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
                     uint64_t a1, uint64_t a1c, uint64_t a2, uint64_t a2c,
                     uint64_t a3, uint64_t a3c, uint64_t a4, uint64_t a4c,
                     uint64_t a5, uint64_t a5c, uint64_t a6, uint64_t a6c) {
@@ -117,8 +117,11 @@ int pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
     uint64_t cages[6] = { a1c, a2c, a3c, a4c, a5c, a6c };
     uint64_t src = 0;
     for (int i = 0; i < 6 && src == 0; i++) src = cages[i];
-    return (int)lind_marshal_dispatch(ctx->real_fn, ctx->spec, src, cageid,
-                                      raw, ctx->spec->nargs);
+    // recover the enclosing reg_entry (ctx is always &g_table[i].ctx) for its name
+    struct reg_entry *_re =
+        (struct reg_entry *)((char *)ctx - offsetof(struct reg_entry, ctx));
+    return (int64_t)lind_marshal_dispatch(ctx->real_fn, ctx->spec, src, cageid,
+                                      raw, ctx->spec->nargs, _re->name);
 }
 
 int main(int argc, char *argv[]) {

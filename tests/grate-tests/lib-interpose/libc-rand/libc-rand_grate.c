@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 // Standard grate dispatcher — required export in every grate.
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -22,10 +22,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
         fprintf(stderr, "[Grate|libc-rand] invalid fn ptr\n");
         assert(0);
     }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,
