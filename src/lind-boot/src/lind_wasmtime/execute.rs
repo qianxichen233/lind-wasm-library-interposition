@@ -232,10 +232,23 @@ pub fn execute_with_lind(
     }
 
     // Load the preload wasm modules.
+    //
+    // preload_modes tracks each preloaded module's linking mode (see
+    // cli::PreloadMode), keyed by MODULE_PATH (not `name` -- every dylink
+    // library preloads under the same wasm import namespace, "env", so a
+    // name-keyed map would collapse multiple preloads' modes together).
+    // Kept separate from `modules` below since `modules` gets cloned into
+    // LindCtx and threaded through fork/thread/dlopen child replay elsewhere
+    // -- adding a 4th tuple element there would ripple into all of that, for
+    // a mode this first cut only needs at the single `module_with_preload`
+    // call site below.
+    let mut preload_modes: std::collections::HashMap<String, crate::cli::PreloadMode> =
+        std::collections::HashMap::new();
     let mut modules = Vec::new();
     modules.push((String::new(), String::new(), module.clone()));
-    for (name, path) in lind_boot.preloads.iter() {
+    for (name, path, mode) in lind_boot.preloads.iter() {
         let module = read_wasm_or_cwasm(&engine, path)?;
+        preload_modes.insert(path.to_string_lossy().to_string(), *mode);
         modules.push((
             name.clone(),
             path.to_string_lossy().to_string(),
@@ -318,6 +331,8 @@ pub fn execute_with_lind(
             // shared table. GOT entries are patched through the shared LindGOT.
             lind_log!(DYLINK, "library {} instantiate", name);
             let mut got_guard = lind_got.lock().unwrap();
+            let force_interposed =
+                preload_modes.get(path.as_str()) == Some(&crate::cli::PreloadMode::Interposed);
             lib_linker
                 .module_with_preload(
                     &mut wstore,
@@ -328,6 +343,7 @@ pub fn execute_with_lind(
                     table_start,
                     &got_guard,
                     path.clone(),
+                    force_interposed,
                 )
                 .map_err(anyhow::Error::from)
                 .context(format!("failed to process preload `{}`", name,))?;
@@ -491,7 +507,10 @@ fn attach_api(
             let dynamic_loader: DynamicLoader<HostCtx> =
                 Arc::new(move |caller, cageid, library_name, mode| {
                     let lind_ctx = caller.data().lind_fork_ctx.as_ref().unwrap();
-                    let linker = lind_ctx.linker.clone().unwrap();
+                    // Deep-clone the linker (through the Arc) — load_library_module
+                    // needs an owned linker to define the dlopen'd library's exports.
+                    // dlopen is not on the hot path, so the deep clone is fine here.
+                    let linker = (*lind_ctx.linker.clone().unwrap()).clone();
                     let got_table = lind_ctx.got_table.clone().unwrap();
 
                     if lind_ctx.had_threads() {
@@ -654,6 +673,7 @@ fn load_main_module(
                 Some(cageid as u64),
                 vec!["signal_callback"],
                 None,
+                false,
             )
             .unwrap();
 

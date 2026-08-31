@@ -1,0 +1,34 @@
+{
+  "_comment": "Curated, un-inferable knowledge for marshal-infer. These built-in defaults (mirrored here for reference) cover glibc/zlib and are compiled in; pass --annotations <file> to EXTEND them per library. The general dataflow detectors live in the tool, not here. Fields: handle_types = DWARF struct name -> handle class (opaque, token-translated). allocators = fn base name (strip leading __ / __libc_) -> {\"size_args\":[idx...]} (byte size = product of those args) or {\"force_local\":true} (realloc-style). return_into_arg0 = searcher fn base names whose return is a pointer into arg0 (computed in a sibling TU, so undetectable by dataflow).",
+
+  "handle_types": {
+    "_IO_FILE": "FILE",
+    "__dirstream": "DIR",
+    "__locale_struct": "locale"
+  },
+
+  "allocators": {
+    "malloc":         {"size_args": [0]},
+    "valloc":         {"size_args": [0]},
+    "pvalloc":        {"size_args": [0]},
+    "aligned_alloc":  {"size_args": [1]},
+    "memalign":       {"size_args": [1]},
+    "calloc":         {"size_args": [0, 1]},
+    "realloc":        {"force_local": true},
+    "reallocarray":   {"force_local": true},
+    "posix_memalign": {"force_local": true},
+    "strdup":         {"force_local": true},
+    "strndup":        {"force_local": true}
+  },
+
+  "return_into_arg0": [
+    "strchr", "strrchr", "index", "rindex", "strchrnul",
+    "memchr", "memrchr", "rawmemchr", "strstr", "strcasestr", "strpbrk"
+  ],
+
+  "ptr_array_args": {
+    "execv": [1], "execvp": [1], "execvpe": [1, 2], "execve": [1, 2],
+    "fexecve": [1, 2], "execveat": [2, 3], "getopt": [1], "getopt_long": [1],
+    "getopt_long_only": [1], "posix_spawn": [4, 5], "posix_spawnp": [4, 5]
+  }
+}

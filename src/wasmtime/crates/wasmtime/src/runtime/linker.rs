@@ -54,6 +54,34 @@ pub(crate) fn is_dylink_internal_symbol(name: &str) -> bool {
     )
 }
 
+/// Returns true if `name` is lind/glibc runtime-glue rather than real library
+/// API surface -- these are the extra symbols `scripts/make_shared_glibc.sh`
+/// force-exports with `--export-if-defined` beyond what `is_dylink_internal_symbol`
+/// already fully excludes from cross-module linking (startup/init hooks, the 3i
+/// primitives grates themselves are built on, and the wasm EH-based setjmp/
+/// longjmp support functions). No caller would ever legitimately register a
+/// grate handler for these, so `interposed` mode's "trap if unregistered" rule
+/// (see instance_dylink's force_interposed) exempts them and links straight to
+/// the real implementation instead, same as `mixed` mode always has.
+fn is_lind_runtime_glue(name: &str) -> bool {
+    matches!(
+        name,
+        "__libc_setup_tls"
+            | "__wasi_init_tp"
+            | "__ctype_init"
+            | "__lind_init_addr_translation"
+            | "copy_data_between_cages"
+            | "copy_handler_table_to_cage"
+            | "make_threei_call"
+            | "register_handler"
+            | "saveSetjmp"
+            | "testSetjmp"
+            | "getTempRet0"
+            | "setTempRet0"
+            | "__wasm_longjmp"
+    )
+}
+
 /// Symbols that may be exported by multiple shared libraries (e.g. as re-exports of
 /// an import they received from libc). The first definition wins; subsequent duplicates
 /// are silently ignored rather than causing a "defined twice" error.
@@ -1027,6 +1055,13 @@ impl<T> Linker<T> {
         // Optional GOT to update when a portal is installed (so GOT.func.X also
         // points to the portal rather than the real library function).
         got: Option<&LindGOT>,
+        // Guaranteed-isolation mode (CLI: `--preload NAME=PATH:interposed`): a
+        // symbol with no registered grate handler traps instead of linking to
+        // this library's own real implementation. `false` preserves today's
+        // "mixed" behavior everywhere except the CLI-driven top-level preload
+        // path -- fork/thread/dlopen child re-attachment call sites all pass
+        // `false` for now (out of scope for the first cut of this feature).
+        force_interposed: bool,
     ) -> Result<&mut Self>
     where
         T: 'static,
@@ -1068,10 +1103,28 @@ impl<T> Linker<T> {
                             let name_for_got = name.clone();
                             let func_ty = original_func.ty(&store);
                             let func_ty_for_portal = func_ty.clone();
+                            // Resolved once here (like handler_cage_id/fn_ptr above)
+                            // rather than via Caller::get_export inside the portal:
+                            // __errno_location lives on libc.so's own dylink'd
+                            // instance, not on whichever instance happens to call
+                            // through this portal, so Caller::get_export (which only
+                            // sees the *calling* instance's own exports) can't find
+                            // it. This cage's "env" namespace is shared by every
+                            // dylink'd library, so the linker's own lookup does.
+                            let errno_location_func = self
+                                .get(&mut store, "env", "__errno_location")
+                                .ok()
+                                .and_then(|e| {
+                                    if let Extern::Func(f) = e {
+                                        Some(f)
+                                    } else {
+                                        None
+                                    }
+                                });
                             let portal = Func::new(
                                 &mut store,
                                 func_ty,
-                                move |_caller, params, results| {
+                                move |mut caller, params, results| {
                                     let mut raw = [0u64; 6];
                                     for (i, v) in params.iter().enumerate().take(6) {
                                         raw[i] = match v {
@@ -1082,6 +1135,71 @@ impl<T> Linker<T> {
                                             _ => 0,
                                         };
                                     }
+
+                                    // Seed the grate's errno with this cage's own
+                                    // current value before dispatching. The grate's
+                                    // errno is a separate value that persists across
+                                    // calls independently of this cage's own resets
+                                    // (e.g. a test's `errno = 0;` right before the
+                                    // call) -- without seeding, a stale value left by
+                                    // an earlier, unrelated interposed call would leak
+                                    // into every later call that doesn't itself touch
+                                    // errno. See threei::set_next_grate_errno_seed's
+                                    // doc. Best-effort, same as the post-call relay
+                                    // below.
+                                    if let Some(errno_loc) = errno_location_func {
+                                        if let Ok(typed) = errno_loc.typed::<(), i32>(&caller) {
+                                            if let Ok(addr) = typed.call(&mut caller, ()) {
+                                                let addr = addr as u32 as usize;
+                                                let mem = {
+                                                    let mut it =
+                                                        caller.as_context_mut().0.all_memories();
+                                                    let m = it.next();
+                                                    drop(it);
+                                                    m
+                                                };
+                                                let seed = match mem {
+                                                    Some(
+                                                        crate::runtime::vm::ExportMemory::Unshared(
+                                                            mem,
+                                                        ),
+                                                    ) => {
+                                                        let mut buf = [0u8; 4];
+                                                        mem.read(&caller, addr, &mut buf)
+                                                            .ok()
+                                                            .map(|_| i32::from_le_bytes(buf))
+                                                    }
+                                                    Some(
+                                                        crate::runtime::vm::ExportMemory::Shared(
+                                                            vm_shared,
+                                                            _,
+                                                        ),
+                                                    ) => {
+                                                        let def = unsafe {
+                                                            vm_shared.vmmemory_ptr().as_ref()
+                                                        };
+                                                        let len = def.current_length.load(
+                                                            core::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        (addr + 4 <= len).then(|| {
+                                                            let mut buf = [0u8; 4];
+                                                            unsafe {
+                                                                core::ptr::copy_nonoverlapping(
+                                                                    def.base.as_ptr().add(addr),
+                                                                    buf.as_mut_ptr(),
+                                                                    4,
+                                                                );
+                                                            }
+                                                            i32::from_le_bytes(buf)
+                                                        })
+                                                    }
+                                                    None => None,
+                                                };
+                                                threei::set_next_grate_errno_seed(seed);
+                                            }
+                                        }
+                                    }
+
                                     let ret = threei::dispatch_lib_call(
                                         handler_cage_id,
                                         fn_ptr,
@@ -1098,12 +1216,93 @@ impl<T> Linker<T> {
                                         raw[5],
                                         cid,
                                     );
+
+                                    // errno is ambient, per-cage TLS state that
+                                    // dispatch_lib_call's arg/return marshalling never
+                                    // sees -- the real call just ran inside the grate's
+                                    // own address space, so its errno write is invisible
+                                    // to this (caller's) cage. Relay the grate's
+                                    // post-call errno (captured by the grate worker,
+                                    // see threei::take_last_grate_errno's doc) into this
+                                    // cage's own errno slot, via the errno_location_func
+                                    // resolved above. Best-effort: a callee without
+                                    // __errno_location, or a cage whose libc doesn't
+                                    // export it, just skips this.
+                                    if let Some(errno_val) = threei::take_last_grate_errno() {
+                                        if let Some(errno_loc) = errno_location_func {
+                                            if let Ok(typed) = errno_loc.typed::<(), i32>(&caller) {
+                                                if let Ok(addr) = typed.call(&mut caller, ()) {
+                                                    // addr is a wasm32 pointer; zero-extend through u32
+                                                    // first, since `i32 as usize` sign-extends and a high
+                                                    // address (top bit set) would otherwise become a
+                                                    // bogus, huge 64-bit offset (see the identical fix in
+                                                    // lind-3i's run()).
+                                                    let addr = addr as u32 as usize;
+                                                    // dylink modules import (not export)
+                                                    // memory, so get_export("memory") is
+                                                    // always None here -- use
+                                                    // all_memories() on the StoreOpaque
+                                                    // directly, matching the remote-lib
+                                                    // wrapper's memory lookup above.
+                                                    let mem = {
+                                                        let mut it = caller
+                                                            .as_context_mut()
+                                                            .0
+                                                            .all_memories();
+                                                        let m = it.next();
+                                                        drop(it);
+                                                        m
+                                                    };
+                                                    match mem {
+                                                        Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
+                                                            let _ = mem.write(
+                                                                &mut caller,
+                                                                addr,
+                                                                &errno_val.to_le_bytes(),
+                                                            );
+                                                        }
+                                                        // A `-pthread` caller exports memory as
+                                                        // shared rather than unshared; the public
+                                                        // `Memory` handle is tied to a specific
+                                                        // store+instance index and can't be
+                                                        // constructed from a bare SharedMemory, so
+                                                        // write through its raw VM definition
+                                                        // instead (bounds-checked by hand).
+                                                        Some(crate::runtime::vm::ExportMemory::Shared(vm_shared, _)) => {
+                                                            let def = unsafe { vm_shared.vmmemory_ptr().as_ref() };
+                                                            let len = def.current_length.load(
+                                                                core::sync::atomic::Ordering::Relaxed,
+                                                            );
+                                                            if addr + 4 <= len {
+                                                                unsafe {
+                                                                    core::ptr::copy_nonoverlapping(
+                                                                        errno_val.to_le_bytes().as_ptr(),
+                                                                        def.base.as_ptr().add(addr),
+                                                                        4,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        None => {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ret now carries the callee's real return value at
+                                    // full 64-bit width (see threei::dispatch_lib_call /
+                                    // pass_fptr_to_wt). I32/F32 take the low 32 bits;
+                                    // I64/F64 are a direct bit-preserving pass-through —
+                                    // previously `ret` was i32 and this F64 arm did
+                                    // `ret as u64`, which sign-extended a truncated
+                                    // 32-bit half into a bogus 64-bit double bit pattern.
                                     for (slot, ty) in
                                         results.iter_mut().zip(func_ty_for_portal.results())
                                     {
                                         *slot = match ty {
-                                            ValType::I32 => Val::I32(ret),
-                                            ValType::I64 => Val::I64(ret as i64),
+                                            ValType::I32 => Val::I32(ret as i32),
+                                            ValType::I64 => Val::I64(ret),
                                             ValType::F32 => Val::F32(ret as u32),
                                             ValType::F64 => Val::F64(ret as u64),
                                             other => {
@@ -1141,6 +1340,32 @@ impl<T> Linker<T> {
                                 }
                             }
                             self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
+                            continue;
+                        }
+
+                        // No grate handler registered for this symbol. Under
+                        // `interposed` mode this library has a guaranteed
+                        // isolation contract -- every call either dispatches
+                        // through a grate or is rejected, with no exceptions --
+                        // so link a trap here instead of falling through to the
+                        // real, un-interposed implementation below. Lind's own
+                        // runtime-glue exports (startup hooks, 3i primitives,
+                        // setjmp/longjmp support) are exempt -- see
+                        // is_lind_runtime_glue's doc.
+                        if force_interposed && !is_lind_runtime_glue(&name) {
+                            let func_ty = original_func.ty(&store);
+                            let module_name_owned = module_name.to_string();
+                            let name_owned = name.clone();
+                            let trap = Func::new(&mut store, func_ty, move |_, _, _| {
+                                bail!(
+                                    "interposed mode: {}::{} has no registered grate \
+                                     handler -- rejecting the call instead of running \
+                                     it locally, un-interposed",
+                                    module_name_owned,
+                                    name_owned
+                                );
+                            });
+                            self.insert(key, Definition::new(store.0, Extern::Func(trap)))?;
                             continue;
                         }
                     }
@@ -1444,6 +1669,8 @@ impl<T> Linker<T> {
         table_base: i32,
         got: &LindGOT,
         path: String,
+        // See instance_dylink's force_interposed doc.
+        force_interposed: bool,
     ) -> Result<&mut Self>
     where
         T: 'static,
@@ -1542,6 +1769,7 @@ impl<T> Linker<T> {
                     Some(cageid),
                     vec![],
                     Some(got),
+                    force_interposed,
                 )
             }
         }
@@ -1639,7 +1867,15 @@ impl<T> Linker<T> {
                     }
                 }
 
-                self.instance_dylink(store, module_name, instance, Some(cageid), vec![], None)
+                self.instance_dylink(
+                    store,
+                    module_name,
+                    instance,
+                    Some(cageid),
+                    vec![],
+                    None,
+                    false,
+                )
             }
         }
     }
@@ -1864,6 +2100,7 @@ impl<T> Linker<T> {
                         Some(cageid),
                         vec![],
                         Some(got),
+                        false,
                     );
                 }
 

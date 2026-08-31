@@ -6,6 +6,7 @@ clang+llvm-*
 *.wasm
 *.cwasm
 *.wat
+*.bc
 
 #Ignore Build artifacts
 src/glibc/build/
@@ -17,6 +18,29 @@ scripts/object_lists_final/
 e2e_status
 reports/
 report.html
+results.json
+grates.json
+dup2test.txt
+tests/grate-tests/lib-interpose/full-libm/generated/
+
+# Local library-interposition experiments and generated metadata
+/libc.marshal.json
+/libm.marshal.json
+/libz.marshal.json
+/openblas.marshal.json
+**/*.marshal.json
+/tests/playground/
+/tests/grate-tests/lib-interpose/full-*/*_full_grate.c
+
+# Local library-interposition research and working notes
+/impl-log.md
+/issues/*.md
+/research/arg-marshalling/*.md
+/tests/grate-tests/lib-interpose/*.md
+/tools/marshal-infer/README.md
+/tools/marshal-infer/example/README.md
+/.codex/
+/AGENTS.md
 
 **/*.so
 
@@ -32,3 +56,6 @@ Cargo.lock
 
 #Ignore Lind runtime log file
 LIND.log
+
+#Ignore embedded reference clone (has its own .git; not meant to be a submodule)
+research/arg-marshalling/Cali-library-isolation/

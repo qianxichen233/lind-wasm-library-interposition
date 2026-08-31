@@ -57,7 +57,7 @@ pub type GrateTrampolineFn = extern "C" fn(
     arg5cageid: u64,
     arg6: u64,
     arg6cageid: u64,
-) -> i32;
+) -> i64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrampolineEntry {
@@ -215,7 +215,7 @@ fn _call_grate_func(
     arg5_cageid: u64,
     arg6: u64,
     arg6_cageid: u64,
-) -> Option<i32> {
+) -> Option<i64> {
     let runtimeid = match get_cage_runtime(grateid) {
         Some(r) => r,
         None => panic!(
@@ -485,6 +485,7 @@ pub fn make_syscall(
             // threei special case: directly call the function pointer
             let func: GrateTrampolineFn =
                 unsafe { std::mem::transmute::<u64, GrateTrampolineFn>(in_grate_fn_ptr_u64) };
+            // make_syscall's own contract stays i32 — see the ret-as-i32 note below.
             return func(
                 self_cageid,
                 target_cageid,
@@ -500,7 +501,7 @@ pub fn make_syscall(
                 arg5_cageid,
                 arg6,
                 arg6_cageid,
-            );
+            ) as i32;
         }
 
         // Grate case: call into the corresponding grate function
@@ -553,7 +554,11 @@ pub fn make_syscall(
         });
 
         if let Some(ret) = grate_result {
-            return ret;
+            // make_syscall's own contract stays i32 (regular syscall results).
+            // _call_grate_func is now i64 to support dispatch_lib_call's wider
+            // library-call return values (double/int64_t/pointer scalars) — this
+            // register_handler-based syscall path doesn't need the extra width.
+            return ret as i32;
         } else {
             // syscall has been registered to register_handler but grate's entry function
             // doesn't provide
@@ -1094,6 +1099,74 @@ pub fn register_lib_handler(
     0
 }
 
+/***************************** grate errno relay *****************************/
+
+std::thread_local! {
+    /// See `take_last_grate_errno`'s doc.
+    static LAST_GRATE_ERRNO: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+    /// See `take_next_grate_errno_seed`'s doc.
+    static NEXT_GRATE_ERRNO_SEED: std::cell::Cell<Option<i32>> = std::cell::Cell::new(None);
+}
+
+/// Record the caller's errno value from just before a grate call, so the
+/// grate worker can seed its own errno with it before invoking the real
+/// function. Without this, the grate's errno is a separate, independently
+/// persisted value that never gets the caller's own `errno = 0` (or
+/// whatever) reset applied to it -- so a *previous*, unrelated interposed
+/// call that happened to set the grate's errno would otherwise leak into
+/// every later call that doesn't itself touch errno, clobbering the
+/// caller's own reset. Seeding makes each dispatched call start from the
+/// same errno baseline a native, uninterposed call would have.
+///
+/// Called by the lib-call portal (see wasmtime's `linker.rs::
+/// instance_dylink`) right before `dispatch_lib_call`, mirroring
+/// `set_last_grate_errno`'s call site on the way out.
+pub fn set_next_grate_errno_seed(value: Option<i32>) {
+    NEXT_GRATE_ERRNO_SEED.with(|c| c.set(value));
+}
+
+/// Take the errno seed recorded for the call about to be dispatched, if the
+/// caller exposed `__errno_location`. Called by the grate worker
+/// (`wasmtime-lind-3i`) immediately before invoking the grate's entry point.
+pub fn take_next_grate_errno_seed() -> Option<i32> {
+    NEXT_GRATE_ERRNO_SEED.with(|c| c.take())
+}
+
+/// Record the callee-side (grate) errno value observed immediately after a
+/// grate call, for later collection by the caller-side lib-call portal (see
+/// wasmtime's `linker.rs::instance_dylink`). `None` means the grate does not
+/// expose `__errno_location` (or the call didn't reach it), so there is
+/// nothing to propagate.
+///
+/// Called by the runtime's grate worker (`wasmtime-lind-3i`) right after
+/// invoking the grate's entry point, since that is the only place with
+/// direct access to the grate's own `__errno_location` at the right moment
+/// -- its worker lease is still held, so no other call can have run in
+/// between.
+pub fn set_last_grate_errno(value: Option<i32>) {
+    LAST_GRATE_ERRNO.with(|c| c.set(value));
+}
+
+/// Take the errno value recorded by the most recent grate call on this
+/// thread, if the callee grate exposed `__errno_location`.
+///
+/// errno is ambient, per-cage TLS state invisible to marshal-infer's
+/// per-function spec -- unlike explicit pointer/return arguments,
+/// `dispatch_lib_call` never shadow-copies it, so an interposed call that
+/// sets errno inside the grate's own address space would otherwise leave
+/// the caller's errno untouched.
+///
+/// This is threaded out-of-band via a thread-local because grate calls
+/// return through an opaque, shared `extern "C"` trampoline chain (also used
+/// by ordinary syscall interposition) that cannot carry a second return
+/// value without widening that ABI; grate calls are synchronous and
+/// thread-confined, so a thread-local round-trips safely as long as the
+/// caller reads it immediately after the matching `dispatch_lib_call`
+/// returns (which the lib-call portal does).
+pub fn take_last_grate_errno() -> Option<i32> {
+    LAST_GRATE_ERRNO.with(|c| c.take())
+}
+
 /***************************** dispatch_lib_call *****************************/
 
 /// Invoke a library-level 3i handler directly, bypassing HANDLERTABLE.
@@ -1116,7 +1189,7 @@ pub fn dispatch_lib_call(
     arg5_cageid: u64,
     arg6: u64,
     arg6_cageid: u64,
-) -> i32 {
+) -> i64 {
     let cage_dead = with_cage(handler_cage_id, |grate| {
         grate
             .grate_inflight
@@ -1125,12 +1198,12 @@ pub fn dispatch_lib_call(
             grate
                 .grate_inflight
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            return -(Errno::ESRCH as i32);
+            return -(Errno::ESRCH as i64);
         }
         0
     });
     if cage_dead != Some(0) {
-        return -(Errno::ESRCH as i32);
+        return -(Errno::ESRCH as i64);
     }
 
     let result = _call_grate_func(
@@ -1156,5 +1229,5 @@ pub fn dispatch_lib_call(
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
 
-    result.unwrap_or(-(Errno::ESRCH as i32))
+    result.unwrap_or(-(Errno::ESRCH as i64))
 }
