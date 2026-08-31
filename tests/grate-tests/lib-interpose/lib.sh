@@ -57,6 +57,38 @@ match_ordered_lines() {
     return 0
 }
 
+# find_forbidden_lines <output> <line1> [line2 ...]
+# Prints (and fails) any given line that DOES appear as a complete line of
+# `output`, anywhere (no ordering/position requirement -- unlike
+# match_ordered_lines, this is an absence check, not a presence check).
+# Use this to prove a code path was never reached at all: e.g. a marshaller
+# rejection test must forbid the handler's own "handler ran" marker, or a
+# handler that runs on a value the marshaller should have rejected (and
+# then itself traps on it, producing the same caller-visible failure as a
+# correct rejection) would otherwise pass undetected.
+find_forbidden_lines() {
+    local output="$1"; shift
+    local -a out_lines
+    mapfile -t out_lines <<<"$output"
+    local line ol found
+    local -a present=()
+    for line in "$@"; do
+        found=0
+        for ol in "${out_lines[@]}"; do
+            if [[ "$ol" == "$line" ]]; then
+                found=1
+                break
+            fi
+        done
+        [[ $found -eq 1 ]] && present+=("$line")
+    done
+    if [[ ${#present[@]} -gt 0 ]]; then
+        printf '%s\n' "${present[@]}"
+        return 1
+    fi
+    return 0
+}
+
 # decide_outcome <exit_code> <missing_count>
 # Prints "pass" or "fail". A nonzero exit_code fails regardless of
 # missing_count -- printing every expected line (PASS included) does not

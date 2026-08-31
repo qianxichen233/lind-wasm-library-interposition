@@ -73,6 +73,10 @@ int main(int argc, char *argv[]) {
                                     g_table[i].name, r); }
         }
         fprintf(stderr, "[libtoy-grate] registered %d/%d handlers\n", ok, ok + fail);
+        if (fail > 0) {
+            fprintf(stderr, "[libtoy-grate] FATAL: %d handler registration(s) failed, aborting startup\n", fail);
+            assert(0);
+        }
         if (execv(argv[1], &argv[1]) == -1) { perror("execv"); assert(0); }
     }
     int status;

@@ -98,7 +98,7 @@ compile_grate() {
 }
 
 # run_test <name> <cage_src|""> <grate_src> <preload_csv|""> <strict:yes|no> \
-#          <run_args...> -- <expect...> -- <evidence...>
+#          <run_args...> -- <expect...> -- <evidence...> [-- <forbidden...>]
 #
 # cage_src/grate_src: source path relative to this directory; output name is
 #   derived automatically (lind_compile always names <src>.c -> <src>.cwasm,
@@ -119,6 +119,12 @@ compile_grate() {
 #   the same result) -- required in addition to `expect` for any test whose
 #   handler's return value alone is indistinguishable from what the real,
 #   uninterposed function would have produced.
+# forbidden: optional (the trailing `--` may be omitted entirely if empty)
+#   -- lines that must NOT appear anywhere in the output. A fail-closed
+#   rejection test must forbid its handler's own "handler ran" marker: a
+#   marshaller that wrongly invokes the handler, which then dereferences a
+#   foreign pointer and traps, produces the same caller-visible GRATE_ERR as
+#   a correct rejection -- expect[] alone can't tell those apart.
 run_test() {
     local name="$1" cage_src="$2" grate_src="$3" preload_csv="$4" strict="$5"
     shift 5
@@ -128,7 +134,13 @@ run_test() {
     local expect=()
     while [[ "$#" -gt 0 && "$1" != "--" ]]; do expect+=("$1"); shift; done
     shift # consume the second --
-    local evidence=("$@")
+    local evidence=()
+    while [[ "$#" -gt 0 && "$1" != "--" ]]; do evidence+=("$1"); shift; done
+    local forbidden=()
+    if [[ "$#" -gt 0 ]]; then
+        shift # consume the third --
+        forbidden=("$@")
+    fi
 
     DECLARED_TESTS+=("$name")
 
@@ -193,13 +205,16 @@ $(cat /tmp/lib-interpose-compile.log)"
     if [[ ${#evidence[@]} -gt 0 ]] && ! m="$(match_ordered_lines "$output" "${evidence[@]}")"; then
         while IFS= read -r line; do missing+=("[dispatch evidence] $line"); done <<<"$m"
     fi
+    if [[ ${#forbidden[@]} -gt 0 ]] && ! m="$(find_forbidden_lines "$output" "${forbidden[@]}")"; then
+        while IFS= read -r line; do missing+=("[forbidden, but present] $line"); done <<<"$m"
+    fi
 
     if [[ "$(decide_outcome "$exit_code" "${#missing[@]}")" == "fail" ]]; then
         if [[ "$exit_code" -ne 0 ]]; then
             fail_test "$name" "$(category_for "$output" "$exit_code")" "$output"
         else
             fail_test "$name" "$(category_for "$output" 0)" \
-                "missing expected line(s):
+                "validation failed:
 $(printf '  - %s\n' "${missing[@]}")
 --- actual output ---
 $output"
@@ -462,6 +477,119 @@ run_test "auto-libc" \
        "  PASS  strtol(endptr)  v=12345 endoff=5 (want 12345, 5)" \
        "[libc-app] 8 passed, 0 failed" \
     -- "[libc-grate] registered 8/8 handlers"
+
+# --------------------------------------------------------------------------
+# fail-closed: lind_marshal.h's fail-closed paths (issue #6). Each mode
+# below deliberately triggers one marshalling failure against a REAL
+# interposed function (memcpy/strlen from libc, toy_ctx_get_val/
+# toy_buf_checksum/toy_argv_len from libtoy) and expects the call to be
+# rejected -- the grate's own handler must never run, and the caller sees
+# threei::GRATE_ERR rather than a real (or foreign-pointer-derived) result.
+# "ok" is the control: the same shapes with valid arguments, proving these
+# are genuine rejections and not a broken/always-failing grate.
+# The libtoy preload is marked :interposed (strict mode): the cage touches
+# only the 3 registered libtoy symbols, so this also directly demonstrates
+# criterion #7 (rejection under strict mode, not a silent local/mixed-mode
+# fallback).
+#
+# Each rejection mode also FORBIDS its handler's own "handler ran" marker.
+# Without that, a marshaller bug that wrongly invokes the handler -- which
+# then dereferences the foreign/corrupt data itself and traps -- would
+# produce the exact same caller-visible GRATE_ERR as a correct rejection,
+# passing the test despite the isolation violation actually happening.
+# --------------------------------------------------------------------------
+for mode_desc in \
+    "arena:memcpy" \
+    "overflow:memcpy" \
+    "badcopy:memcpy" \
+    "unsized:strlen" \
+    "handle:toy_ctx_get_val" \
+    "nested:toy_buf_checksum" \
+    "argv:toy_argv_len"
+do
+    mode="${mode_desc%%:*}"
+    fn="${mode_desc#*:}"
+    GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+    run_test "fail-closed-$mode" \
+        "fail-closed/failclosed_cage.c" \
+        "fail-closed/failclosed_grate.c" \
+        "env=/lib/libtoy.so" "yes" \
+        "/failclosed_cage.cwasm" "$mode" \
+        -- "[Cage|fail-closed] PASS: $mode rejected (GRATE_ERR)" \
+        -- \
+        -- "[Grate|fail-closed] $fn handler ran (should not happen)"
+done
+
+# Control: the same shapes with valid arguments, proving the rejections
+# above are genuine and not a broken/always-failing grate. Here the
+# handler running is the expected/desired behavior, not forbidden.
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-ok" \
+    "fail-closed/failclosed_cage.c" \
+    "fail-closed/failclosed_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/failclosed_cage.cwasm" "ok" \
+    -- "[Cage|fail-closed] PASS: ok completed normally" \
+    -- "[Grate|fail-closed] memcpy handler ran (should not happen)"
+
+# Additional adversarial cases: bounds checks on spec-provided indices
+# (badspec_grate.c registers real functions with deliberately out-of-range
+# size_arg_index values, at both the top level and inside a nested struct
+# field) and pointer-field-tracking allocation exhaustion (ptfexhaust_grate.c,
+# a 16-byte arena that fits the struct shadow but not the tracking array).
+# Separate grates from failclosed_grate.c to avoid symbol-registration
+# collisions on toy_buf_checksum (see comments in each grate file).
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-topindex" \
+    "fail-closed/badspec_cage.c" \
+    "fail-closed/badspec_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/badspec_cage.cwasm" "topindex" \
+    -- "[Cage|badspec] PASS: topindex rejected (GRATE_ERR)" \
+    -- \
+    -- "[Grate|badspec] memmove handler ran (should not happen)"
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-nestedindex" \
+    "fail-closed/badspec_cage.c" \
+    "fail-closed/badspec_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/badspec_cage.cwasm" "nestedindex" \
+    -- "[Cage|badspec] PASS: nestedindex rejected (GRATE_ERR)" \
+    -- \
+    -- "[Grate|badspec] toy_buf_checksum handler ran (should not happen)"
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-ptfexhaust" \
+    "fail-closed/ptfexhaust_cage.c" \
+    "fail-closed/ptfexhaust_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/ptfexhaust_cage.cwasm" \
+    -- "[Cage|ptfexhaust] PASS: rejected (GRATE_ERR)" \
+    -- \
+    -- "[Grate|ptfexhaust] toy_buf_checksum handler ran (should not happen)"
+
+DECLARED_TESTS+=("fail-closed")
+
+# --------------------------------------------------------------------------
+# fail-registration: a grate must abort startup rather than exec the cage
+# with an incomplete handler table. One registration is deliberately given
+# a NULL symbol name (register_lib_handler rejects it); the grate must
+# detect the failure and abort before execv. The payload path
+# (/custom-lib.cwasm) is a placeholder reused from an existing test binary
+# and is never actually run -- if it were, that would itself be the bug
+# this test exists to catch.
+# --------------------------------------------------------------------------
+GRATE_EXTRA=()
+run_test "fail-registration" \
+    "custom-lib/custom-lib.c" \
+    "fail-registration/failreg_grate.c" \
+    "" "no" \
+    "/custom-lib.cwasm" \
+    -- "[Grate|fail-registration] register (null symbol) failed: -1" \
+       "[Grate|fail-registration] registered 1/2 handlers" \
+       "[Grate|fail-registration] FATAL: 1 handler registration(s) failed, aborting startup" \
+    --
 
 # --------------------------------------------------------------------------
 # Completeness check: every directory with a *_grate.c must be declared
