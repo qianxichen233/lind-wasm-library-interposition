@@ -26,6 +26,12 @@ GRATES_DIR="$LINDFS/grates"
 LIND_COMPILE="$REPO_ROOT/scripts/lind_compile"
 LIND_RUN="$REPO_ROOT/scripts/lind_run"
 
+# Route lind_log! diagnostics (Default category is on by default) to stderr,
+# where run_test's output capture can see them, instead of their default
+# destination (a LIND.log file) -- needed for fail-closed-widesig to assert
+# on the rejected-portal diagnostic rather than just a bare exit code.
+export LIND_LOG_OUTPUT=stderr
+
 # auto-libz / auto-libz-spike statically link the real libz implementation
 # (a static grate must resolve every symbol it interposes at link time) from
 # the sibling lind-wasm-apps checkout's zlib build, matching the sibling-repo
@@ -223,6 +229,15 @@ $output"
         pass_test "$name"
     fi
 }
+
+# Pre-flight: the interposition transport's raw-ABI-slot capacity is
+# duplicated (not shared) across inference/generation/runtime -- fail fast,
+# before compiling anything, if those copies have drifted out of sync.
+if ! bash "$SCRIPT_DIR/check_raw_arg_slot_consistency.sh"; then
+    echo "FATAL: raw-arg-slot constant consistency check failed (see above)" >&2
+    exit 1
+fi
+echo ""
 
 echo "=== lib-interpose focused test suite ==="
 echo ""
@@ -559,6 +574,21 @@ run_test "fail-closed-nestedindex" \
     -- \
     -- "[Grate|badspec] toy_buf_checksum handler ran (should not happen)"
 
+# fail-closed-badnargs: toy_mul's real signature is 2 raw ABI slots (well
+# within the transport's 6-slot capacity, so it links normally), but its
+# spec deliberately claims .nargs=7 -- lind_marshal_dispatch's own bound on
+# spec->nargs must reject this itself, since the linker-level check (which
+# only sees the real function's wasm type) cannot.
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-badnargs" \
+    "fail-closed/badspec_cage.c" \
+    "fail-closed/badspec_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/badspec_cage.cwasm" "badnargs" \
+    -- "[Cage|badspec] PASS: badnargs rejected (GRATE_ERR)" \
+    -- \
+    -- "[Grate|badspec] toy_mul handler ran (should not happen)"
+
 GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
 run_test "fail-closed-ptfexhaust" \
     "fail-closed/ptfexhaust_cage.c" \
@@ -568,6 +598,27 @@ run_test "fail-closed-ptfexhaust" \
     -- "[Cage|ptfexhaust] PASS: rejected (GRATE_ERR)" \
     -- \
     -- "[Grate|ptfexhaust] toy_buf_checksum handler ran (should not happen)"
+
+# fail-closed-widesig: toy_wide_sum7 has 7 raw wasm32 ABI slots -- one more
+# than the interposition transport's 6-slot capacity. This is rejected at
+# link/portal-install time (linker.rs), before any grate delegation, so the
+# cage traps on the call itself and can never report its own PASS/FAIL; the
+# parent grate judges success from the cage's exit status instead (see
+# widesig_grate.c). Distinct from the topindex/nestedindex/ptfexhaust cases
+# above, which are rejected inside an already-installed portal's dispatch.
+#
+# The evidence line requires LIND_LOG_OUTPUT=stderr (set above): without it,
+# a bare nonzero cage exit could also mean an unrelated crash, and the test
+# would pass for the wrong reason.
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-widesig" \
+    "fail-closed/widesig_cage.c" \
+    "fail-closed/widesig_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/widesig_cage.cwasm" \
+    -- "[Grate|widesig] registered 1/1 handlers" "[Grate|widesig] PASS: rejected (cage crashed as expected, exit=1)" \
+    -- "    1: lib-3i portal: env.toy_wide_sum7 has 7 raw ABI argument slots, exceeding the interposition transport's 6-slot capacity" \
+    -- "[Cage|widesig] FAIL: call returned normally" "[Grate|widesig] toy_wide_sum7 handler ran (should not happen)"
 
 DECLARED_TESTS+=("fail-closed")
 

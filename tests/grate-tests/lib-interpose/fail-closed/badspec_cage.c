@@ -5,6 +5,8 @@
 // Usage: <mode>
 //   topindex    -- invalid top-level size_arg_index (memmove)
 //   nestedindex -- invalid nested sibling size_arg_index (toy_buf_checksum)
+//   badnargs    -- spec->nargs (7) exceeds LIND_RAW_ARGS_MAX for a function
+//                  whose real signature (toy_mul, 2 args) is well within it
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -14,6 +16,7 @@
 extern void *memmove(void *dest, const void *src, size_t n);
 struct toy_buffer { const char *data; unsigned len; };
 extern int toy_buf_checksum(const struct toy_buffer *b);
+extern int toy_mul(int a, int b);
 
 int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: %s <mode>\n", argv[0]); return 2; }
@@ -29,6 +32,8 @@ int main(int argc, char **argv) {
         char data[8] = {0};
         struct toy_buffer b = { .data = data, .len = sizeof(data) };
         r = toy_buf_checksum(&b);
+    } else if (strcmp(mode, "badnargs") == 0) {
+        r = toy_mul(3, 4);
     } else {
         fprintf(stderr, "unknown mode: %s\n", mode);
         return 2;

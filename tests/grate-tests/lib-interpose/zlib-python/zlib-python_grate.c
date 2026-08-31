@@ -1,11 +1,18 @@
 // Grate for zlib-python interposition test.
-// Intercepts deflateInit2_, deflate, and deflateEnd so that Python's
-// zlib.compress() returns a fixed 4-byte output b"LIND" regardless of input.
+// Intercepts deflate and deflateEnd so that Python's zlib.compress()
+// returns a fixed 4-byte output b"LIND" regardless of input.
+//
+// deflateInit2_'s real signature lowers to 8 raw wasm32 ABI slots (strm,
+// level, method, windowBits, memLevel, strategy, version, stream_size) --
+// beyond the 6-slot capacity of the register_lib_handler/pass_fptr_to_wt
+// transport, so it is deliberately left uninterposed here and runs as the
+// real zlib call (safe under this test's non-strict preload: the cage's use
+// of libz isn't limited to these 3 symbols). See lind_marshal.h's
+// LIND_RAW_ARGS_MAX and linker.rs's >6-param portal rejection.
 //
 // Uses lind_marshal.h for fully automated argument marshalling — no manual
 // copy_data_between_cages in any handler:
 //
-//   deflateInit2_  → all args SCALAR; handler returns Z_OK
 //   deflate        → z_stream* described as a nested struct (LIND_LO_STRUCT):
 //                    next_out field is PTR OUT sized by sibling avail_out;
 //                    handler writes FIXED_OUTPUT into the shadow buffer and
@@ -86,34 +93,6 @@ static struct lind_layout _zstream_layout = {
     .fields      = _zstream_fields,
     .struct_size = 24,
 };
-
-// ---------------------------------------------------------------------------
-// deflateInit2_: ignore all args, return Z_OK
-// ---------------------------------------------------------------------------
-
-static struct lind_marshal_spec deflate_init2_spec = {
-    .nargs = 8,
-    .args  = {
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-        { .kind = LIND_ARG_SCALAR },
-    },
-    .ret = { .kind = LIND_RET_SCALAR },
-};
-
-static uint64_t handler_deflate_init2(uint64_t a0, uint64_t a1, uint64_t a2,
-                                       uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-    printf("[Grate|zlib-python] deflateInit2_ intercepted — returning Z_OK\n");
-    return 0;
-}
-
-LIND_DEFINE_MARSHAL_HANDLER(deflate_init2_, &deflate_init2_spec, handler_deflate_init2)
 
 // ---------------------------------------------------------------------------
 // deflate: fully automated via nested struct layout
@@ -225,16 +204,8 @@ int main(int argc, char *argv[]) {
     if (pid == 0) {
         int cageid = getpid();
 
-        printf("[Grate|zlib-python] registering deflateInit2_ handler for cage %d\n", cageid);
-        int ret = register_lib_handler(cageid, "env", "deflateInit2_",
-            grateid, (uint64_t)(uintptr_t)&lind_mh_deflate_init2_);
-        if (ret != 0) {
-            fprintf(stderr, "[Grate|zlib-python] register deflateInit2_ failed: %d\n", ret);
-            assert(0);
-        }
-
         printf("[Grate|zlib-python] registering deflate handler for cage %d\n", cageid);
-        ret = register_lib_handler(cageid, "env", "deflate",
+        int ret = register_lib_handler(cageid, "env", "deflate",
             grateid, (uint64_t)(uintptr_t)&lind_mh_deflate);
         if (ret != 0) {
             fprintf(stderr, "[Grate|zlib-python] register deflate failed: %d\n", ret);

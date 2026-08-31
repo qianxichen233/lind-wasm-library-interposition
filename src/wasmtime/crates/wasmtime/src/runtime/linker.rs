@@ -241,6 +241,23 @@ pub(crate) enum DefinitionType {
     Tag(wasmtime_environ::Tag),
 }
 
+// The library-interposition portal's raw call-site transport is fixed-arity:
+// LIND_MAX_RAW_ARG_SLOTS raw wasm-level argument/cage-id pairs, no more. A
+// wider lowered signature can't be forwarded without silently dropping data,
+// so a portal for such a function is refused outright at link time (see its
+// use below) rather than truncated.
+//
+// This width is independently duplicated -- not derived from a shared
+// definition -- in three other places that must every one of them agree with
+// this value: tools/marshal-infer/src/Infer.cpp's `kMaxRawArgSlots` (the
+// inference-time force_local gate), tools/marshal-gen/gen_grate.py's
+// `LIND_RAW_ARGS_MAX` (the generator's own independent slot-count check),
+// and tests/grate-tests/lib-interpose/lind_marshal.h's `LIND_RAW_ARGS_MAX`
+// (the C dispatch-time abort). Change this value only together with all
+// three; tests/grate-tests/lib-interpose/check_raw_arg_slot_consistency.sh
+// fails the moment any of the four disagree.
+const LIND_MAX_RAW_ARG_SLOTS: usize = 6;
+
 impl<T> Linker<T> {
     /// Creates a new [`Linker`].
     ///
@@ -1100,8 +1117,30 @@ impl<T> Linker<T> {
                     if let Some(cid) = cage_id {
                         let maybe_handler = threei::get_lib_handler(cid, module_name, &name);
                         if let Some((handler_cage_id, fn_ptr)) = maybe_handler {
-                            let name_for_got = name.clone();
                             let func_ty = original_func.ty(&store);
+
+                            // See LIND_MAX_RAW_ARG_SLOTS: reject a wider
+                            // lowered signature outright instead of silently
+                            // truncating it via `.take(LIND_MAX_RAW_ARG_SLOTS)` below.
+                            if func_ty.params().len() > LIND_MAX_RAW_ARG_SLOTS {
+                                let symbol = format!("{module_name}.{name}");
+                                let nparams = func_ty.params().len();
+                                let portal = Func::new(
+                                    &mut store,
+                                    func_ty.clone(),
+                                    move |_, _, _| {
+                                        bail!(
+                                            "lib-3i portal: {symbol} has {nparams} raw ABI argument \
+                                         slots, exceeding the interposition transport's \
+                                         {LIND_MAX_RAW_ARG_SLOTS}-slot capacity"
+                                        );
+                                    },
+                                );
+                                self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
+                                continue;
+                            }
+
+                            let name_for_got = name.clone();
                             let func_ty_for_portal = func_ty.clone();
                             // Resolved once here (like handler_cage_id/fn_ptr above)
                             // rather than via Caller::get_export inside the portal:
@@ -1125,8 +1164,10 @@ impl<T> Linker<T> {
                                 &mut store,
                                 func_ty,
                                 move |mut caller, params, results| {
-                                    let mut raw = [0u64; 6];
-                                    for (i, v) in params.iter().enumerate().take(6) {
+                                    let mut raw = [0u64; LIND_MAX_RAW_ARG_SLOTS];
+                                    for (i, v) in
+                                        params.iter().enumerate().take(LIND_MAX_RAW_ARG_SLOTS)
+                                    {
                                         raw[i] = match v {
                                             Val::I32(x) => *x as u32 as u64,
                                             Val::I64(x) => *x as u64,
