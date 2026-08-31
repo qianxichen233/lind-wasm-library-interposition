@@ -53,8 +53,11 @@ int main(void) {
         snprintf(buf, sizeof buf, "compress rc=%d", rc);
         check("compress", 0, buf);
     } else {
-        snprintf(buf, sizeof buf, "rc=0 comp_len=%lu", comp_len);
-        check("compress", comp_len > 0 && comp_len < sizeof(comp), buf);
+        // The compressed size is zlib-implementation-dependent (only "valid,
+        // nonempty, no bigger than the buffer" is guaranteed) -- print it as
+        // a diagnostic, separate from the stable pass/fail line below.
+        printf("[libz-app] compress diagnostic: comp_len=%lu\n", comp_len);
+        check("compress", comp_len > 0 && comp_len < sizeof(comp), "rc=0, valid size");
 
         unsigned char back[256];
         unsigned long back_len = sizeof(back);

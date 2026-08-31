@@ -10,11 +10,21 @@ static void check(const char *name, int ok, const char *detail) {
     else    { printf("  FAIL  %s  %s\n", name, detail); fail++; }
 }
 
-// data-segment buffers (cross-cage reachable)
-static const char hello[]  = "hello world";
-static const char abc[]    = "abc";
-static const char abd[]    = "abd";
-static const char numstr[] = "12345abc";
+// memcmp/strcmp only guarantee a negative/zero/positive result, not a
+// specific magnitude -- normalize to -1/0/1 before printing so the printed
+// value is stable across libc implementations.
+static int sign(int v) { return (v > 0) - (v < 0); }
+
+// data-segment buffers (cross-cage reachable).
+// Deliberately NOT `const`: a const/literal argument lets clang fold these
+// builtins away at compile time, bypassing interposition entirely (same
+// pattern as libc-strlen.c/auto-cstr.c).
+static char hello[]  = "hello world";
+static char abc[]    = "abc";
+static char abd[]    = "abd";
+static char numstr[] = "12345abc";
+static char abcXY[]  = "abcXY";
+static char abcZ[]   = "abcZ";
 
 int main(void) {
     char buf[64];
@@ -32,17 +42,17 @@ int main(void) {
     // memcmp — two in-buffers sized by arg2
     int e = memcmp(abc, abc, 3);
     int g = memcmp(abc, abd, 3);
-    snprintf(buf, sizeof buf, "eq=%d lt=%d", e, g);
+    snprintf(buf, sizeof buf, "eq=%d lt=%d", sign(e), sign(g));
     check("memcmp", e == 0 && g < 0, buf);
 
     // strcmp — two cstrings
     int se = strcmp(abc, abc);
     int sg = strcmp(abc, abd);
-    snprintf(buf, sizeof buf, "eq=%d lt=%d", se, sg);
+    snprintf(buf, sizeof buf, "eq=%d lt=%d", sign(se), sign(sg));
     check("strcmp", se == 0 && sg < 0, buf);
 
     // strncmp — from_arg(2)
-    int n = strncmp("abcXY", "abcZ", 3);
+    int n = strncmp(abcXY, abcZ, 3);
     snprintf(buf, sizeof buf, "= %d (want 0)", n);
     check("strncmp", n == 0, buf);
 

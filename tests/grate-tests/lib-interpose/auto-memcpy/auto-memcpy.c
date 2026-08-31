@@ -9,8 +9,10 @@ extern void *memcpy(void *dest, const void *src, size_t n);
 int main(void) {
     const char src[] = "hello, lind!";
     char dst[32] = {0};
+    // volatile: disable builtin lowering so the call stays interposable.
+    volatile size_t n = sizeof(src);
 
-    void *ret = memcpy(dst, src, sizeof(src));
+    void *ret = memcpy(dst, src, n);
 
     // Verify copy-out: dst should contain the source string
     if (memcmp(dst, src, sizeof(src)) != 0) {

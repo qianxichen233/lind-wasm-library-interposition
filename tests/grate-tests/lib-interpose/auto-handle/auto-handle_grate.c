@@ -36,8 +36,8 @@ static uint64_t handler_ctx_create(uint64_t val, uint64_t a1, uint64_t a2,
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     struct _ctx *ctx = (struct _ctx *)malloc(sizeof(struct _ctx));
     ctx->val = LIND_AS_INT(val);
-    printf("[Grate|auto-handle] toy_ctx_create(%d) -> real_ptr=%p\n",
-           ctx->val, (void *)ctx);
+    printf("[Grate|auto-handle] toy_ctx_create dispatched, val=%d\n", ctx->val);
+    fflush(stdout); // flush before returning control to the cage
     // Return the real pointer; lind_marshal_dispatch will register it and
     // return the app_token to the source cage (via LIND_RET_HANDLE).
     return (uint64_t)(uintptr_t)ctx;
@@ -57,7 +57,8 @@ static uint64_t handler_ctx_get_val(uint64_t real_ptr, uint64_t a1, uint64_t a2,
                                      uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     struct _ctx *ctx = (struct _ctx *)(uintptr_t)real_ptr;
-    printf("[Grate|auto-handle] toy_ctx_get_val(ptr=%p) -> %d\n", (void *)ctx, ctx->val);
+    printf("[Grate|auto-handle] toy_ctx_get_val dispatched, val=%d\n", ctx->val);
+    fflush(stdout); // flush before returning control to the cage
     return LIND_RET_INT(ctx->val);
 }
 
@@ -75,7 +76,8 @@ static uint64_t handler_ctx_close(uint64_t real_ptr, uint64_t a1, uint64_t a2,
                                    uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     struct _ctx *ctx = (struct _ctx *)(uintptr_t)real_ptr;
-    printf("[Grate|auto-handle] toy_ctx_close(ptr=%p)\n", (void *)ctx);
+    printf("[Grate|auto-handle] toy_ctx_close dispatched\n");
+    fflush(stdout); // flush before returning control to the cage
     free(ctx);
     // Also release from handle table. We need the original app_token; look it up
     // by real_ptr (linear scan is fine for tests).
@@ -94,7 +96,7 @@ LIND_DEFINE_MARSHAL_HANDLER(toy_ctx_close, &ctx_close_spec, handler_ctx_close)
 
 // ---------------------------------------------------------------------------
 
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -102,10 +104,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg5, uint64_t arg5cage,
                     uint64_t arg6, uint64_t arg6cage) {
     if (fn_ptr_uint == 0) { fprintf(stderr, "[Grate|auto-handle] invalid fn ptr\n"); assert(0); }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,

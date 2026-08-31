@@ -80,7 +80,7 @@ static uint64_t handler_buf_checksum(uint64_t b_u64, uint64_t a1, uint64_t a2,
 
 LIND_DEFINE_MARSHAL_HANDLER(toy_buf_checksum, &buf_checksum_spec, handler_buf_checksum)
 
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -88,10 +88,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg5, uint64_t arg5cage,
                     uint64_t arg6, uint64_t arg6cage) {
     if (fn_ptr_uint == 0) { fprintf(stderr, "[Grate|auto-nested] invalid fn ptr\n"); assert(0); }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,

@@ -47,6 +47,7 @@ static struct lind_marshal_spec strncpy_spec = {
 static uint64_t handler_strncpy(uint64_t dest, uint64_t src, uint64_t n,
                                  uint64_t, uint64_t, uint64_t) {
     printf("[Grate|auto-strncpy] strncpy intercepted: n=%zu\n", LIND_AS_SIZE(n));
+    fflush(stdout); // flush before returning control to the cage
     return LIND_RET_PTR(strncpy(LIND_AS_STR(dest), LIND_AS_CSTR(src), LIND_AS_SIZE(n)));
 }
 
@@ -56,7 +57,7 @@ LIND_DEFINE_MARSHAL_HANDLER(strncpy, &strncpy_spec, handler_strncpy)
 // Standard grate dispatcher (required export)
 // ---------------------------------------------------------------------------
 
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -67,10 +68,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
         fprintf(stderr, "[Grate|auto-strncpy] invalid fn ptr\n");
         assert(0);
     }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,

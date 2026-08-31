@@ -52,7 +52,7 @@ static struct libctx adler32_ctx = { &adler32_spec, (void *)(uintptr_t)&adler32 
 
 // Generic grate dispatcher. The "fn ptr" registered with register_lib_handler is
 // actually a struct libctx*; we read (spec, real_fn) and run the generic marshaller.
-int pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -78,9 +78,10 @@ int pass_fptr_to_wt(uint64_t ctx_ptr_u64, uint64_t cageid,
             ctx->spec->nargs);
 
     uint64_t r = lind_marshal_dispatch(ctx->real_fn, ctx->spec,
-                                       src_cage, cageid, raw, ctx->spec->nargs);
+                                       src_cage, cageid, raw, ctx->spec->nargs,
+                                       "adler32");
     fprintf(stderr, "[Grate|spike] dispatch returned 0x%llx\n", (unsigned long long)r);
-    return (int)r;
+    return (int64_t)r;
 }
 
 int main(int argc, char *argv[]) {

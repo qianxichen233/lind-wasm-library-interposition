@@ -35,15 +35,17 @@ static struct lind_marshal_spec memchr_spec = {
 static uint64_t handler_memchr(uint64_t s, uint64_t c, uint64_t n,
                                 uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
-    void *result = memchr(LIND_AS_CPTR(s), LIND_AS_INT(c), LIND_AS_SIZE(n));
-    printf("[Grate|auto-memchr] memchr intercepted, result=%p base=%p\n",
-           result, LIND_AS_CPTR(s));
+    const char *base = LIND_AS_CPTR(s);
+    void *result = memchr(base, LIND_AS_INT(c), LIND_AS_SIZE(n));
+    long offset = result ? (const char *)result - base : -1;
+    printf("[Grate|auto-memchr] memchr dispatched, offset=%ld\n", offset);
+    fflush(stdout); // flush before returning control to the cage
     return LIND_RET_PTR(result);
 }
 
 LIND_DEFINE_MARSHAL_HANDLER(memchr, &memchr_spec, handler_memchr)
 
-int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
+int64_t pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg1, uint64_t arg1cage,
                     uint64_t arg2, uint64_t arg2cage,
                     uint64_t arg3, uint64_t arg3cage,
@@ -51,10 +53,10 @@ int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid,
                     uint64_t arg5, uint64_t arg5cage,
                     uint64_t arg6, uint64_t arg6cage) {
     if (fn_ptr_uint == 0) { fprintf(stderr, "[Grate|auto-memchr] invalid fn ptr\n"); assert(0); }
-    int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    int64_t (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
               uint64_t, uint64_t, uint64_t) =
-        (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        (int64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
                  uint64_t, uint64_t, uint64_t))(uintptr_t)fn_ptr_uint;
     return fn(cageid, arg1, arg1cage, arg2, arg2cage,
