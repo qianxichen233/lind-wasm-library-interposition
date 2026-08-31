@@ -66,3 +66,39 @@ int toy_argv_len(const char **argv) {
     }
     return total;
 }
+
+// --- Functions for the post-call pointer-provenance tests (LIND_RET_PTR_INTO_ARG,
+// out_ptr_into_arg1, and struct-field OUT/cursor copy-back+fixup). ---
+
+// toy_scan_buf: memchr-alike, returns a pointer into buf (or NULL).
+// Used by the LIND_RET_PTR_INTO_ARG provenance test.
+const char *toy_scan_buf(const char *buf, int c, unsigned n) {
+    printf("[libtoy] toy_scan_buf — this should NOT print if interposed\n");
+    for (unsigned i = 0; i < n; i++)
+        if (buf[i] == (char)c) return &buf[i];
+    return 0;
+}
+
+// toy_strtol_like: strtol-alike, writes an endptr into *nptr's own buffer.
+// Used by the out_ptr_into_arg1 (OUT ptr-to-ptr) provenance test.
+long toy_strtol_like(const char *nptr, char **endptr) {
+    printf("[libtoy] toy_strtol_like — this should NOT print if interposed\n");
+    long v = 0;
+    const char *p = nptr;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+    if (endptr) *endptr = (char *)p;
+    return v;
+}
+
+// toy_stream_process: a minimal zlib-deflate-alike cursor-advance struct,
+// used by the struct-field OUT/cursor copy-back+fixup provenance test
+// (lind_marshal.h's _lind_post_struct Step 1/Step 3).
+struct toy_stream { const char *next_in; unsigned avail_in; char *next_out; unsigned avail_out; };
+int toy_stream_process(struct toy_stream *s) {
+    printf("[libtoy] toy_stream_process — this should NOT print if interposed\n");
+    unsigned n = s->avail_in < s->avail_out ? s->avail_in : s->avail_out;
+    for (unsigned i = 0; i < n; i++) s->next_out[i] = s->next_in[i];
+    s->next_out += n;
+    s->avail_out -= n;
+    return 0;
+}
