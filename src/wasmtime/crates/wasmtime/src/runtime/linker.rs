@@ -258,6 +258,61 @@ pub(crate) enum DefinitionType {
 // fails the moment any of the four disagree.
 const LIND_MAX_RAW_ARG_SLOTS: usize = 6;
 
+// Renders a lowered signature as `(p0, p1, ...) -> (r0, r1, ...)`, e.g.
+// `(i32, v128, i64) -> (i32)`. Used to give every lib-3i portal rejection
+// diagnostic the complete shape being rejected -- the symbol name and a
+// single offending index alone don't distinguish overloaded-looking exports
+// or reveal a hidden ABI parameter (e.g. a synthetic sret pointer) sitting
+// earlier in the list.
+fn lib3i_format_signature(func_ty: &FuncType) -> String {
+    let params: Vec<String> = func_ty.params().map(|p| p.to_string()).collect();
+    let results: Vec<String> = func_ty.results().map(|r| r.to_string()).collect();
+    format!("({}) -> ({})", params.join(", "), results.join(", "))
+}
+
+// The lib-3i portal's transport carries only i32/i64/f32/f64 scalars, and
+// only ONE result -- dispatch_lib_call/pass_fptr_to_wt return a single i64,
+// with no channel for a second value, a v128 lane, or an opaque reference.
+// A signature outside that shape can't be installed as a real portal at
+// all: forwarding it would either silently zero an unsupported parameter
+// (a v128 or ref value has no meaningful representation in the transport's
+// raw u64 slots) or duplicate the single transported result across every
+// result slot of a multi-result function, handing the caller a value that
+// type-checks but is fabricated. Returns the reason the signature can't be
+// transported, or None if it's fully supported.
+fn lib3i_unsupported_signature_reason(func_ty: &FuncType) -> Option<String> {
+    if func_ty.params().len() > LIND_MAX_RAW_ARG_SLOTS {
+        return Some(format!(
+            "{} raw ABI argument slots, exceeding the interposition transport's \
+             {LIND_MAX_RAW_ARG_SLOTS}-slot capacity",
+            func_ty.params().len()
+        ));
+    }
+    for (i, p) in func_ty.params().enumerate() {
+        if !matches!(p, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64) {
+            return Some(format!(
+                "param {i} has type {p}, which the transport cannot carry \
+                 (only i32/i64/f32/f64 scalars are supported)"
+            ));
+        }
+    }
+    if func_ty.results().len() > 1 {
+        return Some(format!(
+            "{} results, exceeding the interposition transport's single-result capacity",
+            func_ty.results().len()
+        ));
+    }
+    for (i, r) in func_ty.results().enumerate() {
+        if !matches!(r, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64) {
+            return Some(format!(
+                "result {i} has type {r}, which the transport cannot carry \
+                 (only i32/i64/f32/f64 scalars are supported)"
+            ));
+        }
+    }
+    None
+}
+
 impl<T> Linker<T> {
     /// Creates a new [`Linker`].
     ///
@@ -1119,23 +1174,22 @@ impl<T> Linker<T> {
                         if let Some((handler_cage_id, fn_ptr)) = maybe_handler {
                             let func_ty = original_func.ty(&store);
 
-                            // See LIND_MAX_RAW_ARG_SLOTS: reject a wider
-                            // lowered signature outright instead of silently
-                            // truncating it via `.take(LIND_MAX_RAW_ARG_SLOTS)` below.
-                            if func_ty.params().len() > LIND_MAX_RAW_ARG_SLOTS {
+                            // Validate the whole lowered signature up front
+                            // -- argument count, argument types, result
+                            // count, and result types -- rather than
+                            // silently truncating/zeroing/duplicating data
+                            // the transport can't actually carry (see
+                            // lib3i_unsupported_signature_reason's doc).
+                            if let Some(reason) = lib3i_unsupported_signature_reason(&func_ty) {
                                 let symbol = format!("{module_name}.{name}");
-                                let nparams = func_ty.params().len();
-                                let portal = Func::new(
-                                    &mut store,
-                                    func_ty.clone(),
-                                    move |_, _, _| {
+                                let signature = lib3i_format_signature(&func_ty);
+                                let portal =
+                                    Func::new(&mut store, func_ty.clone(), move |_, _, _| {
                                         bail!(
-                                            "lib-3i portal: {symbol} has {nparams} raw ABI argument \
-                                         slots, exceeding the interposition transport's \
-                                         {LIND_MAX_RAW_ARG_SLOTS}-slot capacity"
+                                            "lib-3i portal: {symbol} {signature} cannot be \
+                                             transported: {reason}"
                                         );
-                                    },
-                                );
+                                    });
                                 self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
                                 continue;
                             }

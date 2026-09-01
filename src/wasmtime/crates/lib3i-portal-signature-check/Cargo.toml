@@ -1,0 +1,20 @@
+[package]
+name = "lib3i-portal-signature-check"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone, runnable regression check for the lib-3i portal's signature
+# validation (issue #13): unsupported wasm value types (v128, funcref,
+# externref) and multi-result signatures cannot be expressed by any C
+# source the Lind toolchain compiles, so this is a real, documented
+# capability gap -- see CLAUDE.md's toolchain-exception clause. This crate
+# uses raw WAT text (via wasmtime's `wat` feature) to construct the shapes
+# directly and exercises the real `Linker::instance_dylink` portal-install
+# code path, not a reimplementation of it. See src/main.rs's doc comment
+# for how to run it.
+[dependencies]
+wasmtime = { path = "../wasmtime", default-features = false, features = [
+    "cranelift", "pooling-allocator", "gc-null", "threads", "demangle",
+    "addr2line", "cache", "anyhow", "wat",
+] }
+threei = { path = "../threei" }

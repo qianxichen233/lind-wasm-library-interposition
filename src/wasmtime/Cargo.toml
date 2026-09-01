@@ -205,6 +205,7 @@ members = [
   "crates/cage",
   "crates/lind-3i",
   "crates/lind-remote-lib",
+  "crates/lib3i-portal-signature-check",
 ]
 exclude = [
   'docs/rust_wasi_markdown_parser',
