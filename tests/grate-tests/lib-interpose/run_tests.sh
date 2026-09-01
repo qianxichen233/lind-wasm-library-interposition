@@ -15,6 +15,13 @@
 # --allow-skips: without it, any skipped maintained test (e.g. a missing
 # fixture dependency) fails the run; pass it for an explicitly optional
 # local run.
+#
+# Unsupported wasm value types (v128, funcref/externref) and multi-result
+# signatures at lib-3i portal install time (issue #13) can't be reached from
+# any C source the Lind toolchain compiles, so that coverage lives in
+# src/wasmtime/crates/lib3i-portal-signature-check (raw WAT against the real
+# Linker::instance_dylink code path) and is run as a pre-flight step below,
+# alongside the raw-arg-slot consistency check.
 
 set -uo pipefail
 
@@ -235,6 +242,19 @@ $output"
 # before compiling anything, if those copies have drifted out of sync.
 if ! bash "$SCRIPT_DIR/check_raw_arg_slot_consistency.sh"; then
     echo "FATAL: raw-arg-slot constant consistency check failed (see above)" >&2
+    exit 1
+fi
+echo ""
+
+# Pre-flight: unsupported wasm value types (v128, funcref/externref) and
+# multi-result signatures at lib-3i portal install time (issue #13). No C
+# source compiles to those shapes, so this is a separate Rust crate built
+# on raw WAT -- see its own doc comment for why. Built fresh each run, same
+# reasoning as every cage/grate/fixture above: a stale local binary would
+# silently mask a real regression in linker.rs's portal-install validation.
+echo "Running lib3i-portal-signature-check (issue #13)..."
+if ! (cd "$REPO_ROOT/src/wasmtime" && cargo run --quiet -p lib3i-portal-signature-check); then
+    echo "FATAL: lib3i-portal-signature-check failed (see above)" >&2
     exit 1
 fi
 echo ""
@@ -617,7 +637,7 @@ run_test "fail-closed-widesig" \
     "env=/lib/libtoy.so" "yes" \
     "/widesig_cage.cwasm" \
     -- "[Grate|widesig] registered 1/1 handlers" "[Grate|widesig] PASS: rejected (cage crashed as expected, exit=1)" \
-    -- "    1: lib-3i portal: env.toy_wide_sum7 has 7 raw ABI argument slots, exceeding the interposition transport's 6-slot capacity" \
+    -- "    1: lib-3i portal: env.toy_wide_sum7 (i32, i32, i32, i32, i32, i32, i32) -> (i32) cannot be transported: 7 raw ABI argument slots, exceeding the interposition transport's 6-slot capacity" \
     -- "[Cage|widesig] FAIL: call returned normally" "[Grate|widesig] toy_wide_sum7 handler ran (should not happen)"
 
 # fail-closed-provenance-*: post-call pointer-provenance validation (issue
