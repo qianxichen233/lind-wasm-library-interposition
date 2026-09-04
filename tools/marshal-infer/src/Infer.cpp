@@ -7,6 +7,7 @@
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstrTypes.h"
@@ -17,6 +18,11 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 
 #include <algorithm>
@@ -51,6 +57,23 @@ int dwarfIndexOf(const Value *v, unsigned sretOffset) {
     int idx = (int)a->getArgNo() - (int)sretOffset;
     return idx >= 0 ? idx : -1;
   }
+  return -1;
+}
+
+// Same, but also resolves ONE level through a pointer load: `v` may not be
+// the argument itself but `load T, ptr %P` where %P is. Needed for the
+// Fortran-by-reference calling convention every classic BLAS entry point
+// uses (`blasint *N` unpacked as `BLASLONG n = *N;` at function entry,
+// versus CBLAS's `blasint n` taken directly) -- without this, a value
+// derived from a Fortran-style scalar-by-reference argument never resolves
+// back to that argument at all, only its CBLAS sibling (which passes the
+// same logical value directly) would. Callers apply stripIntCasts()
+// themselves before calling this, matching dwarfIndexOf's own contract.
+int dwarfIndexOfMaybeLoaded(const Value *v, unsigned sretOffset) {
+  if (int idx = dwarfIndexOf(v, sretOffset); idx >= 0)
+    return idx;
+  if (auto *ld = dyn_cast<LoadInst>(v))
+    return dwarfIndexOf(stripPtr(ld->getPointerOperand()), sretOffset);
   return -1;
 }
 
@@ -320,7 +343,7 @@ bool treeHasUnmappable(const TreeNode *n) {
   if (n->kind == NodeKind::Pointer && n->sizeKind != SizeKind::Const &&
       n->sizeKind != SizeKind::FromArg &&
       n->sizeKind != SizeKind::FromArgPointee && n->sizeKind != SizeKind::Cstr &&
-      n->sizeKind != SizeKind::PtrArray)
+      n->sizeKind != SizeKind::PtrArray && n->sizeKind != SizeKind::StrideVector)
     return true;
   for (const auto &c : n->children)
     if (treeHasUnmappable(c.get())) return true;
@@ -344,6 +367,36 @@ int sizeyRank(const std::string &t) {
   return 0;
 }
 
+// A direct call, to a callee with a body we could analyze, that received this
+// pointer as one of its own arguments -- a candidate for one-hop interprocedural
+// length detection (see detectDelegatedArrayBound below).
+struct DelegateCall {
+  const CallBase *cb;
+  unsigned argIdx; // which of cb's call-site operands received the pointer
+};
+
+// ELEMENT-count (and, separately, per-element stride) evidence from ONE
+// hand-written counted loop indexing a pointer -- e.g. a BLAS-style
+// `while(i<n){ y[iy]+=da*x[ix]; ix+=inc_x; ...}` walk: length=n, stride=
+// inc_x. `stride` is null when no argument governs the per-iteration step
+// (e.g. a genuine compile-time-constant stride, or simply not found) --
+// length alone is still meaningful (see its consumption in inferFunction)
+// even without a stride.
+struct LoopBound {
+  const Value *length = nullptr;
+  // True iff `length` came from ScalarEvolution's own exact trip-count
+  // analysis (loopBoundValues); false iff it came from
+  // dominatingArgumentGuard's dominator-tree walk instead. The guard walk is
+  // DELIBERATELY imprecise (a dominating-but-unrelated argument check can
+  // match -- see its own comment) and proves nothing about the loop's real
+  // trip count, only that SOME argument is checked somewhere above it: sound
+  // as "this pointer is array-shaped" evidence (a force_local gate), never as
+  // an exact count. `stride` is therefore only ever populated when this is
+  // true -- see loopBoundValues.
+  bool lengthProven = false;
+  const Value *stride = nullptr;
+};
+
 // Per-argument access summary, accumulated by walking derived pointers.
 struct Access {
   bool read = false;
@@ -351,7 +404,20 @@ struct Access {
   bool escapes = false;     // pointer stored away / passed to unknown callee
   bool stringOp = false;    // flows into a C-string libcall
   bool unknownCallee = false;
-  SmallVector<const Value *, 4> lengths; // length operands paired with this ptr
+  SmallVector<const Value *, 4> lengths; // BYTE-count operands paired with this
+                                          // ptr (memcpy-family length args) --
+                                          // trusted directly as a byte size.
+  // ELEMENT-count (+ stride) evidence from a hand-written counted loop (see
+  // LoopBound above). Deliberately kept separate from `lengths` above:
+  // unlike a memcpy length, `length` here is a number of ELEMENTS, not
+  // bytes -- LIND_SIZE_FROM_ARG has no N*elemsize scaling, so feeding it
+  // into the same trusted byte-count sink would make the tool confidently
+  // emit a size wrong by a factor of the element size, with no warning at
+  // all. Consumed to populate a LIND_SIZE_STRIDE_VECTOR spec when both
+  // length AND stride resolve to real caller arguments; falls back to fail-
+  // closed (force_local) when only length resolves.
+  SmallVector<LoopBound, 2> loopBounds;
+  SmallVector<DelegateCall, 2> delegateCalls;
 };
 
 // Classify the role of operand `opIdx` in a call to a known lib function.
@@ -398,6 +464,195 @@ LibRole classifyLibArg(StringRef name, unsigned opIdx, const CallBase *cb) {
   return r;
 }
 
+// Peel a SCEV down to a bare argument-derived Value, but ONLY through casts
+// and an smax/umax clamp against a constant with exactly one non-constant
+// operand -- both are ScalarEvolution's OWN choice of representation for the
+// SAME quantity (a clamp SCEV inserts to stay conservative when nothing
+// upstream already proved positivity), never a transform that changes what
+// the quantity IS. Any other shape -- in particular a Mul, or an Add that
+// doesn't collapse away entirely under SCEV's own constant folding -- means
+// the quantity is not PROVABLY just the bare argument, and must be rejected
+// rather than guessed: e.g. a genuine `2*n` element count or a stride that's
+// really `2*incx` at the source level must never collapse to "depends on n
+// / incx".
+const Value *unwrapArgumentSCEV(const SCEV *S) {
+  for (unsigned depth = 0; S && depth < 8; ++depth) {
+    if (auto *unk = dyn_cast<SCEVUnknown>(S))
+      return unk->getValue();
+    if (auto *cast = dyn_cast<SCEVCastExpr>(S)) { S = cast->getOperand(); continue; }
+    if (isa<SCEVUMaxExpr>(S) || isa<SCEVSMaxExpr>(S)) {
+      auto *nary = cast<SCEVNAryExpr>(S);
+      const SCEV *nonConst = nullptr;
+      unsigned nonConstCount = 0;
+      for (unsigned i = 0; i < nary->getNumOperands(); ++i) {
+        if (isa<SCEVConstant>(nary->getOperand(i))) continue;
+        nonConst = nary->getOperand(i);
+        ++nonConstCount;
+      }
+      if (nonConstCount != 1) return nullptr;
+      S = nonConst;
+      continue;
+    }
+    return nullptr; // Mul, unresolved Add, or any other shape -- reject
+  }
+  return nullptr;
+}
+
+// Collect every icmp/fcmp reachable from a branch condition through and/or
+// combinations (a guard often checks more than one thing at once, e.g.
+// `if (n<=0 || alpha==0.0) return;`, compiled to
+// `or i1 (icmp slt n, 1), (fcmp oeq alpha, 0.0)` feeding one branch).
+void collectComparisons(const Value *cond, SmallVectorImpl<const CmpInst *> &out,
+                        SmallPtrSetImpl<const Value *> &seen, unsigned depth) {
+  if (depth > 6 || !cond || !seen.insert(cond).second)
+    return;
+  if (auto *cmp = dyn_cast<CmpInst>(cond)) {
+    out.push_back(cmp);
+    return;
+  }
+  if (auto *bo = dyn_cast<BinaryOperator>(cond)) {
+    if (bo->getOpcode() == Instruction::And || bo->getOpcode() == Instruction::Or) {
+      collectComparisons(bo->getOperand(0), out, seen, depth + 1);
+      collectComparisons(bo->getOperand(1), out, seen, depth + 1);
+    }
+  }
+}
+
+// Walk the dominator tree from a loop up to the function entry, looking for
+// ANY dominating conditional branch that checks a function argument against
+// a constant -- e.g. an `if (n<=0) return;` early-exit ahead of the loop's
+// actual element walk.
+//
+// Deliberately less precise than confirming "this exact branch is the one
+// that skips exactly this loop" (Loop::getLoopGuardBranch() attempts that,
+// but requires a strictly canonical GuardBB->Preheader->Header->Latch->
+// ExitBlock shape that does not survive LLVM's runtime-unroll-with-remainder
+// transform, which inserts an extra remainder-handling split between the
+// guard and the real preheader). A dominating-but-unrelated argument check would also
+// match here. That's acceptable because the only use of a match is to fail
+// closed (force_local + a specific warning), never to compute a numeric
+// size -- a false positive costs an unnecessary exclusion, not a wrong
+// answer, which is the same asymmetry this tool's other heuristics already
+// accept (e.g. the char-buffer size-pairing fallback).
+const Value *dominatingArgumentGuard(const Loop *L, DominatorTree &DT) {
+  BasicBlock *start = L->getLoopPreheader();
+  if (!start)
+    start = L->getHeader();
+  DomTreeNode *node = DT.getNode(start);
+  for (unsigned hops = 0; node && hops < 12; ++hops, node = node->getIDom()) {
+    BasicBlock *bb = node->getBlock();
+    if (!bb)
+      continue;
+    auto *br = dyn_cast_or_null<BranchInst>(bb->getTerminator());
+    if (!br || !br->isConditional())
+      continue;
+    SmallVector<const CmpInst *, 4> cmps;
+    SmallPtrSet<const Value *, 8> seen;
+    collectComparisons(br->getCondition(), cmps, seen, 0);
+    for (const CmpInst *cmp : cmps) {
+      for (unsigned i = 0; i < 2; ++i) {
+        const Value *op = stripIntCasts(cmp->getOperand(i));
+        if (isa<Argument>(op))
+          return op;
+        // Fortran-by-reference idiom: the compared value may be a LOCAL
+        // loaded from a pointer argument (`BLASLONG n = *N;`), not the
+        // argument itself -- return the load; callers resolve it (and the
+        // direct-Argument case above) uniformly via dwarfIndexOfMaybeLoaded.
+        if (auto *ld = dyn_cast<LoadInst>(op))
+          if (isa<Argument>(stripPtr(ld->getPointerOperand())))
+            return op;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Length AND (separately) stride for one GEP inside a countable loop --
+// e.g. a BLAS-style `x[ix]` walk (ix+=inc_x each iteration): length=n,
+// stride=inc_x. Builds DominatorTree/LoopInfo/AssumptionCache/
+// ScalarEvolution once for both: length and stride for the SAME gep always
+// need the SAME loop/analysis objects, so there's no reason to duplicate the
+// work.
+LoopBound loopBoundValues(const GetElementPtrInst *gep) {
+  LoopBound result;
+  Function *F = const_cast<Function *>(gep->getFunction());
+  if (!F)
+    return result;
+  DominatorTree DT(*F);
+  LoopInfo LI(DT);
+  const Loop *L = LI.getLoopFor(gep->getParent());
+  if (!L)
+    return result;
+  AssumptionCache AC(*F);
+  TargetLibraryInfoImpl TLII;
+  TargetLibraryInfo TLI(TLII);
+  ScalarEvolution SE(*F, TLI, AC, DT, LI);
+
+  // Length: a property of the LOOP itself (its trip count), not of any one
+  // induction variable inside it -- doesn't matter which IV the GEP happens
+  // to index with, and doesn't matter what predicate/start/step the loop's
+  // controlling comparison actually uses (`i<n`, `i<=n`, a non-zero start,
+  // a non-unit step, ...): ScalarEvolution's own exact backedge-taken-count
+  // analysis already accounts for all of that by construction, which no
+  // amount of hand-rolled comparison-pattern-matching can safely replicate
+  // (an `i<=n` loop's element count is n+1, not n -- getTripCountFromExitCount
+  // computes that relationship correctly; a bare pattern match on the latch
+  // comparison's operands, tried and abandoned here, could not). Falls back
+  // to guard-scanning when the trip count doesn't resolve (e.g. LLVM's
+  // runtime-unroll-with-remainder transform, which recomputes the trip
+  // count via an equivalent but no-longer-argument-shaped udiv/zext/trunc
+  // rewrite) -- but the guard fallback proves nothing exact (see
+  // LoopBound::lengthProven) and must never be paired with a stride below.
+  // Width-preserving overload, not the default overflow-safe one: the
+  // latter always widens by a bit (to represent ExitCount==UINT_MAX
+  // exactly), which wraps the whole expression in an extra zext and defeats
+  // unwrapArgumentSCEV's cast-then-bare-argument peel even for the ordinary
+  // `for(i=0;i<n;i++)` case (ExitCount=n-1, TripCount=(n-1)+1, which only
+  // folds back down to bare `n` when kept in ExitCount's own type). The
+  // widening's purpose -- exactness at the ExitCount==UINT_MAX edge -- is
+  // moot here: the runtime's own overflow checks (see LIND_SIZE_STRIDE_VECTOR
+  // in lind_marshal.h) already guard the actual byte-size computation.
+  const SCEV *ec = SE.getBackedgeTakenCount(L);
+  if (ec && !isa<SCEVCouldNotCompute>(ec))
+    result.length = unwrapArgumentSCEV(
+        SE.getTripCountFromExitCount(ec, ec->getType(), L));
+  if (result.length) {
+    result.lengthProven = true;
+  } else {
+    result.length = dominatingArgumentGuard(L, DT);
+  }
+  if (!result.length)
+    return result; // no length -> no point looking for a stride either
+  if (!result.lengthProven)
+    return result; // array-shaped evidence only -- never pair with a stride
+
+  // Stride: THIS gep's own index operand's per-iteration step, if that
+  // index is itself an affine recurrence of the SAME loop `length` came
+  // from (a GEP whose index is invariant in this loop, or varies with a
+  // DIFFERENT enclosing loop, has no meaningful "stride" here) -- AND that
+  // recurrence PROVABLY STARTS AT ZERO. The runtime always treats the
+  // pointer passed at the real call as the start of the shadow-copied
+  // region (offset 0); if the address induction variable actually starts
+  // somewhere else (e.g. `ix = inc_x;` before the loop, rather than `ix =
+  // 0;`), the base pointer itself is never accessed and the
+  // (1+(n-1)*stride) extent formula would silently miss everything from
+  // the true first access up to n*stride, under-covering the real accessed
+  // range. A `getelementptr <elemty>, ptr %p, iN %idx` (the only shape this
+  // file's GEPs take -- always a single index, since none of the pointee
+  // types involved are themselves aggregates) has its index as the last
+  // operand.
+  if (gep->getNumOperands() >= 2) {
+    Value *idxOperand = gep->getOperand(gep->getNumOperands() - 1);
+    const SCEV *idxSCEV = SE.getSCEV(idxOperand);
+    if (auto *ar = dyn_cast<SCEVAddRecExpr>(idxSCEV)) {
+      auto *start = dyn_cast<SCEVConstant>(ar->getStart());
+      if (ar->getLoop() == L && start && start->getValue()->isZero())
+        result.stride = unwrapArgumentSCEV(ar->getStepRecurrence(SE));
+    }
+  }
+  return result;
+}
+
 // Walk all values derived (by GEP/cast/phi/select) from pointer argument `A`,
 // recording how the pointee memory is read/written and any paired length.
 Access analyzeAccess(const Argument *A) {
@@ -416,8 +671,19 @@ Access analyzeAccess(const Argument *A) {
         if (st->getPointerOperand() == V) acc.written = true;
         if (st->getValueOperand() == V) acc.escapes = true; // ptr stored away
       } else if (auto *gep = dyn_cast<GetElementPtrInst>(U)) {
-        if (gep->getPointerOperand() == V && seen.insert(gep).second)
+        if (gep->getPointerOperand() == V && seen.insert(gep).second) {
           work.push_back(gep);
+          // A hand-written counted loop indexing this pointer (a shape
+          // memcpy-style library calls don't cover at all -- e.g. a
+          // BLAS-style `while(i<n){ y[iy]+=da*x[ix]; ... }` walk, possibly
+          // one hop away in a delegated callee). ELEMENT count (+ stride),
+          // not a byte count -- goes to the separate loopBounds sink (see
+          // its declaration above), never acc.lengths, so it's never
+          // trusted as a byte size.
+          LoopBound lb = loopBoundValues(gep);
+          if (lb.length)
+            acc.loopBounds.push_back(lb);
+        }
       } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U) ||
                  isa<PHINode>(U) || isa<SelectInst>(U)) {
         if (seen.insert(U).second) work.push_back(U);
@@ -455,12 +721,231 @@ Access analyzeAccess(const Argument *A) {
             if (cb->getArgOperand(oi) == V) {
               acc.escapes = true;
               acc.unknownCallee = true;
+              // A direct call (known callee, not indirect) to a function whose
+              // body we might have loaded elsewhere -- record it as a one-hop
+              // delegation candidate. Bodyless callees (pure declarations) are
+              // filtered by the caller of analyzeAccess, which only has a
+              // CalleeIndex entry for defined functions in the first place.
+              if (callee)
+                acc.delegateCalls.push_back({cb, oi});
             }
         }
       }
     }
   }
   return acc;
+}
+
+unsigned computeSretOffset(const Function &F) {
+  return (F.arg_size() && F.getArg(0)->hasStructRetAttr()) ? 1 : 0;
+}
+
+// Resolve a Value to a top-level DWARF argument index, ALSO recording
+// whether the raw wasm call passes that argument's VALUE directly or a
+// POINTER to it (see dwarfIndexOfMaybeLoaded's own comment for why the
+// second case exists -- classic Fortran BLAS's `blasint *N` unpacked as
+// `BLASLONG n = *N;`). Distinct from dwarfIndexOfMaybeLoaded, which
+// collapses this distinction into a single index -- fine for its own
+// callers (FromArg vs. FromArgPointee is already a separate SizeKind per
+// case), but StrideVector's two independent operands need the source
+// preserved so the runtime knows how to read each one (see ExtentOperand).
+ExtentOperand resolveExtentOperand(const Value *v, unsigned sretOffset) {
+  if (int idx = dwarfIndexOf(v, sretOffset); idx >= 0)
+    return {idx, ExtentSource::Value};
+  if (auto *ld = dyn_cast<LoadInst>(v))
+    if (int idx = dwarfIndexOf(stripPtr(ld->getPointerOperand()), sretOffset);
+        idx >= 0)
+      return {idx, ExtentSource::PointeeI32};
+  return {};
+}
+
+// Result of array-bound detection, direct or delegated: caller-argument
+// operands, not raw Values -- both detectDirectArrayBound and
+// detectDelegatedArrayBound resolve all the way down to this before
+// returning, so their caller never has to know which path produced it.
+// `stride` invalid with `length` valid is a real, meaningful outcome (array-
+// shaped, but no distinct stride argument found/resolved) -- see its
+// consumption in inferFunction for what that combination means for sizing.
+struct ArrayBound {
+  ExtentOperand length;
+  ExtentOperand stride;
+};
+
+// Array-bound detection WITHIN the function currently being analyzed (no
+// delegation) -- e.g. a hand-written loop directly in the function's own
+// body, or (rare) a memcpy-family call passing this pointer with a
+// resolvable length. Resolves acc.loopBounds' raw Values down to caller
+// argument operands; a resolved length with no resolved stride is still
+// returned (length-only) rather than discarded.
+//
+// Scans ALL of acc.loopBounds and prefers a fully-resolved (length+stride)
+// entry over a length-only one -- does NOT stop at the first length match.
+// This matters because analyzeAccess's worklist walk finds every GEP
+// reachable from the pointer, across every branch, not just one "the" loop:
+// a guarded `if (inc_x==1) { <SIMD loop, step is a compile-time
+// vector-width constant, not an argument> } else { <plain loop, step is
+// inc_x> }` shape visits both loops' GEPs, and if the SIMD one happens to be
+// found first, stopping there would report length-only (its "stride" isn't
+// argument-derived at all, just a small literal) even though the very next
+// entry has a real, fully-resolvable stride from the general-case loop.
+// `lb.stride` is only ever set when `lb.lengthProven` (see LoopBound), so an
+// unproven length can never spuriously pair with one here.
+ArrayBound detectDirectArrayBound(const Access &acc, unsigned sretOffset) {
+  ArrayBound best;
+  for (const LoopBound &lb : acc.loopBounds) {
+    ExtentOperand len = resolveExtentOperand(stripIntCasts(lb.length), sretOffset);
+    if (!len.valid())
+      continue;
+    ExtentOperand stride = lb.stride
+        ? resolveExtentOperand(stripIntCasts(lb.stride), sretOffset)
+        : ExtentOperand{};
+    // A parameter can never legitimately be its own stride -- len==stride is
+    // proof the "length" side mis-resolved (dominatingArgumentGuard's
+    // comparison-collector doesn't know WHICH operand of a compound
+    // `n<=0 || inc_x<=0` guard is the real count vs. the increment, and can
+    // pick either one). Discard the WHOLE entry, not just the stride half:
+    // we have direct evidence this length is wrong, so it must not be kept
+    // as a length-only fallback either.
+    if (stride.valid() && stride.argIndex == len.argIndex)
+      continue;
+    if (stride.valid())
+      return {len, stride}; // fully resolved -- good enough, stop here
+    if (!best.length.valid())
+      best.length = len; // remember the first length-only match, keep looking
+  }
+  if (best.length.valid())
+    return best;
+  for (const Value *lv : acc.lengths) {
+    ExtentOperand len = resolveExtentOperand(stripIntCasts(lv), sretOffset);
+    if (len.valid())
+      return {len, {}};
+  }
+  return {};
+}
+
+// One-hop interprocedural array-bound detection. `acc` is the CALLER-side
+// access summary for a pointer argument that has no local evidence of its
+// own (acc.lengths/acc.loopBounds both empty) -- e.g. a public wrapper whose
+// own compiled body never indexes its array arguments at all, immediately
+// delegating to an internal kernel compiled as a separate translation unit.
+// If `acc` recorded a direct call to a callee whose BODY
+// is available -- either defined right in the caller's own module (used
+// directly, unambiguous by construction), or, for a genuinely cross-module
+// reference, the ONE unambiguous externally-linked definition found across
+// every resident module in `calleeIndex` (built once, up front; see
+// CalleeIndex in Infer.h) -- re-run the same access analysis on the
+// callee's OWN corresponding parameter. If the callee's own dataflow shows
+// that parameter is itself bounded by (and, separately, walked with a step
+// derived from) other parameters of the callee's own, map those
+// callee-parameter indices back through the SAME call site's actual
+// arguments to the CALLER's own DWARF argument list -- that's what gets
+// reported, in the caller's own terms.
+//
+// Fixed at exactly one hop: deep enough for the confirmed public-wrapper/
+// internal-kernel shape, shallow enough to bound cost and rule out cycles
+// without a visited-set.
+ArrayBound detectDelegatedArrayBound(const Access &acc, unsigned callerSretOffset,
+                                     const CalleeIndex &calleeIndex,
+                                     std::string *calleeNameOut) {
+  ArrayBound best;
+  std::string bestName;
+  for (const DelegateCall &dc : acc.delegateCalls) {
+    const Function *callee = dc.cb->getCalledFunction();
+    if (!callee)
+      continue; // indirect call -- callee statically unknown, cannot follow
+    const Function *calleeDef = nullptr;
+    if (!callee->isDeclaration()) {
+      // Defined right here, in the caller's own module -- the call site
+      // already references the exact body directly; no name lookup (and no
+      // possibility of ambiguity) needed.
+      calleeDef = callee;
+    } else if (callee->hasName()) {
+      // A genuinely cross-module reference (only declared in this TU).
+      // calleeIndex maps a name to nullptr when more than one resident
+      // module defines an externally-linked function with that name --
+      // refuse to guess which one this declaration actually resolves to,
+      // rather than silently picking one (see CalleeIndex in Infer.h).
+      auto it = calleeIndex.find(callee->getName());
+      if (it == calleeIndex.end() || !it->second)
+        continue;
+      calleeDef = it->second;
+    } else {
+      continue;
+    }
+    if (dc.argIdx >= calleeDef->arg_size())
+      continue; // shouldn't happen (argIdx came from this exact call), but be safe
+    unsigned calleeSretOffset = computeSretOffset(*calleeDef);
+    Access calleeAcc = analyzeAccess(calleeDef->getArg(dc.argIdx));
+
+    // Map a Value found INSIDE the callee (a length OR a stride -- same
+    // mapping either way) back to one of the CALLER's own DWARF argument
+    // operands, via this same call site's actual arguments.
+    auto mapBack = [&](const Value *v) -> ExtentOperand {
+      const Value *s = stripIntCasts(v);
+      int calleeParamIdx = dwarfIndexOfMaybeLoaded(s, calleeSretOffset);
+      if (calleeParamIdx < 0 || (unsigned)calleeParamIdx >= dc.cb->arg_size())
+        return {};
+      const Value *atCallSite = stripIntCasts(dc.cb->getArgOperand(calleeParamIdx));
+      // resolveExtentOperand, not a plain index lookup: the CALLER's own
+      // value passed into this slot might itself be a local loaded from one
+      // of the caller's OWN pointer arguments -- the Fortran-by-reference
+      // idiom (a Fortran entry point's `n` is `load i32, ptr %N`, where %N
+      // -- not `n` -- is its actual argument; its CBLAS sibling takes `n`
+      // directly, so only the Fortran entry point's call needs the extra
+      // hop, and the runtime needs to know it's there).
+      return resolveExtentOperand(atCallSite, callerSretOffset);
+    };
+    auto checkOne = [&](const Value *v) -> ExtentOperand {
+      if (ExtentOperand r = mapBack(v); r.valid())
+        return r;
+      // (*lenptr) idiom inside the callee, mirroring the same check the
+      // top-level acc.lengths loop does for the function under direct analysis.
+      if (auto *ld = dyn_cast<LoadInst>(stripIntCasts(v)))
+        return mapBack(stripPtr(ld->getPointerOperand()));
+      return {};
+    };
+
+    // Loop-bound evidence (the common BLAS-style delegation case): try to resolve BOTH
+    // length and stride back to the caller for EVERY loop bound found, not
+    // just the first whose length resolves -- prefer a fully-resolved
+    // (length+stride) match over a length-only one, for the same reason
+    // detectDirectArrayBound does (see its own comment). `lb.stride` is
+    // only ever set when `lb.lengthProven`, so an unproven callee-side
+    // length can never spuriously pair with a stride here either.
+    for (const LoopBound &lb : calleeAcc.loopBounds) {
+      ExtentOperand len = checkOne(lb.length);
+      if (!len.valid())
+        continue;
+      ExtentOperand stride = lb.stride ? checkOne(lb.stride) : ExtentOperand{};
+      // See the identical check in detectDirectArrayBound: a parameter can
+      // never legitimately be its own stride, so this pairing is discarded
+      // outright rather than kept as a length-only fallback.
+      if (stride.valid() && stride.argIndex == len.argIndex)
+        continue;
+      if (stride.valid()) {
+        if (calleeNameOut) *calleeNameOut = callee->getName().str();
+        return {len, stride}; // fully resolved -- good enough, stop here
+      }
+      if (!best.length.valid()) {
+        best.length = len;
+        bestName = callee->getName().str();
+      }
+    }
+    // Byte-count evidence (memcpy-family call) inside the callee -- a valid
+    // "array-shaped" signal on its own, but carries no stride concept, so
+    // it can never beat an already-found fully-resolved loop-bound match;
+    // only worth remembering as a length-only fallback.
+    if (!best.length.valid())
+      for (const Value *lv : calleeAcc.lengths)
+        if (ExtentOperand r = checkOne(lv); r.valid()) {
+          best.length = r;
+          bestName = callee->getName().str();
+          break;
+        }
+  }
+  if (best.length.valid() && calleeNameOut)
+    *calleeNameOut = bestName;
+  return best;
 }
 
 // Annotate the fields of a struct/union pointee, best-effort. Returns whether the
@@ -1184,9 +1669,9 @@ void enforceRawArgSlotCap(FunctionTrees &ft) {
 
 } // namespace
 
-void inferFunction(const Function &F, FunctionTrees &ft) {
-  unsigned sretOffset =
-      (F.arg_size() && F.getArg(0)->hasStructRetAttr()) ? 1 : 0;
+void inferFunction(const Function &F, FunctionTrees &ft,
+                   const CalleeIndex &calleeIndex) {
+  unsigned sretOffset = computeSretOffset(F);
   int cursorArg = -1; // a char** arg whose *p walks its own buffer (strsep)
 
   // ---- variadic tail (if any) ----
@@ -1433,9 +1918,85 @@ void inferFunction(const Function &F, FunctionTrees &ft) {
                          : ": byte buffer size paired to arg") +
             std::to_string(sizeArg) + " heuristically");
       } else {
-        // non-char scalar pointee with no proven length → one fixed object.
-        node->sizeKind = SizeKind::Const;
-        node->constSize = elem;
+        // non-char scalar pointee with no proven BYTE-count length
+        // (acc.lengths empty/unresolved). Before silently assuming one
+        // element, check for ELEMENT-count array evidence -- either found
+        // directly in THIS function's own loop (detectDirectArrayBound), or
+        // one hop away via a delegated call to a callee whose body is
+        // available (detectDelegatedArrayBound). A genuinely single-scalar
+        // out-param (e.g. frexp's int *exp) is UNCHANGED: neither check ever
+        // fires for it, so it falls through to the same const-size path as
+        // before.
+        ArrayBound bound = detectDirectArrayBound(acc, sretOffset);
+        std::string delegateName;
+        if (!bound.length.valid())
+          bound = detectDelegatedArrayBound(acc, sretOffset, calleeIndex,
+                                            &delegateName);
+        auto describe = [&](const ExtentOperand &op) {
+          return "arg" + std::to_string(op.argIndex) +
+              (op.source == ExtentSource::PointeeI32 ? " (via pointer)" : "");
+        };
+
+        if (bound.length.valid() && bound.stride.valid()) {
+          // Full evidence: length AND a distinct stride operand both
+          // resolved to real caller arguments -- the runtime can size this
+          // exactly (LIND_SIZE_STRIDE_VECTOR, computed from the real call's
+          // actual argument values at dispatch time; see lind_marshal.h).
+          // No force_local needed.
+          node->sizeKind = SizeKind::StrideVector;
+          node->sizeOperand = bound.length;
+          node->strideOperand = bound.stride;
+          node->constSize = elem;
+          ft.warnings.push_back("arg" + std::to_string(p) +
+              ": BLAS-style strided vector (length=" + describe(bound.length) +
+              ", stride=" + describe(bound.stride) +
+              (delegateName.empty() ? ", found via loop analysis)"
+                                    : ", found via kernel delegation to `" +
+                                          delegateName + "`)") +
+              " — byte extent computed at dispatch time from the real "
+              "call's argument values (a negative stride at runtime aborts "
+              "the whole grate process — see LIND_SIZE_STRIDE_VECTOR in "
+              "lind_marshal.h)");
+        } else if (bound.length.valid()) {
+          // Array-shaped, but no distinct stride operand resolved. The
+          // runtime has no "N contiguous elements" primitive separate from
+          // LIND_SIZE_STRIDE_VECTOR (which needs an explicit stride operand
+          // to point at) -- still can't be safely sized. force_local rather
+          // than silently marshal it as one element.
+          node->sizeKind = SizeKind::Const;
+          node->constSize = elem;
+          ft.forceLocal = true;
+          ft.warnings.push_back("arg" + std::to_string(p) +
+              ": array-shaped (length governed by " + describe(bound.length) +
+              (delegateName.empty() ? ", found via loop analysis)"
+                                    : ", found via kernel delegation to `" +
+                                          delegateName + "`)") +
+              " but no distinct stride operand was found, and this tool "
+              "has no \"N contiguous elements\" size primitive separate "
+              "from the strided one — force_local rather than silently "
+              "marshalling it as one element");
+        } else if (!acc.escapes) {
+          // No length evidence anywhere, but analyzeAccess also found no
+          // store-away and no call outside its small recognized set -- the
+          // pointer's entire usage is visible right here, and none of it
+          // walked more than one object (e.g. frexp's int *exp: loaded/
+          // stored directly, never passed anywhere else). That absence of
+          // any array-shaped evidence, combined with full local visibility,
+          // is positive evidence of single-object access, not a guess.
+          node->sizeKind = SizeKind::Const;
+          node->constSize = elem;
+        } else {
+          // The pointer escapes to a sink this analysis can't see into
+          // (stored into memory, or passed to a call outside the small
+          // recognized set) with no length evidence found anywhere. The
+          // real callee could walk an arbitrary number of elements through
+          // it; assuming one would be a guess, not a proof. Fail closed.
+          ft.forceLocal = true;
+          ft.warnings.push_back("arg" + std::to_string(p) +
+              ": pointer escapes to an unanalyzable callee or store with no "
+              "proven extent — refusing to assume a single element — "
+              "force_local");
+        }
       }
     }
 
@@ -1468,7 +2029,8 @@ void inferFunction(const Function &F, FunctionTrees &ft) {
         node->sizeKind != SizeKind::FromArg &&
         node->sizeKind != SizeKind::FromArgPointee &&
         node->sizeKind != SizeKind::Cstr &&
-        node->sizeKind != SizeKind::PtrArray) {
+        node->sizeKind != SizeKind::PtrArray &&
+        node->sizeKind != SizeKind::StrideVector) {
       ft.forceLocal = true;
     }
   }

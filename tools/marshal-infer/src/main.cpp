@@ -175,6 +175,24 @@ static void jsonNode(raw_ostream &os, const TreeNode *n, unsigned ind,
          << (isField ? (long long)n->sizeArgIndex : remapArg(n->sizeArgIndex));
     if (n->sizeKind == SizeKind::Const)
       os << ",\"const_size\":" << n->constSize;
+    if (n->sizeKind == SizeKind::StrideVector) {
+      // Always top-level operands (struct-field stride detection isn't
+      // implemented), so always remapped -- no isField branch needed, unlike
+      // FromArg/FromArgPointee above. Each operand is its own object, not a
+      // bare index: `source` records whether the raw argument slot IS the
+      // value or points to it (see ExtentOperand/ExtentSource in
+      // ParamTree.h) -- collapsing that into a single index is exactly the
+      // bug this shape exists to avoid (a Fortran-by-reference scalar's raw
+      // slot holds a pointer, not the number itself).
+      auto operand = [&](const char *key, const ExtentOperand &op) {
+        os << ",\"" << key << "\":{\"arg_index\":" << remapArg(op.argIndex)
+           << ",\"source\":"; jsonStr(os, extentSourceName(op.source));
+        os << "}";
+      };
+      operand("size_operand", n->sizeOperand);
+      operand("stride_operand", n->strideOperand);
+      os << ",\"const_size\":" << n->constSize;
+    }
     if (n->shallow) os << ",\"shallow\":true";
     if (n->cursor) os << ",\"cursor\":true";
   }
@@ -344,18 +362,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Build one inference record for a (public name, defining function) pair.
-  auto buildRecord = [&](StringRef name,
-                         const Function &f) -> std::unique_ptr<FunctionTrees> {
-    DISubprogram *sp = f.getSubprogram();
-    if (!sp) return nullptr; // no debug info — needs -g
-    auto ft = buildFunctionTrees(sp);
-    if (!ft) return nullptr;
-    ft->funcName = name.str();
-    inferFunction(f, *ft);
-    return ft;
-  };
-
   // Collect inference for each interface-candidate function across ALL input
   // modules, keyed by exported name. glibc exports many symbols as weak aliases
   // (strlen -> __strlen), so we resolve GlobalAliases to their defining function
@@ -369,11 +375,58 @@ int main(int argc, char **argv) {
     return (!haveExports || exports.count(n)) && !emitted.count(n);
   };
 
+  // Pass 1: load every input .bc into a RESIDENT Module (all sharing `ctx`,
+  // kept alive for the rest of main()) and index every EXTERNALLY-LINKED
+  // defined function by name across all of them. Two passes, not one,
+  // because a callee needed for one-hop delegation analysis (see CalleeIndex
+  // in Infer.h) may live in a .bc processed later in file order than its
+  // caller -- the old single-pass loop discarded each Module before moving
+  // to the next, so a caller could only ever see an external declaration for
+  // a callee compiled separately, never its body.
+  //
+  // Internal/static-linkage functions are deliberately excluded: they're
+  // invisible outside their own TU, so indexing one by name would let an
+  // unrelated same-named static function in a different TU silently resolve
+  // some other module's genuinely external declaration (see CalleeIndex's
+  // comment). A same-module callee never needs this index at all -- the call
+  // site already references its body directly (detectDelegatedArrayBound).
+  //
+  // A name with more than one externally-linked definition across resident
+  // modules is genuinely ambiguous (which one a given cross-module
+  // declaration actually resolves to isn't knowable from IR alone) --
+  // recorded as nullptr rather than silently keeping whichever was inserted
+  // first.
+  std::vector<std::unique_ptr<Module>> mods;
+  CalleeIndex calleeIndex;
   for (const std::string &input : InputFiles) {
     SMDiagnostic err;
     std::unique_ptr<Module> mod = parseIRFile(input, err, ctx);
     if (!mod) { ++modBad; continue; } // skip unreadable TU
     ++modOk;
+    for (Function &f : *mod) {
+      if (f.isDeclaration() || f.hasLocalLinkage())
+        continue;
+      auto res = calleeIndex.try_emplace(f.getName(), &f);
+      if (!res.second && res.first->second != &f)
+        res.first->second = nullptr; // >1 conflicting definition -- ambiguous
+    }
+    mods.push_back(std::move(mod));
+  }
+
+  // Build one inference record for a (public name, defining function) pair.
+  auto buildRecord = [&](StringRef name,
+                         const Function &f) -> std::unique_ptr<FunctionTrees> {
+    DISubprogram *sp = f.getSubprogram();
+    if (!sp) return nullptr; // no debug info — needs -g
+    auto ft = buildFunctionTrees(sp);
+    if (!ft) return nullptr;
+    ft->funcName = name.str();
+    inferFunction(f, *ft, calleeIndex);
+    return ft;
+  };
+
+  // Pass 2: run inference over every resident module.
+  for (const std::unique_ptr<Module> &mod : mods) {
     for (Function &f : *mod) {
       if (f.isDeclaration()) continue;
       if (!ShowAll && f.hasLocalLinkage()) continue;

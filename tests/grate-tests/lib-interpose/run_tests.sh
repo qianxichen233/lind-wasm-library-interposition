@@ -699,6 +699,62 @@ run_test "fail-closed-provenance-stream" \
        "[Grate|provenance] toy_stream_process handler ran, mode=5" \
        "[Grate|provenance] toy_stream_process handler ran, mode=6"
 
+# fail-closed-stridevec-*: LIND_SIZE_STRIDE_VECTOR and lind_extent_operand
+# (issue #26 review). See stridevec_grate.c/stridevec_cage.c for what each
+# mode targets and why. Acceptance modes assert the real handler ran
+# (evidence a genuine dispatch happened, not a lucky coincidence);
+# rejection modes forbid it (LIND_GRATE_ERR alone doesn't prove the real
+# handler never executed).
+for mode_desc in \
+    "basic:toy_daxpy" \
+    "zero:toy_daxpy" \
+    "zerostride:toy_daxpy" \
+    "pointee:toy_daxpy_ref" \
+    "mixed:toy_daxpy_mixed"
+do
+    mode="${mode_desc%%:*}"
+    fn="${mode_desc#*:}"
+    GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+    run_test "fail-closed-stridevec-$mode" \
+        "fail-closed/stridevec_cage.c" \
+        "fail-closed/stridevec_grate.c" \
+        "env=/lib/libtoy.so" "yes" \
+        "/stridevec_cage.cwasm" "$mode" \
+        -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: $mode" \
+        -- "[Grate|stridevec] $fn handler ran"
+done
+
+for mode_desc in \
+    "negstride:toy_daxpy" \
+    "overflow:toy_daxpy" \
+    "narrow:toy_daxpy" \
+    "arenaexhaust:toy_daxpy" \
+    "nullpointee:toy_daxpy_ref" \
+    "wrongptr:toy_daxpy_ref"
+do
+    mode="${mode_desc%%:*}"
+    fn="${mode_desc#*:}"
+    GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+    run_test "fail-closed-stridevec-$mode" \
+        "fail-closed/stridevec_cage.c" \
+        "fail-closed/stridevec_grate.c" \
+        "env=/lib/libtoy.so" "yes" \
+        "/stridevec_cage.cwasm" "$mode" \
+        -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: $mode" \
+        -- \
+        -- "[Grate|stridevec] $fn handler ran"
+done
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-stridevec-badindex" \
+    "fail-closed/stridevec_cage.c" \
+    "fail-closed/stridevec_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/stridevec_cage.cwasm" "badindex" \
+    -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: badindex" \
+    -- \
+    -- "[Grate|stridevec] toy_daxpy_badindex handler ran (should not happen)"
+
 DECLARED_TESTS+=("fail-closed")
 
 # --------------------------------------------------------------------------

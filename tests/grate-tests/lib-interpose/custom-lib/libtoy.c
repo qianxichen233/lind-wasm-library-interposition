@@ -102,3 +102,50 @@ int toy_stream_process(struct toy_stream *s) {
     s->avail_out -= n;
     return 0;
 }
+
+// toy_daxpy: cblas_daxpy-alike (Y += alpha*X, strided). Used to test
+// LIND_SIZE_STRIDE_VECTOR (issue #26): naive n*elem_size sizing undersizes
+// X/Y whenever the stride isn't 1, since real BLAS-style calls span
+// elements 0, stride, 2*stride, ..., (n-1)*stride -- not just the first n.
+// Returns int (unlike real cblas_daxpy's void) purely so a rejected call's
+// LIND_GRATE_ERR sentinel has a return value to travel back in -- a void
+// portal has no result slot for it to occupy at all.
+int toy_daxpy(int n, double alpha, const double *x, int incx, double *y, int incy) {
+    // Unlike this file's other toy_* functions, the stridevec_grate.c
+    // handler for this one calls straight through to this real
+    // implementation (on the shadow-marshalled buffers) -- so running here
+    // is the expected, correct outcome, not a sign of a marshalling bug.
+    for (int i = 0; i < n; i++)
+        y[i * incy] += alpha * x[i * incx];
+    return 0;
+}
+
+// toy_daxpy_ref: same computation as toy_daxpy, but n/incx/incy are passed
+// by reference -- the Fortran BLAS calling convention, where every scalar
+// argument is a pointer to its value rather than the value itself. Used to
+// test LIND_SIZE_STRIDE_VECTOR's pointee-sourced extent operands.
+int toy_daxpy_ref(const int *n, double alpha, const double *x, const int *incx,
+                   double *y, const int *incy) {
+    for (int i = 0; i < *n; i++)
+        y[i * (*incy)] += alpha * x[i * (*incx)];
+    return 0;
+}
+
+// toy_daxpy_mixed: n and incy by reference, incx by value -- an extent
+// operand pair (X's n/incx) and a lone pointee operand (Y's incy) don't
+// have to agree on sourcing; this exercises a spec mixing both within one
+// call.
+int toy_daxpy_mixed(const int *n, double alpha, const double *x, int incx,
+                     double *y, const int *incy) {
+    for (int i = 0; i < *n; i++)
+        y[i * (*incy)] += alpha * x[i * incx];
+    return 0;
+}
+
+// toy_daxpy_badindex: identical to toy_daxpy, registered under its own
+// symbol purely so a test can pair it with a spec whose extent operand
+// arg_index is deliberately out of range without colliding with
+// toy_daxpy's own (correct) registration in the same grate.
+int toy_daxpy_badindex(int n, double alpha, const double *x, int incx, double *y, int incy) {
+    return toy_daxpy(n, alpha, x, incx, y, incy);
+}

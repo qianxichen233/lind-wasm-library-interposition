@@ -30,6 +30,16 @@ SIZE_KIND = {
     "from_arg_pointee": "LIND_SIZE_FROM_ARG_POINTEE",
     "cstr": "LIND_SIZE_CSTR",
     "ptr_array": "LIND_SIZE_PTR_ARRAY",
+    "stride_vector": "LIND_SIZE_STRIDE_VECTOR",
+}
+# StrideVector extent operands: whether a raw wasm argument slot IS the
+# value or points to it (see ParamTree.h's ExtentSource / lind_marshal.h's
+# lind_extent_source). Required because classic Fortran BLAS passes every
+# scalar by reference (`int *N`), unlike CBLAS's by-value `int n` -- the two
+# cannot share one representation without losing this distinction.
+EXTENT_SOURCE = {
+    "value": "LIND_EXTENT_VALUE",
+    "pointee_i32": "LIND_EXTENT_POINTEE_I32",
 }
 RET_KIND = {
     "void": "LIND_RET_VOID",
@@ -45,7 +55,7 @@ RET_KIND = {
 # the app a grate-cage pointer it can't dereference.
 SUPPORTED_RET = {"void", "scalar", "ptr_alias_arg", "ptr_into_arg", "handle"}
 SUPPORTED_SIZE = {None, "none", "na", "const", "from_arg", "from_arg_pointee",
-                  "cstr", "ptr_array"}
+                  "cstr", "ptr_array", "stride_vector"}
 
 # The interposition runtime's call-site transport is fixed-arity at this many
 # raw wasm-level argument/cage-id pairs (pass_fptr_to_wt / register_lib_handler
@@ -157,6 +167,21 @@ FD_FUNCS = {
 }
 
 
+def _valid_extent_operand(o, nargs):
+    """True iff `o` is a well-formed StrideVector size_operand/stride_operand:
+    a dict with an in-range integer arg_index and a known source. Malformed
+    metadata here (missing, wrong-typed, out-of-range, or an unrecognized
+    source string) must never be silently repaired into a valid-looking but
+    wrong handler -- see EXTENT_SOURCE's own comment on why source can't be
+    guessed."""
+    if not isinstance(o, dict):
+        return False
+    idx = o.get("arg_index")
+    if not isinstance(idx, int) or isinstance(idx, bool) or not (0 <= idx < nargs):
+        return False
+    return o.get("source") in EXTENT_SOURCE
+
+
 def is_marshalable(f):
     """True iff the runtime can faithfully marshal every part of this spec."""
     name = f.get("name", "")
@@ -204,6 +229,14 @@ def is_marshalable(f):
             return False
         if n.get("kind") == "ptr" and n.get("size_kind") not in SUPPORTED_SIZE:
             return False                          # unknown sizing -> can't copy safely
+        if n.get("kind") == "ptr" and n.get("size_kind") == "stride_vector":
+            const_size = n.get("const_size")
+            if (not isinstance(const_size, int) or isinstance(const_size, bool)
+                    or const_size <= 0):
+                return False                      # invalid element size
+            if not (_valid_extent_operand(n.get("size_operand"), nargs)
+                    and _valid_extent_operand(n.get("stride_operand"), nargs)):
+                return False                      # malformed/missing extent operand
         for ch in (n.get("pointee") or []) + (n.get("fields") or []):
             if not walk(ch):
                 return False
@@ -249,6 +282,31 @@ class Emitter:
         if sk in ("from_arg", "from_arg_pointee"):
             idx = a.get("size_arg_index", a.get("size_field_index", 0))
             parts.append(f".size_arg_index = {idx}")
+        if sk == "stride_vector":
+            # is_marshalable() is the primary gate (it also range-checks
+            # arg_index against the function's real arg count, which isn't
+            # known here) -- this is a defense-in-depth backstop for any
+            # direct caller of arg_spec_body/emit_function_spec that skips
+            # it. Malformed metadata (missing, wrong-typed, or an
+            # unrecognized source) must fail loudly, never silently default
+            # to arg 0 / LIND_EXTENT_VALUE: that would emit a valid-looking
+            # but wrong handler instead of refusing to generate one.
+            def operand(o, label):
+                if not isinstance(o, dict):
+                    raise ValueError(f"stride_vector {label} missing/malformed: {o!r}")
+                idx = o.get("arg_index")
+                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+                    raise ValueError(f"stride_vector {label} has invalid arg_index: {idx!r}")
+                src = o.get("source")
+                if src not in EXTENT_SOURCE:
+                    raise ValueError(f"stride_vector {label} has unknown source: {src!r}")
+                return f'{{ .arg_index = {idx}, .source = {EXTENT_SOURCE[src]} }}'
+            const_size = a.get("const_size")
+            if not isinstance(const_size, int) or isinstance(const_size, bool) or const_size <= 0:
+                raise ValueError(f"stride_vector has invalid const_size: {const_size!r}")
+            parts.append(f'.size_operand = {operand(a.get("size_operand"), "size_operand")}')
+            parts.append(f'.stride_operand = {operand(a.get("stride_operand"), "stride_operand")}')
+            parts.append(f'.const_size = {const_size}')
 
         # NULL-terminated array of pointers (argv): emit the per-element spec.
         if sk == "ptr_array":
