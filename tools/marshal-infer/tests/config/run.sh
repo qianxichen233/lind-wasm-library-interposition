@@ -400,6 +400,45 @@ fbneg_check neg_unsigned_no_nuw
 fbneg_check neg_unrelated_counter
 fbneg_check neg_different_step_counter
 
+# neg_missing_guard's pairing never resolving (checked above) isn't the whole
+# story: before the fail-closed fix below, this exact function fell through
+# to the single-element fallback and was observably "marshal" -- the overall
+# decision must be checked directly, not just the absence of a resolved
+# stride_vector pairing.
+check "factored (-): neg_missing_guard overall decision" \
+    "$(pyjq "$json_fbneg" "([x for x in f['functions'] if x['name']=='neg_missing_guard'] or [{'decision':'MISSING'}])[0]['decision']")" \
+    "force_local"
+
+echo ""
+echo "=== fail-closed on unresolved indexed access: no --config ==="
+# analyzeAccess/inferFunction must never fall through to the single-element
+# fallback for a scalar-pointee pointer that's visibly indexed by anything
+# other than a provable constant zero, regardless of whether that indexed
+# access ever resolves to an exact extent (see Access::requiresDynamicExtent
+# in Infer.cpp). Unconditionally available, no --config anywhere here.
+cp "$SCRIPT_DIR/dynamic_extent.c" "$WORK/dynamic_extent.c"
+( cd "$WORK" && "$LIND_COMPILE" --emit-llvm dynamic_extent.c -- -O1 -fno-unroll-loops ) >/dev/null 2>&1
+json_dynext="$WORK/dynext.marshal.json"
+"$MARSHAL_INFER" --json -o "$json_dynext" "$WORK/dynamic_extent.bc" 2>/dev/null
+
+dynext_decision() {
+    pyjq "$json_dynext" "([x for x in f['functions'] if x['name']=='$1'] or [{'decision':'MISSING'}])[0]['decision']"
+}
+check "dynamic extent: unresolved loop bound -> force_local" \
+    "$(dynext_decision unresolved_loop_bound)" "force_local"
+check "dynamic extent: dynamic non-loop index -> force_local" \
+    "$(dynext_decision dynamic_direct_index)" "force_local"
+check "dynamic extent: constant nonzero index -> force_local" \
+    "$(dynext_decision constant_nonzero_index)" "force_local"
+check "dynamic extent: negative offset -> force_local" \
+    "$(dynext_decision negative_offset_index)" "force_local"
+check "dynamic extent: direct *p access -> one-element marshal" \
+    "$(dynext_decision direct_deref)" "marshal"
+check "dynamic extent: p[0] only -> one-element marshal" \
+    "$(dynext_decision zero_index_only)" "marshal"
+check "dynamic extent: genuine scalar out-param unaffected" \
+    "$(dynext_decision write_scalar_out)" "marshal"
+
 echo ""
 echo "=== contract application + provenance ==="
 cat > "$WORK/contract.json" <<EOF

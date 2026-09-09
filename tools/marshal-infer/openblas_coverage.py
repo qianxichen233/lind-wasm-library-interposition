@@ -24,7 +24,7 @@ marshal-infer's own --config coverage.min_marshal_count/min_marshal_pct gate
 sufficient condition for a generated handler to exist (a "marshal" record
 with, say, an unsupported return kind or a malformed contract operand
 produces no handler at all -- see gen_grate.py's unmarshalable_reason()).
-openblas.marshal.json has carried exactly this gap (50 marshal decisions, 48
+openblas.marshal.json has carried exactly this gap (42 marshal decisions, 40
 generated handlers) with nothing to catch it. This script is the downstream
 gate that actually matters for "can this be used": it measures GENERATED
 handlers, additionally requires a fixed set of OpenBLAS symbols to be among
@@ -49,16 +49,16 @@ from gen_grate import is_marshalable, unmarshalable_reason, LIND_RAW_ARGS_MAX  #
 _SLOT_WARNING_RE = re.compile(r"needs (\d+) raw ABI slots")
 
 # GENERATED_FLOOR is a REGRESSION floor pinned to what generation already
-# achieves today (48), not a target padded down "for safety margin" --
-# padding it down (e.g. to 40, marshal-infer's OWN now-superseded
-# decision=="marshal" threshold) would let exactly the kind of silent
-# generated-handler regression this script exists to catch slip back through.
-# GENERATED_TARGET records the actual goal instead: roughly 80 of the 89
-# functions the transport can carry at all (see "transport accepted" above).
-# Closing that gap is inference-side work (more contracts/heuristics
-# recovering more of OpenBLAS's real -O2 loop shapes); this script can only
-# report it, not close it, so it's a NOTE below, not a failure.
-GENERATED_FLOOR = 48
+# achieves today (40), not a target padded down "for safety margin" -- any
+# drop below it would let a silent generated-handler regression slip back
+# through unnoticed. GENERATED_TARGET records the actual goal instead:
+# roughly 80 of the 89 functions the transport can carry at all (see
+# "transport accepted" above). Closing that gap is inference-side work (more
+# contracts recovering more of OpenBLAS's real loop shapes, or -- per issue
+# #27 -- analysis-friendlier IR, not more compiler-output pattern guesses);
+# this script can only report it, not close it, so it's a NOTE below, not a
+# failure.
+GENERATED_FLOOR = 40
 GENERATED_TARGET = 80
 
 # Symbols this project's OpenBLAS interposition work is required to cover --

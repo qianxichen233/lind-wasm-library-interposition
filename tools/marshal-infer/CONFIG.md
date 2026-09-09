@@ -317,11 +317,46 @@ clang/LLVM version's own canonicalization prevents it), so that condition
 is verified by inspection rather than an adversarial test.
 
 This recovered `cblas_sasum`/`sasum_`/`cblas_dasum`/`dasum_` (46/203
-strict, up from 42/203). `kernel/arm/sum.c`'s `ssum_`/`dsum_` and
+strict at the time). `kernel/arm/sum.c`'s `ssum_`/`dsum_` and
 `kernel/riscv64/nrm2.c` have the identical rescaling but each add a
 further complication (a SIMD-fast-path control-flow merge; a
 possibly-negative stride compared via `abs()`) this proof correctly
 declines rather than reach for — see `PATTERNS.md` for both.
+
+## The single-element fallback requires full local visibility
+
+`analyzeAccess` walks every GEP reachable from a pointer argument, but its
+result only ever fed one question directly: did any of those GEPs resolve
+to a proven or configured multi-element extent (`loopBounds`,
+`delegateCalls`)? A GEP that was visibly there — a loop whose trip count
+didn't resolve, a plain `x[i]`, a constant `x[3]`, a negative `x[-1]` — but
+produced no such resolved extent left no trace at all once discarded. The
+single-element fallback (`!acc.escapes` → treat the pointer as one scalar)
+had no way to distinguish that case from a pointer genuinely never indexed
+past its own address (`*p`, `p[0]`, a plain scalar out-param) — both looked
+identical: no length evidence, no escape.
+
+`Access::requiresDynamicExtent` closes this: set whenever a GEP off the
+pointer has any index that isn't provably an all-zero constant
+(`GetElementPtrInst::hasAllZeroIndices()`), independent of whether
+`loopBoundValues` proves anything about it. The single-element fallback
+now requires `!acc.escapes && !acc.requiresDynamicExtent`; a pointer that
+trips the flag with no exact extent proven or configured force_locals
+instead, with a diagnostic naming the argument.
+
+**Found via review, not measurement — and it was already live in the
+checked-in OpenBLAS profile:** `srotmg_`/`drotmg_`/`cblas_srotmg`/
+`cblas_drotmg`'s output parameter (BLAS's 5-element `P` array, written as
+`P[0]`..`P[4]`) has no loop, no distinct length argument, and never
+escapes — every condition the old fallback checked. It was marshalled as a
+single `float`/`double`, four elements short of what the function actually
+writes. Fixing the gap drops the checked-in floor from 46/203 back to
+42/203 (`min_marshal_count` updated accordingly) — the sasum/dasum family
+above are still proven and still marshal; these four were never sound to
+begin with. Covered by `tests/config/dynamic_extent.c`: an unresolved loop
+bound, a dynamic non-loop index, a constant nonzero index, and a negative
+offset must all force_local; a direct dereference, an explicit `p[0]`, and
+a genuine scalar out-param must all still marshal as one element.
 
 ## Why the heuristics exist, and their real ceiling
 
@@ -348,7 +383,7 @@ does not enable them. The mechanism, and the safety history below, stay
 relevant for whatever future library genuinely can't be analyzed
 un-unrolled.
 
-Of the 203-46=157 remaining `force_local` functions, 114 are blocked by
+Of the 203-42=161 remaining `force_local` functions, 114 are blocked by
 the raw-ABI-slot cap (`LIND_RAW_ARGS_MAX`, untouchable by any config or
 analysis choice) — an absolute floor. 203-114-1(variadic) = 88 is the
 practical ceiling for source-shape analysis against OpenBLAS's current
@@ -445,10 +480,10 @@ nothing but a human noticing the number looked different.
 ## See also
 
 - `profiles/openblas.json` — currently just a coverage floor
-  (`min_marshal_count: 46`) to catch any future regression; neither
+  (`min_marshal_count: 42`) to catch any future regression; neither
   `contracts` nor `analysis.policy:"relaxed"` is needed against OpenBLAS's
   real binary once `infer_openblas.sh` analyzes it at `-O1` (see above) --
-  46/203 marshal, strict, every decision `proven`.
+  42/203 marshal, strict, every decision `proven`.
 - `infer_openblas.sh` — the analysis-specific `-O1`/no-unroll/no-vectorize
   compile profile, and the `COMMON_OPT` gotcha for actually making it
   stick against OpenBLAS's own Makefile.
@@ -464,5 +499,7 @@ nothing but a human noticing the number looked different.
   its direct-predicate counterpart (`matrix.c`, non-unrolled, crossing
   signed/unsigned, forward/reversed, and plain/Fortran-by-reference
   counters), the factored-bound proof's own adversarial matrix
-  (`factored_bound_pos.c`/`factored_bound_neg.c`), and coverage-threshold
+  (`factored_bound_pos.c`/`factored_bound_neg.c`), the single-element
+  fallback's required full local visibility (`dynamic_extent.c`), and
+  coverage-threshold
   enforcement.

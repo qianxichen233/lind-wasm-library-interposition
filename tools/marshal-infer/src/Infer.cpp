@@ -433,6 +433,17 @@ struct Access {
   bool escapes = false;     // pointer stored away / passed to unknown callee
   bool stringOp = false;    // flows into a C-string libcall
   bool unknownCallee = false;
+  // A GEP off this pointer was found whose indices are not PROVABLY all
+  // constant zero -- i.e. the pointer is used as more than a single object,
+  // whether or not that multi-element access ever resolves to an exact
+  // extent. Covers an induction-variable GEP (whether or not
+  // loopBoundValues can prove its trip count), a dynamic non-loop index
+  // (`x[i]`), a nonzero constant index (`x[3]`), and a negative offset --
+  // every one of these fails `hasAllZeroIndices()` the same way. Set
+  // independently of `loopBounds` below so a GEP whose extent couldn't be
+  // proven still blocks the single-element fallback instead of being
+  // silently discarded (see its consumption in inferFunction).
+  bool requiresDynamicExtent = false;
   SmallVector<const Value *, 4> lengths; // BYTE-count operands paired with this
                                           // ptr (memcpy-family length args) --
                                           // trusted directly as a byte size.
@@ -1194,6 +1205,8 @@ Access analyzeAccess(const Argument *A, bool allowUnrollScaledStride) {
       } else if (auto *gep = dyn_cast<GetElementPtrInst>(U)) {
         if (gep->getPointerOperand() == V && seen.insert(gep).second) {
           work.push_back(gep);
+          if (!gep->hasAllZeroIndices())
+            acc.requiresDynamicExtent = true;
           // A hand-written counted loop indexing this pointer (a shape
           // memcpy-style library calls don't cover at all -- e.g. a
           // BLAS-style `while(i<n){ y[iy]+=da*x[ix]; ... }` walk, possibly
@@ -2671,9 +2684,10 @@ void inferFunction(const Function &F, FunctionTrees &ft,
               "has no \"N contiguous elements\" size primitive separate "
               "from the strided one — force_local rather than silently "
               "marshalling it as one element");
-        } else if (!acc.escapes) {
+        } else if (!acc.escapes && !acc.requiresDynamicExtent) {
           // No length evidence anywhere, but analyzeAccess also found no
-          // store-away and no call outside its small recognized set -- the
+          // store-away, no call outside its small recognized set, and no
+          // GEP off this pointer with a non-provably-zero index -- the
           // pointer's entire usage is visible right here, and none of it
           // walked more than one object (e.g. frexp's int *exp: loaded/
           // stored directly, never passed anywhere else). That absence of
@@ -2682,16 +2696,30 @@ void inferFunction(const Function &F, FunctionTrees &ft,
           node->sizeKind = SizeKind::Const;
           node->constSize = elem;
         } else {
-          // The pointer escapes to a sink this analysis can't see into
-          // (stored into memory, or passed to a call outside the small
-          // recognized set) with no length evidence found anywhere. The
-          // real callee could walk an arbitrary number of elements through
-          // it; assuming one would be a guess, not a proof. Fail closed.
+          // Either the pointer escapes to a sink this analysis can't see
+          // into (stored into memory, or passed to a call outside the small
+          // recognized set), or it's visibly indexed as more than one
+          // object (a loop induction variable whose trip count didn't
+          // resolve, a dynamic index, a nonzero constant index, or a
+          // negative offset) with no exact extent proven or configured.
+          // Either way, assuming one element would be a guess, not a proof
+          // -- fail closed rather than silently marshal a partial object.
           ft.forceLocal = true;
-          ft.warnings.push_back("arg" + std::to_string(p) +
-              ": pointer escapes to an unanalyzable callee or store with no "
-              "proven extent — refusing to assume a single element — "
-              "force_local");
+          std::string why;
+          if (acc.requiresDynamicExtent && acc.escapes)
+            why = "pointer is indexed by an offset that isn't provably a "
+                  "constant zero and also escapes to an unanalyzable callee "
+                  "or store";
+          else if (acc.requiresDynamicExtent)
+            why = "pointer is indexed by an offset that isn't provably a "
+                  "constant zero (loop, dynamic, constant-nonzero, or "
+                  "negative), but no exact element extent was proven or "
+                  "configured";
+          else
+            why = "pointer escapes to an unanalyzable callee or store with "
+                  "no proven extent";
+          ft.warnings.push_back("arg" + std::to_string(p) + ": " + why +
+              " — refusing to assume a single element — force_local");
         }
       }
     }
