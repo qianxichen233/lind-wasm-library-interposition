@@ -53,6 +53,15 @@ const char *extentSourceName(ExtentSource s) {
   return "value";
 }
 
+const char *confidenceName(Confidence c) {
+  switch (c) {
+  case Confidence::Proven:     return "proven";
+  case Confidence::Configured: return "configured";
+  case Confidence::Heuristic:  return "heuristic";
+  }
+  return "proven";
+}
+
 const char *retKindName(RetKind r) {
   switch (r) {
   case RetKind::Void:        return "void";

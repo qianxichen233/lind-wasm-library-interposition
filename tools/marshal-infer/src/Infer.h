@@ -6,6 +6,7 @@
 // KSplit's read/write + NesCheck + size analyses (see research/arg-marshalling/).
 #pragma once
 
+#include "Config.h"
 #include "ParamTree.h"
 
 #include "llvm/ADT/StringMap.h"
@@ -45,8 +46,29 @@ using CalleeIndex = llvm::StringMap<const llvm::Function *>;
 // parameter trees (from buildFunctionTrees); this fills dir/sizeKind/handle/ret.
 // `calleeIndex` must cover every module resident in this run (built before any
 // inferFunction call, since a callee can be analyzed regardless of which
-// module the CALLER happens to be processed from).
+// module the CALLER happens to be processed from). `config`, if non-null,
+// supplies this function's checked-in contract overrides (Config.h) and the
+// interprocedural-delegation-hop limit; passing nullptr reproduces the
+// built-in defaults exactly (max_delegation_hops=1, no contracts).
 void inferFunction(const llvm::Function &f, FunctionTrees &ft,
-                   const CalleeIndex &calleeIndex);
+                   const CalleeIndex &calleeIndex, const Config *config = nullptr);
+
+// Checks a checked-in contract's operand indices against `ft`'s ACTUAL
+// lowered DWARF parameter list before inferFunction is ever allowed to
+// apply it: the target pointer argument must exist, the size/stride operand
+// argument indices must exist, a "value" operand must name a compatible
+// integer scalar, and a "pointee_i32" operand must name a compatible
+// pointer-to-32-bit-integer. loadConfig cannot perform this check itself --
+// it runs before any bitcode is even read, with no function signature to
+// check against. Returns false (with a specific, actionable message in
+// `err`) on the FIRST violation found; a stale or incompatible contract is
+// a hard configuration error (main.cpp aborts the whole run on it), never a
+// value silently applied and hoped to be harmless -- an out-of-range or
+// wrong-typed operand index would otherwise be baked into the emitted JSON
+// verbatim (extentOperandFromContract performs no validation of its own)
+// and read back by the runtime as if it had been proven correct.
+bool validateContractAgainstSignature(const FunctionTrees &ft,
+                                      const FunctionContract &contract,
+                                      std::string &err);
 
 } // namespace marshal

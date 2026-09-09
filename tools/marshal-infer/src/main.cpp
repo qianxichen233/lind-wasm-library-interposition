@@ -12,6 +12,7 @@
 //   --all         include internal/static functions
 //   --module NAME label the module in JSON output (default: input path)
 #include "Annotations.h"
+#include "Config.h"
 #include "Infer.h"
 #include "ParamTree.h"
 
@@ -22,12 +23,14 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <fstream>
+#include <map>
 #include <string>
 
 using namespace llvm;
@@ -48,6 +51,11 @@ static cl::opt<std::string> AnnoFile("annotations",
 static cl::opt<std::string> ExportsFile("exports",
     cl::desc("only emit functions whose name is in this newline-separated file "
              "(e.g. the library's exported-symbol list)"),
+    cl::value_desc("file"));
+static cl::opt<std::string> ConfigFile("config",
+    cl::desc("versioned config file (see CONFIG.md): analysis knobs, "
+             "checked-in per-symbol contracts, and coverage thresholds. "
+             "Omitting this reproduces the built-in defaults exactly."),
     cl::value_desc("file"));
 
 // --------------------------------------------------------------------------
@@ -192,6 +200,12 @@ static void jsonNode(raw_ostream &os, const TreeNode *n, unsigned ind,
       operand("size_operand", n->sizeOperand);
       operand("stride_operand", n->strideOperand);
       os << ",\"const_size\":" << n->constSize;
+      // Confidence (issue #27): proven by static analysis, configured by a
+      // checked-in contract, or heuristic (an explicitly config-enabled,
+      // unproven guess) -- always emitted for a StrideVector node, never
+      // omitted, so a reader never has to guess whether "absent" means
+      // "proven" or just "not recorded".
+      os << ",\"confidence\":"; jsonStr(os, confidenceName(n->confidence));
     }
     if (n->shallow) os << ",\"shallow\":true";
     if (n->cursor) os << ",\"cursor\":true";
@@ -337,6 +351,20 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Versioned config (issue #27): analysis knobs, checked-in contracts,
+  // coverage thresholds. A malformed/invalid file is a HARD error (unlike
+  // --annotations' best-effort merge) -- see Config.h's own comment on why
+  // this schema is closed and strict rather than permissive.
+  Config config;
+  bool haveConfig = !ConfigFile.empty();
+  if (haveConfig) {
+    std::string cerr;
+    if (!loadConfig(ConfigFile, config, cerr)) {
+      errs() << "marshal-infer: --config: " << cerr << "\n";
+      return 1;
+    }
+  }
+
   // Output stream.
   std::error_code ec;
   std::unique_ptr<raw_fd_ostream> fileOut;
@@ -413,15 +441,33 @@ int main(int argc, char **argv) {
     mods.push_back(std::move(mod));
   }
 
+  // Contract validation failures (issue #27, item 5/6): a stale or
+  // incompatible checked-in contract is a hard configuration error, not a
+  // warning routed around -- collected across every function so a single
+  // run reports every offending entry at once, then aborts (no JSON
+  // written at all: unlike a coverage-threshold shortfall, a contract that
+  // fails this check could otherwise bake a wrong-typed or out-of-range
+  // operand straight into the emitted spec, so nothing from this run
+  // should be treated as trustworthy output).
+  std::vector<std::string> contractErrors;
+
   // Build one inference record for a (public name, defining function) pair.
   auto buildRecord = [&](StringRef name,
                          const Function &f) -> std::unique_ptr<FunctionTrees> {
     DISubprogram *sp = f.getSubprogram();
     if (!sp) return nullptr; // no debug info — needs -g
-    auto ft = buildFunctionTrees(sp);
+    auto ft = buildFunctionTrees(sp, haveConfig ? config.maxTypeDepth : 6);
     if (!ft) return nullptr;
     ft->funcName = name.str();
-    inferFunction(f, *ft, calleeIndex);
+    if (haveConfig) {
+      auto it = config.contracts.find(ft->funcName);
+      if (it != config.contracts.end()) {
+        std::string verr;
+        if (!validateContractAgainstSignature(*ft, it->second, verr))
+          contractErrors.push_back(verr);
+      }
+    }
+    inferFunction(f, *ft, calleeIndex, haveConfig ? &config : nullptr);
     return ft;
   };
 
@@ -448,10 +494,68 @@ int main(int argc, char **argv) {
     }
   }
 
+  // A contract entry that was NEVER consulted (its symbol was never emitted
+  // at all, or the specific argument never reached the contract-check
+  // branch in Infer.cpp -- e.g. a stale contract left over after a
+  // refactor, or one written for the wrong argument index) is the same
+  // class of "quietly wrong" configuration state as an out-of-range
+  // operand: a hard error (added to contractErrors below), not a warning
+  // routed around.
+  if (haveConfig && !config.contracts.empty()) {
+    std::map<std::string, const FunctionTrees *> byName;
+    for (const auto &r : records) byName[r->funcName] = r.get();
+    for (const auto &fc : config.contracts) {
+      auto it = byName.find(fc.first);
+      if (it == byName.end()) {
+        contractErrors.push_back("config contract for '" + fc.first +
+            "' never applied -- no such symbol was emitted");
+        continue;
+      }
+      const FunctionTrees *ft = it->second;
+      for (const auto &argc : fc.second) {
+        int argIdx = argc.first;
+        bool applied = ft->forceLocal ? false
+            : (size_t)argIdx < ft->params.size() &&
+              ft->params[argIdx]->confidence == Confidence::Configured;
+        if (!applied)
+          contractErrors.push_back("config contract for '" + fc.first +
+              "' arg" + std::to_string(argIdx) +
+              " never applied (the function force_localed for an "
+              "unrelated reason)");
+      }
+    }
+  }
+
+  // Abort the whole run -- no JSON written -- on any contract problem
+  // found either above (stale/never-applied) or during buildRecord
+  // (out-of-range or wrong-typed operand): see contractErrors' own comment
+  // for why this fails closed rather than emitting output that could bake
+  // in a spec nothing has actually verified.
+  if (!contractErrors.empty()) {
+    for (const std::string &e : contractErrors)
+      errs() << "marshal-infer: ERROR: " << e << "\n";
+    return 1;
+  }
+
+  size_t marshalCount = 0;
+  for (const auto &r : records)
+    if (!r->forceLocal) ++marshalCount;
+
   if (AsJson) {
     std::string label =
         ModuleName.empty() ? std::string(InputFiles.front()) : ModuleName;
     os << "{\n  \"module\":"; jsonStr(os, label);
+    // Config identity (issue #27): which checked-in profile, if any,
+    // produced this output -- so a reader (or a diff between two runs) can
+    // always tell what configuration was in effect, not just what the
+    // results were. Omitted entirely when no --config was given, matching
+    // this tool's built-in-default behavior exactly (backward compatible).
+    if (haveConfig) {
+      os << ",\n  \"config\":{\"version\":" << config.configVersion;
+      os << ",\"profile_name\":"; jsonStr(os, config.profileName);
+      os << ",\"source_path\":"; jsonStr(os, config.sourcePath);
+      os << "}";
+    }
     os << ",\n  \"function_count\":" << records.size();
     os << ",\n  \"functions\":[\n";
     for (size_t i = 0; i < records.size(); ++i) {
@@ -470,6 +574,27 @@ int main(int argc, char **argv) {
   if (haveExports)
     errs() << "; " << records.size() << "/" << exports.size()
            << " exported symbols covered";
-  errs() << "\n";
+  errs() << "; " << marshalCount << "/" << records.size() << " marshal\n";
+
+  // Coverage-threshold enforcement (issue #27): fail the WHOLE run --
+  // nonzero exit, output already written above so it's still inspectable --
+  // when this library's marshal rate drops below what its checked-in
+  // profile expects. This is deliberately checked LAST, after every other
+  // output has been produced: a threshold failure should stop a build
+  // pipeline, not hide what was actually inferred.
+  if (haveConfig && config.coverage.enabled) {
+    size_t denom = haveExports ? exports.size() : records.size();
+    double pct = denom ? (100.0 * (double)marshalCount / (double)denom) : 0.0;
+    bool countOk = marshalCount >= (size_t)config.coverage.minMarshalCount;
+    bool pctOk = pct >= config.coverage.minMarshalPct;
+    if (!countOk || !pctOk) {
+      errs() << "marshal-infer: COVERAGE THRESHOLD FAILED (" << config.sourcePath
+             << "): got " << marshalCount << " marshal ("
+             << format("%.1f", pct)
+             << "%), required >= " << config.coverage.minMarshalCount
+             << " and >= " << format("%.1f", config.coverage.minMarshalPct) << "%\n";
+      return 1;
+    }
+  }
   return 0;
 }

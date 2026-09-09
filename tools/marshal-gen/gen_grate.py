@@ -182,12 +182,18 @@ def _valid_extent_operand(o, nargs):
     return o.get("source") in EXTENT_SOURCE
 
 
-def is_marshalable(f):
-    """True iff the runtime can faithfully marshal every part of this spec."""
+def unmarshalable_reason(f, warn=False):
+    """None iff the runtime can faithfully marshal every part of this spec;
+    otherwise a short, specific, actionable reason why not -- naming the
+    exact argument/pointee and the exact malformed field, never just "no"."""
     name = f.get("name", "")
-    if name in NEVER_INTERPOSE or name in FD_FUNCS \
-            or any(s in name for s in NEVER_INTERPOSE_SUBSTR):
-        return False
+    if name in NEVER_INTERPOSE:
+        return "function is in NEVER_INTERPOSE (control-flow terminator / exec-family / static-link-blocked / binaryen bug)"
+    if name in FD_FUNCS:
+        return "function operates on a per-cage file descriptor (see FD_FUNCS)"
+    for s in NEVER_INTERPOSE_SUBSTR:
+        if s in name:
+            return f"function name contains NEVER_INTERPOSE_SUBSTR {s!r}"
     # `args` is already one JSON entry per raw wasm-level ABI slot (sret and
     # multi-slot params are pre-flattened by marshal-infer), so its length IS
     # the raw slot count -- see LIND_RAW_ARGS_MAX. Inference should already
@@ -200,15 +206,16 @@ def is_marshalable(f):
     # with it -- on the function's first real call.
     nargs = len(f.get("args", []))
     if nargs > LIND_RAW_ARGS_MAX:
-        print(f"[gen_grate] REJECTING {name}: needs {nargs} raw ABI slots, "
-              f"exceeding the interposition transport's {LIND_RAW_ARGS_MAX}-slot "
-              f"capacity (marked \"marshal\" despite this -- stale or hand-edited JSON?)",
-              file=sys.stderr)
-        return False
+        reason = (f"needs {nargs} raw ABI slots, exceeding the interposition "
+                  f"transport's {LIND_RAW_ARGS_MAX}-slot capacity (marked "
+                  f"\"marshal\" despite this -- stale or hand-edited JSON?)")
+        if warn:
+            print(f"[gen_grate] REJECTING {name}: {reason}", file=sys.stderr)
+        return reason
     ret = f.get("ret") or {}
     r = ret.get("kind")
     if r is not None and r not in SUPPORTED_RET:
-        return False  # ptr_alloc, ptr_to_static, ptr_into_cursor, ...
+        return f"unsupported return kind {r!r} (ptr_alloc/ptr_to_static/ptr_into_cursor hand the app a grate-cage pointer it can't dereference)"
     # NOTE: no `type == "complex"` exclusion anymore. marshal-infer now detects
     # byval/sret-lowered arguments and returns (C99 _Complex, ordinary large
     # by-value structs, and long double's sret-shaped return) via LLVM IR
@@ -224,25 +231,43 @@ def is_marshalable(f):
     # the function stays force_local upstream and never reaches this check as
     # "marshal" at all.)
 
-    def walk(n):
+    def walk(n, path):
         if n.get("cursor"):                       # strsep-style cursor: not implemented
-            return False
-        if n.get("kind") == "ptr" and n.get("size_kind") not in SUPPORTED_SIZE:
-            return False                          # unknown sizing -> can't copy safely
-        if n.get("kind") == "ptr" and n.get("size_kind") == "stride_vector":
-            const_size = n.get("const_size")
-            if (not isinstance(const_size, int) or isinstance(const_size, bool)
-                    or const_size <= 0):
-                return False                      # invalid element size
-            if not (_valid_extent_operand(n.get("size_operand"), nargs)
-                    and _valid_extent_operand(n.get("stride_operand"), nargs)):
-                return False                      # malformed/missing extent operand
-        for ch in (n.get("pointee") or []) + (n.get("fields") or []):
-            if not walk(ch):
-                return False
-        return True
+            return f"{path}: cursor-style pointee not implemented"
+        if n.get("kind") == "ptr":
+            sk = n.get("size_kind")
+            if sk not in SUPPORTED_SIZE:
+                return f"{path}: unsupported size_kind {sk!r} -- can't size the copy safely"
+            if sk == "stride_vector":
+                const_size = n.get("const_size")
+                if (not isinstance(const_size, int) or isinstance(const_size, bool)
+                        or const_size <= 0):
+                    return f"{path}: stride_vector has invalid const_size {const_size!r}"
+                for label, key in (("size_operand", "size_operand"),
+                                   ("stride_operand", "stride_operand")):
+                    o = n.get(key)
+                    if not _valid_extent_operand(o, nargs):
+                        return f"{path}: stride_vector {label} malformed/out-of-range: {o!r}"
+        for i, ch in enumerate(n.get("pointee") or []):
+            r = walk(ch, f"{path}.pointee[{i}]")
+            if r:
+                return r
+        for i, ch in enumerate(n.get("fields") or []):
+            r = walk(ch, f"{path}.fields[{i}]")
+            if r:
+                return r
+        return None
 
-    return all(walk(a) for a in f.get("args", []))
+    for i, a in enumerate(f.get("args", [])):
+        r = walk(a, f"arg{i}")
+        if r:
+            return r
+    return None
+
+
+def is_marshalable(f):
+    """True iff the runtime can faithfully marshal every part of this spec."""
+    return unmarshalable_reason(f, warn=True) is None
 
 # C identifiers that are valid function names but need extern decls with the
 # right signature would be ideal; we use a generic extern returning long and
@@ -590,7 +615,12 @@ def main():
     d = json.load(open(args.json))
     marshal_fns = [f for f in d["functions"] if f.get("decision") == "marshal"]
     # Drop functions whose spec uses unsupported features -> force_local (safe fallback).
-    dropped = [f["name"] for f in marshal_fns if not is_marshalable(f)]
+    # A "marshal" decision is necessary but not sufficient for a generated
+    # handler to exist: unmarshalable_reason() is the actual generator-side
+    # gate, and its reason string is what makes a dropped function's cause
+    # (malformed contract operand, unsupported return shape, ...) actionable
+    # instead of a bare name in a list.
+    dropped = [(f["name"], unmarshalable_reason(f)) for f in marshal_fns if not is_marshalable(f)]
     fns = [f for f in marshal_fns if is_marshalable(f)]
     if args.only:
         want = {n.strip() for n in args.only.split(",") if n.strip()}
@@ -630,9 +660,8 @@ def main():
     n_force = sum(1 for f in d["functions"] if f.get("decision") == "force_local")
     print(f"[gen_grate] {len(fns)} marshalable handlers, "
           f"{n_force} inference-force_local + {len(dropped)} dropped-unsupported (un-interposed)")
-    if dropped:
-        print(f"[gen_grate] dropped to force_local (unsupported features): "
-              f"{len(dropped)} fns, e.g. {sorted(dropped)[:8]}")
+    for dname, reason in sorted(dropped):
+        print(f"[gen_grate] dropped to force_local: {dname}: {reason}", file=sys.stderr)
     print(f"[gen_grate] wrote {args.out}")
 
 

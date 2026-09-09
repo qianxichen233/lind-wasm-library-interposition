@@ -80,6 +80,26 @@ struct ExtentOperand {
   bool valid() const { return argIndex >= 0; }
 };
 
+// How a StrideVector decision was reached (issue #27's confidence model).
+//   Proven     — the length AND the address induction variable's zero start
+//                were both proven exactly by ScalarEvolution (see Infer.cpp's
+//                loopBoundValues); runtime memory safety follows from that
+//                proof.
+//   Configured — a checked-in config file's "contracts" entry (Config.h)
+//                asserted this argument's extent: a human verified it,
+//                presumably because static analysis couldn't.
+//   Heuristic  — a checked-in config file's "analysis.policy":"relaxed"
+//                opted into a NAMED heuristic (Config::heuristics) that
+//                pairs an UNPROVEN (dominatingArgumentGuard-derived) length
+//                with a stride anyway. This carries the SAME runtime
+//                memory-safety exposure a Proven decision would if the
+//                heuristic's guess is wrong -- the runtime has no reduced-
+//                trust code path for a lower-confidence spec -- made
+//                visible and attributable rather than silently accepted or
+//                silently rejected.
+enum class Confidence { Proven, Configured, Heuristic };
+const char *confidenceName(Confidence c);
+
 // What the return value is / how it must be translated.
 enum class RetKind {
   Void,
@@ -136,6 +156,11 @@ struct TreeNode {
   ExtentOperand sizeOperand;
   ExtentOperand strideOperand;
   uint64_t constSize = 0;  // Const: byte count. StrideVector: per-element byte size.
+
+  // How this StrideVector decision was reached (issue #27's confidence
+  // model -- meaningful only for sizeKind==StrideVector; every other kind
+  // stays at the default and is not emitted). See Confidence's own comment.
+  Confidence confidence = Confidence::Proven;
 
   // For Pointer nodes: this pointer is an opaque handle (translate via token
   // table, never deep-copy the pointee). E.g. FILE*, z_stream's state, toy_ctx.

@@ -1,0 +1,9 @@
+{
+  "config_version": 1,
+  "profile_name": "openblas",
+
+  "coverage": {
+    "enabled": true,
+    "min_marshal_count": 46
+  }
+}
