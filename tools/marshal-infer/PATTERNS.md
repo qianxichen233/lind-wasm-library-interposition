@@ -35,7 +35,7 @@ whichever one does *not* coincide with the independently-resolved stride
 (an argument can never legitimately be its own stride). `cblas_sscal`/
 `sscal_`/`cblas_dscal`/`dscal_` marshal correctly today.
 
-## Peeled first iteration — `kernel/riscv64/iamax.c` (`isamax_k`) — OpenBLAS
+## Peeled first iteration — `kernel/riscv64/{i,}{max,min,amax,amin}.c` — OpenBLAS
 *Category: StrideVector length/stride inference*
 
 ```c
@@ -57,15 +57,26 @@ BLASLONG CNAME(BLASLONG n, FLOAT *x, BLASLONG inc_x) {
 }
 ```
 
-**Issue:** the first element is handled before the loop starts, so by the
-time the loop's own address accumulator (`ix`) begins, it already starts
-at `inc_x`, not `0`.
+**Issue:** the first element is handled before the loop starts (seeding
+the running max/min from real data instead of a fake `0.0` sentinel), so
+by the time the loop's own address accumulator (`ix`) begins, it already
+starts at `inc_x`, not `0`.
 
 **Status: unhandled by design.** The address induction variable's
 zero-start proof is unconditional — never relaxed by any heuristic or
 config, because a nonzero start means the real touched region doesn't
-begin where the spec would claim it does. Only a hand-verified `contracts`
-entry can cover this shape.
+begin where the spec would claim it does. The LENGTH side still resolves
+fine (`n` — the loop's own trip count is otherwise clean), which is why
+this shows up as "array-shaped ... but no distinct stride operand", not a
+length failure. Only a hand-verified `contracts` entry can cover this
+shape; the real touched region genuinely does start at offset 0 (`x[0]`
+is read, just outside the loop), so such a contract would be sound.
+
+Not just `isamax_k`: this exact idiom is shared verbatim by all 8 kernel
+files in the family — `amax.c`, `amin.c`, `iamax.c`, `iamin.c`, `imax.c`,
+`imin.c`, `max.c`, `min.c` — across both precisions and both CBLAS/Fortran
+naming forms, 28 exported symbols total, all force_local for the identical
+reason.
 
 ## Fused index/counter with a rescaled bound — `kernel/riscv64/asum.c` (`sasum_k`) — OpenBLAS
 *Category: StrideVector length/stride inference*
@@ -107,10 +118,78 @@ today. `kernel/arm/sum.c` (`ssum_`/`dsum_`) has the
 identical rescaling but ALSO an extra SIMD-fast-path branch merging the
 address induction variable's start value from two different control-flow
 paths -- still unhandled, a strictly harder problem than this one.
-`kernel/riscv64/nrm2.c` also has the identical rescaling but guards only
-`inc_x != 0` (not `inc_x > 0`, since it supports walking backward with a
-negative stride) and compares `abs(i) < abs(n)` rather than a bare `i < n`
--- also still unhandled, correctly declined rather than guessed at.
+`kernel/riscv64/nrm2.c` has the identical rescaling too, but is its own,
+harder case -- see the next entry.
+
+## Signed stride with a caller-side rebase — `kernel/riscv64/nrm2.c` (`nrm2_k`) — OpenBLAS
+*Category: StrideVector length/stride inference; runtime capability gap*
+
+```c
+// interface/nrm2.c -- the exported wrapper (what marshal-infer actually
+// analyzes; NRM2_K below is a separate, non-exported symbol)
+FLOATRET NAME(blasint *N, FLOAT *x, blasint *INCX) {
+  BLASLONG n = *N, incx = *INCX;
+  if (n <= 0) return 0.;
+  if (n == 1) return fabs(x[0]);
+  if (incx == 0) return sqrt((double)n) * fabs(x[0]);
+  if (incx < 0) x -= (n - 1) * incx;   // rebase so the kernel always walks forward
+  return NRM2_K(n, x, incx);
+}
+
+// kernel/riscv64/nrm2.c
+FLOAT CNAME(BLASLONG n, FLOAT *x, BLASLONG inc_x) {
+  BLASLONG i = 0;
+  if (n <= 0 || inc_x == 0) return(0.0);
+  if (n == 1) return(ABS(x[0]));
+  n *= inc_x;
+  while (abs(i) < abs(n)) { ...; i += inc_x; }
+}
+```
+
+**Issue, layered:**
+
+1. The kernel's own loop condition is `abs(i) < abs(n)`, not a bare
+   `i < n` -- `detectFactoredStrideTripCount` matches a direct `icmp`
+   against the induction variable and the `stride*length` bound, so
+   wrapping both sides in `abs()` defeats the match outright, independent
+   of anything below.
+2. Unlike `sasum_k`'s guard (`inc_x <= 0`, stride forced positive before
+   the loop ever runs), this kernel only guards `inc_x != 0` -- BLAS
+   explicitly supports a negative increment (walking the vector backward),
+   and this kernel takes advantage of it directly rather than normalizing
+   it away first. A caller-supplied `inc_x` can genuinely be negative at
+   the point the kernel's own loop runs.
+3. That matters beyond just "harder to prove": `LIND_SIZE_STRIDE_VECTOR`'s
+   runtime handler (`lind_marshal.h`) hard-`_lind_marshal_abort`s the
+   *entire grate process* on a negative stride operand -- shadow-copying a
+   negative-stride span would mean touching memory *before* the passed
+   pointer, which no `lind_arg_spec` kind currently does, so the runtime
+   fails closed instead. Proving `(length=n, stride=inc_x)` for the kernel
+   exactly as written and marshalling it would mean a real, legitimate
+   negative-`inc_x` call kills the whole grate the first time it runs --
+   worse than today's `force_local`, which just takes the slow path
+   correctly.
+
+**A real fix exists, but it isn't inference-only.** The *exported* wrapper
+above already normalizes this for its own caller: when `incx<0` it rebases
+`x` by `(n-1)*incx` before delegating, specifically so the kernel always
+walks forward from the rebased pointer. Worked through algebraically, the
+set of elements the kernel actually touches, expressed relative to the
+wrapper's own *original* `x` argument (not the rebased one), is always
+`x[0], x[|incx|], x[2|incx|], ..., x[(n-1)|incx|]` regardless of `incx`'s
+sign -- the true stride as seen from the caller is `abs(incx)`, always
+non-negative. Marshalling the wrapper (not the kernel) with a stride of
+`abs(incx)` would be both provable and safe -- but `lind_extent_operand`
+only knows how to read an argument's raw value or one pointer dereference
+(`ExtentSource::Value`/`PointeeI32`); there's no "absolute value of an
+argument" source. Closing this needs a schema addition on *both* sides
+(marshal-infer's `ExtentOperand`/`Confidence` machinery, and the runtime's
+`lind_extent_operand`/`_lind_eval_extent_operand`), not a marshal-infer-only
+change -- coordinate with whoever owns the runtime marshalling code before
+attempting it.
+
+**Status: unhandled, correctly declined rather than guessed at.**
+`cblas_snrm2`/`snrm2_`/`cblas_dnrm2`/`dnrm2_` stay `force_local`.
 
 ## Signed counter unrolled at `-O2` — `kernel/riscv64/copy.c` (`dcopy_k`) — OpenBLAS
 *Category: StrideVector length/stride inference*
