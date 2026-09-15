@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Regression tests for the versioned config system (issue #27): schema
 # validation and failure modes, backward compatibility with no --config,
-# analysis-knob threading (max_type_depth, max_delegation_hops), contract
-# application + provenance recording, the "contract never applied" warning,
-# and coverage-threshold enforcement. Fixtures are compiled via the real
-# toolchain entry points (`lind_compile --emit-llvm` / `--emit-marshal` --
-# see CLAUDE.md); C fixtures shared with the stride_vector_extent suite are
-# referenced there rather than duplicated.
+# analysis-knob threading (max_type_depth, max_delegation_hops), the
+# StrideVector loop-shape proofs (exact trip-count, compound-guard
+# disambiguation, the factored-bound proof, the inclusive-bound and
+# unresolved-indexed-extent safety properties), checked-in per-argument
+# contract application/validation/provenance, and coverage-threshold
+# enforcement. Fixtures are compiled via the real toolchain entry points
+# (`lind_compile --emit-llvm` / `--emit-marshal` -- see CLAUDE.md); C
+# fixtures shared with the stride_vector_extent suite are referenced there
+# rather than duplicated.
 #
 # Usage: tools/marshal-infer/tests/config/run.sh
 set -uo pipefail
@@ -134,40 +137,12 @@ EOF
 rc="$(try_config "$WORK/bad_contract_argkey.json")"
 check "non-integer contract argument key: exit code" "$rc" "1"
 
-echo '{"config_version": 1, "analysis": {"heuristics": ["guard_based_length"]}}' > "$WORK/bad_heuristics_no_policy.json"
-rc="$(try_config "$WORK/bad_heuristics_no_policy.json")"
-check "heuristics set without policy=relaxed: exit code" "$rc" "1"
-
-echo '{"config_version": 1, "analysis": {"policy": "relaxed"}}' > "$WORK/bad_relaxed_no_heuristics.json"
-rc="$(try_config "$WORK/bad_relaxed_no_heuristics.json")"
-check "policy=relaxed with no heuristics: exit code" "$rc" "1"
-
-echo '{"config_version": 1, "analysis": {"policy": "relaxed", "heuristics": ["not_a_real_heuristic"]}}' > "$WORK/bad_unknown_heuristic.json"
-rc="$(try_config "$WORK/bad_unknown_heuristic.json")"
-check "unknown heuristic name: exit code" "$rc" "1"
-
-echo '{"config_version": 1, "analysis": {"policy": "lenient"}}' > "$WORK/bad_policy_value.json"
-rc="$(try_config "$WORK/bad_policy_value.json")"
-check "invalid policy value: exit code" "$rc" "1"
-
 echo "--- present-but-wrong-typed fields must be REJECTED, not silently defaulted ---"
 echo '{"config_version": 1, "analysis": {"max_type_depth": "six"}}' > "$WORK/wrong_type_depth.json"
 rc="$(try_config "$WORK/wrong_type_depth.json")"
 check "max_type_depth as string: exit code" "$rc" "1"
 check "max_type_depth as string: message" \
     "$(grep -c "max_type_depth: must be an integer" "$WORK/probe.err")" "1"
-
-echo '{"config_version": 1, "analysis": {"policy": 1}}' > "$WORK/wrong_type_policy.json"
-rc="$(try_config "$WORK/wrong_type_policy.json")"
-check "policy as integer: exit code" "$rc" "1"
-check "policy as integer: message" \
-    "$(grep -c "policy: must be a string" "$WORK/probe.err")" "1"
-
-echo '{"config_version": 1, "analysis": {"policy": "relaxed", "heuristics": "guard_based_length"}}' > "$WORK/wrong_type_heuristics.json"
-rc="$(try_config "$WORK/wrong_type_heuristics.json")"
-check "heuristics as bare string (not array): exit code" "$rc" "1"
-check "heuristics as bare string (not array): message" \
-    "$(grep -c "heuristics: must be an array" "$WORK/probe.err")" "1"
 
 echo '{"config_version": 1, "coverage": {"enabled": "yes", "min_marshal_count": 1}}' > "$WORK/wrong_type_enabled.json"
 rc="$(try_config "$WORK/wrong_type_enabled.json")"
@@ -245,91 +220,66 @@ check "max_delegation_hops=0: wrapper_axpy decision (delegation disabled)" \
     "force_local"
 
 echo ""
-echo "=== heuristic-gated marshalling (relaxed policy) ==="
+echo "=== unrollable loop with no separate counter: no heuristic left to recover it ==="
+# walk_heuristic.c's real -O2 build unrolls this loop, defeating the exact
+# trip-count/stride proofs -- there is no longer a relaxed-policy fallback
+# to recover it (see PATTERNS.md's "signed counter unrolled at -O2" entry:
+# the supported answer is analyzing the library at a lower optimization
+# level, not guessing at the unrolled shape). Correctly, unconditionally
+# force_local, no --config involved at all.
 cp "$SCRIPT_DIR/walk_heuristic.c" "$WORK/walk_heuristic.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm walk_heuristic.c -- -O2 ) >/dev/null 2>&1
-
-json_strict="$WORK/wh_strict.marshal.json"
-"$MARSHAL_INFER" --json -o "$json_strict" "$WORK/walk_heuristic.bc" 2>/dev/null
-check "strict (no config): decision" \
-    "$(pyjq "$json_strict" "f['functions'][0]['decision']")" "force_local"
-
-cat > "$WORK/only_length.json" <<'EOF'
-{"config_version": 1, "analysis": {"policy": "relaxed", "heuristics": ["guard_based_length"]}}
-EOF
-json_len="$WORK/wh_len.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/only_length.json" -o "$json_len" "$WORK/walk_heuristic.bc" 2>/dev/null
-check "guard_based_length alone: decision (unroll_scaled_stride also needed)" \
-    "$(pyjq "$json_len" "f['functions'][0]['decision']")" "force_local"
-
-cat > "$WORK/only_stride.json" <<'EOF'
-{"config_version": 1, "analysis": {"policy": "relaxed", "heuristics": ["unroll_scaled_stride"]}}
-EOF
-json_str="$WORK/wh_str.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/only_stride.json" -o "$json_str" "$WORK/walk_heuristic.bc" 2>/dev/null
-check "unroll_scaled_stride alone: decision (guard_based_length also needed)" \
-    "$(pyjq "$json_str" "f['functions'][0]['decision']")" "force_local"
-
-cat > "$WORK/both.json" <<'EOF'
-{"config_version": 1, "analysis": {"policy": "relaxed", "heuristics": ["guard_based_length", "unroll_scaled_stride"]}}
-EOF
-json_both="$WORK/wh_both.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/both.json" -o "$json_both" "$WORK/walk_heuristic.bc" 2>/dev/null
-check "both heuristics together: decision" \
-    "$(pyjq "$json_both" "f['functions'][0]['decision']")" "marshal"
-arg2="$(pyjq "$json_both" "__import__('json').dumps(f['functions'][0]['args'][2])")"
-echo "$arg2" | python3 -c "
-import json, sys
-a = json.load(sys.stdin)
-assert a['size_kind'] == 'stride_vector', a
-assert a['confidence'] == 'heuristic', a['confidence']
-assert a['size_operand'] == {'arg_index': 0, 'source': 'value'}, a['size_operand']
-assert a['stride_operand'] == {'arg_index': 1, 'source': 'value'}, a['stride_operand']
-print('ok')
-" && { echo "  ok    both heuristics together: correct operands, confidence=heuristic"; PASS=$((PASS+1)); } \
-  || { echo "  FAIL  both heuristics together: operand/confidence shape"; echo "$arg2"; FAIL=$((FAIL+1)); }
+json_wh="$WORK/wh.marshal.json"
+"$MARSHAL_INFER" --json -o "$json_wh" "$WORK/walk_heuristic.bc" 2>/dev/null
+check "unrolled, no separate counter: decision" \
+    "$(pyjq "$json_wh" "f['functions'][0]['decision']")" "force_local"
 
 echo ""
 echo "=== compound dominating guard disambiguation (n vs. stride) ==="
+# dominatingArgumentGuard's multi-candidate collection + disambiguation
+# against the independently-resolved stride (see its own comment in
+# Infer.cpp) is still exercised here, even though an unproven guard-derived
+# length is never promoted to a full pairing anymore: the force_local
+# warning must still name arg0 (n), never arg1 (stride), proving the
+# disambiguation itself is still correct.
 cp "$SCRIPT_DIR/compound_guard.c" "$WORK/compound_guard.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm compound_guard.c -- -O2 ) >/dev/null 2>&1
 json_cg="$WORK/cg.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/both.json" -o "$json_cg" "$WORK/compound_guard.bc" 2>/dev/null
+"$MARSHAL_INFER" --json -o "$json_cg" "$WORK/compound_guard.bc" 2>/dev/null
 check "compound guard: decision" \
-    "$(pyjq "$json_cg" "f['functions'][0]['decision']")" "marshal"
-arg2cg="$(pyjq "$json_cg" "__import__('json').dumps(f['functions'][0]['args'][2])")"
-echo "$arg2cg" | python3 -c "
-import json, sys
-a = json.load(sys.stdin)
-assert a['size_operand'] == {'arg_index': 0, 'source': 'value'}, a['size_operand']
-assert a['stride_operand'] == {'arg_index': 1, 'source': 'value'}, a['stride_operand']
-print('ok')
-" && { echo "  ok    compound guard: length correctly attributed to n, not stride"; PASS=$((PASS+1)); } \
-  || { echo "  FAIL  compound guard: wrong operand attribution"; echo "$arg2cg"; FAIL=$((FAIL+1)); }
+    "$(pyjq "$json_cg" "f['functions'][0]['decision']")" "force_local"
+check "compound guard: warning attributes length to n (arg0), not stride" \
+    "$(pyjq "$json_cg" "any('governed by arg0' in w for w in f['functions'][0]['warnings'])")" \
+    "True"
+check "compound guard: warning does NOT attribute length to stride (arg1)" \
+    "$(pyjq "$json_cg" "any('governed by arg1' in w for w in f['functions'][0]['warnings'])")" \
+    "False"
 
 echo ""
-echo "=== SAFETY: inclusive bound (i<=n) must NEVER be accepted, any heuristic combination ==="
+echo "=== SAFETY: inclusive bound (i<=n) must NEVER be accepted ==="
 cp "$SCRIPT_DIR/inclusive_reject.c" "$WORK/inclusive_reject.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm inclusive_reject.c -- -O2 ) >/dev/null 2>&1
 json_incl="$WORK/incl.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/both.json" -o "$json_incl" "$WORK/inclusive_reject.bc" 2>/dev/null
-check "inclusive bound: decision (both heuristics enabled)" \
+"$MARSHAL_INFER" --json -o "$json_incl" "$WORK/inclusive_reject.bc" 2>/dev/null
+check "inclusive bound: decision" \
     "$(pyjq "$json_incl" "f['functions'][0]['decision']")" "force_local"
 check "inclusive bound: no stride_vector emitted anywhere" \
     "$(pyjq "$json_incl" "any(a.get('size_kind')=='stride_vector' for a in f['functions'][0].get('args', []))")" \
     "False"
 
 echo ""
-echo "=== SAFETY MATRIX: direct (non-unrolled) latch predicate orientation ==="
+echo "=== SAFETY MATRIX: exact trip-count proof's inclusive/exclusive handling ==="
 # See matrix.c's own comment for the full axis table. Every function here
-# compiles WITHOUT unrolling (-fno-unroll-loops), so boundConfirmsExclusive-
-# Length's DIRECT-match branch (not the masked-unroll branch) is exactly
-# what's exercised -- this is the class of bug reported against a real
-# `for (int i = 0; i <= n; ++i)` loop, which involves no masking at all.
+# compiles WITHOUT unrolling (-fno-unroll-loops): each _lt_ (exclusive)
+# function's separate, unit-step counter (never used for indexing) makes
+# its exact trip count reduce directly to a bare argument; each _le_
+# (inclusive) function's real trip count is n+1, which never reduces that
+# way, so it force_locals. No --config anywhere in this section -- this is
+# the unconditional exact proof, not a heuristic.
 cp "$SCRIPT_DIR/matrix.c" "$WORK/matrix.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm matrix.c -- -O1 -fno-unroll-loops ) >/dev/null 2>&1
 json_matrix="$WORK/matrix.marshal.json"
-"$MARSHAL_INFER" --json --config "$WORK/both.json" -o "$json_matrix" "$WORK/matrix.bc" 2>/dev/null
+"$MARSHAL_INFER" --json -o "$json_matrix" "$WORK/matrix.bc" 2>/dev/null
 
 matrix_check() {
     local fn="$1" want="$2"
@@ -353,8 +303,8 @@ echo "=== factored stride trip count: unconditional exact proof, no --config ===
 # See factored_bound_pos.c/factored_bound_neg.c's own comments and
 # PATTERNS.md's "fused index/counter with a rescaled bound" entry. No
 # --config anywhere in this section: detectFactoredStrideTripCount is
-# unconditionally available (Confidence::Proven), unlike guard_based_length/
-# unroll_scaled_stride which require an explicit relaxed-policy opt-in.
+# unconditionally available, part of the same always-on exact-proof
+# pipeline as ScalarEvolution's own trip-count analysis.
 cp "$SCRIPT_DIR/factored_bound_pos.c" "$WORK/factored_bound_pos.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm factored_bound_pos.c -- -O1 -fno-unroll-loops ) >/dev/null 2>&1
 json_fbpos="$WORK/fbpos.marshal.json"
@@ -364,11 +314,9 @@ json_fbpos="$WORK/fbpos.marshal.json"
 # "pointee_i32" (same for both operands in every fixture here).
 fbpos_check() {
     local fn="$1" wantSizeIdx="$2" wantStrideIdx="$3" wantSource="$4"
-    local decision confidence sizeOp strideOp
+    local decision sizeOp strideOp
     decision="$(pyjq "$json_fbpos" "([x for x in f['functions'] if x['name']=='$fn'] or [{'decision':'MISSING'}])[0]['decision']")"
     check "factored (+): $fn decision" "$decision" "marshal"
-    confidence="$(pyjq "$json_fbpos" "next((a.get('confidence') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None)")"
-    check "factored (+): $fn confidence" "$confidence" "proven"
     sizeOp="$(pyjq "$json_fbpos" "__import__('json').dumps(next((a.get('size_operand') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None))")"
     check "factored (+): $fn size_operand" "$sizeOp" "{\"arg_index\": $wantSizeIdx, \"source\": \"$wantSource\"}"
     strideOp="$(pyjq "$json_fbpos" "__import__('json').dumps(next((a.get('stride_operand') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None))")"
@@ -386,9 +334,9 @@ json_fbneg="$WORK/fbneg.marshal.json"
 
 fbneg_check() {
     local fn="$1"
-    local confidence
-    confidence="$(pyjq "$json_fbneg" "next((a.get('confidence') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None)")"
-    check "factored (-): $fn never resolves this pairing" "$confidence" "None"
+    local decision
+    decision="$(pyjq "$json_fbneg" "([x for x in f['functions'] if x['name']=='$fn'] or [{'decision':'MISSING'}])[0]['decision']")"
+    check "factored (-): $fn force_locals (unresolved indexed extent)" "$decision" "force_local"
 }
 fbneg_check neg_inclusive_bound
 fbneg_check neg_nonzero_origin
@@ -399,15 +347,6 @@ fbneg_check neg_partial_guard
 fbneg_check neg_unsigned_no_nuw
 fbneg_check neg_unrelated_counter
 fbneg_check neg_different_step_counter
-
-# neg_missing_guard's pairing never resolving (checked above) isn't the whole
-# story: before the fail-closed fix below, this exact function fell through
-# to the single-element fallback and was observably "marshal" -- the overall
-# decision must be checked directly, not just the absence of a resolved
-# stride_vector pairing.
-check "factored (-): neg_missing_guard overall decision" \
-    "$(pyjq "$json_fbneg" "([x for x in f['functions'] if x['name']=='neg_missing_guard'] or [{'decision':'MISSING'}])[0]['decision']")" \
-    "force_local"
 
 echo ""
 echo "=== fail-closed on unresolved indexed access: no --config ==="
@@ -563,9 +502,8 @@ check "coverage threshold NOT met: error message" \
 
 echo ""
 echo "=== the checked-in OpenBLAS profile itself validates ==="
-# try_config's probe function (scalar_out.c's halve_and_report) has neither
-# cblas_daxpy nor daxpy_, so it correctly trips the profile's OWN
-# stale-contract warnings and coverage threshold (both tested in isolation
+# try_config's probe function (scalar_out.c's halve_and_report) doesn't
+# come close to the profile's own coverage floor (tested in isolation
 # above) -- this section checks SCHEMA validation succeeded specifically,
 # not that the whole run's coverage passed against an unrelated probe.
 try_config "$REPO_ROOT/tools/marshal-infer/profiles/openblas.json" >/dev/null

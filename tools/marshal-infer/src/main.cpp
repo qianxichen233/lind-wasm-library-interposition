@@ -200,11 +200,10 @@ static void jsonNode(raw_ostream &os, const TreeNode *n, unsigned ind,
       operand("size_operand", n->sizeOperand);
       operand("stride_operand", n->strideOperand);
       os << ",\"const_size\":" << n->constSize;
-      // Confidence (issue #27): proven by static analysis, configured by a
-      // checked-in contract, or heuristic (an explicitly config-enabled,
-      // unproven guess) -- always emitted for a StrideVector node, never
-      // omitted, so a reader never has to guess whether "absent" means
-      // "proven" or just "not recorded".
+      // Confidence: proven by static analysis, or configured by a
+      // checked-in contract -- always emitted for a StrideVector node,
+      // never omitted, so a reader never has to guess whether "absent"
+      // means "proven" or just "not recorded".
       os << ",\"confidence\":"; jsonStr(os, confidenceName(n->confidence));
     }
     if (n->shallow) os << ",\"shallow\":true";
@@ -352,9 +351,9 @@ int main(int argc, char **argv) {
   }
 
   // Versioned config (issue #27): analysis knobs, checked-in contracts,
-  // coverage thresholds. A malformed/invalid file is a HARD error (unlike
-  // --annotations' best-effort merge) -- see Config.h's own comment on why
-  // this schema is closed and strict rather than permissive.
+  // and coverage thresholds. A malformed/invalid file is a HARD error
+  // (unlike --annotations' best-effort merge) -- see Config.h's own
+  // comment on why this schema is closed and strict rather than permissive.
   Config config;
   bool haveConfig = !ConfigFile.empty();
   if (haveConfig) {
@@ -441,14 +440,14 @@ int main(int argc, char **argv) {
     mods.push_back(std::move(mod));
   }
 
-  // Contract validation failures (issue #27, item 5/6): a stale or
-  // incompatible checked-in contract is a hard configuration error, not a
-  // warning routed around -- collected across every function so a single
-  // run reports every offending entry at once, then aborts (no JSON
-  // written at all: unlike a coverage-threshold shortfall, a contract that
-  // fails this check could otherwise bake a wrong-typed or out-of-range
-  // operand straight into the emitted spec, so nothing from this run
-  // should be treated as trustworthy output).
+  // Contract validation failures: a stale or incompatible checked-in
+  // contract is a hard configuration error, not a warning routed around --
+  // collected across every function so a single run reports every
+  // offending entry at once, then aborts (no JSON written at all: unlike a
+  // coverage-threshold shortfall, a contract that fails this check could
+  // otherwise bake a wrong-typed or out-of-range operand straight into the
+  // emitted spec, so nothing from this run should be treated as
+  // trustworthy output).
   std::vector<std::string> contractErrors;
 
   // Build one inference record for a (public name, defining function) pair.

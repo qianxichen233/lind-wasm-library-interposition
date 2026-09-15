@@ -7,31 +7,18 @@
 // marshal-infer's built-in default behavior exactly (see loadConfig's own
 // comment on backward compatibility).
 //
-// Two of this file's knobs CAN affect runtime memory-safety exposure, and
-// both require deliberate, visible opt-in rather than a silent default:
-//   - A "contract" entry does not bypass soundness -- it supplies the SAME
-//     size/direction vocabulary the analyzer itself would have produced had
-//     it been able to prove the value, asserted by a human who verified it.
-//   - "analysis.policy":"relaxed" + a named entry in "analysis.heuristics"
-//     DOES accept a genuinely unproven pairing (see Infer.cpp's
-//     loopBoundValues/detectDirectArrayBound) -- this carries the SAME
-//     runtime exposure a proven decision would if the heuristic is wrong,
-//     since the runtime has no reduced-trust code path for a lower-
-//     confidence spec. It requires BOTH the policy switch AND the specific
-//     heuristic to be named, and is rejected as vacuous if either is set
-//     without the other.
-// Every other soundness-critical check (the escape-based fail-closed gate,
-// the address-induction-variable zero-start proof, ambiguous-callee
-// rejection) is compiled-in and unconditional -- nothing in this file can
-// weaken those. Every decision's provenance (proven / configured /
-// heuristic) is recorded in the output JSON (see ParamTree.h's
-// TreeNode::confidence) so a reader can always tell which functions were
-// analyzed, asserted, or guessed.
+// A "contract" entry is the only knob here that can affect what gets
+// marshalled. It explicitly replaces an automatic extent proof with a
+// human-reviewed assertion in the SAME size/direction vocabulary the
+// analyzer produces. Its operands are validated against the target
+// function's real signature before it is applied (see Infer.cpp's
+// validateContractAgainstSignature), and its configured provenance is
+// recorded in the output JSON (see ParamTree.h's TreeNode::confidence).
+// There is no separate opt-in for an unproven automatic heuristic.
 #pragma once
 
 #include <cstdint>
 #include <map>
-#include <set>
 #include <string>
 
 namespace marshal {
@@ -84,53 +71,6 @@ struct CoveragePolicy {
                               // when given, else of all covered records
 };
 
-// Strict (the built-in default) accepts only Proven StrideVector decisions.
-// Relaxed additionally accepts whichever NAMED heuristics are listed in
-// Config::heuristics -- see KnownHeuristics below for the closed set of
-// names loadConfig will accept, and Confidence::Heuristic in ParamTree.h
-// for exactly what accepting one means for runtime memory-safety exposure.
-enum class InferencePolicy { Strict, Relaxed };
-
-// The closed set of heuristic names loadConfig accepts in
-// "analysis.heuristics" (only meaningful when policy=="relaxed"). Adding a
-// new heuristic means implementing its actual mechanism in Infer.cpp AND
-// adding its name here -- listing an unimplemented name here would let a
-// profile silently enable nothing while believing it enabled something.
-//
-// "guard_based_length": pairs a stride with a length that came from
-// dominatingArgumentGuard's dominator-tree walk rather than an exact
-// ScalarEvolution trip-count proof (see LoopBound::lengthProven and
-// loopBoundValues in Infer.cpp) -- the ONE mechanism issue #26's fix
-// removed, reinstated here as an explicit, attributable, opt-in choice
-// instead of a silent default.
-//
-// "unroll_scaled_stride": accepts a per-iteration step recurrence of the
-// form `K*incx` (K a small power of two) as meaning plain `incx` -- the
-// shape LLVM's loop-unroll transform produces for an induction variable's
-// step (see LoopBound::strideProven and unwrapArgumentSCEVWithUnrollGuess
-// in Infer.cpp). In practice needed TOGETHER with "guard_based_length" to
-// recover a real -O2-optimized loop: unrolling transforms BOTH the trip-
-// count computation (defeating the exact SCEV proof, hence
-// guard_based_length) and the address induction variable's own step
-// (defeating the exact stride proof) at once. A genuine source-level
-// "stride is 2*incx" relationship is indistinguishable from this pattern
-// and would be silently misread as plain incx.
-//
-// A third fallback deriving length directly from a loop's own latch
-// comparison (rather than a separate dominating guard) was prototyped and
-// removed: even with an independent ScalarEvolution proof gating it, it
-// recovered zero additional OpenBLAS functions beyond what
-// guard_based_length already finds (LLVM's own unroll transform already
-// inserts the guard branches that heuristic looks for first), so it was
-// pure added attack surface with no measured benefit. Do not re-add a
-// pattern-matching length fallback without first demonstrating measurable
-// coverage it uniquely provides.
-inline const std::set<std::string> &knownHeuristics() {
-  static const std::set<std::string> k = {"guard_based_length",
-                                          "unroll_scaled_stride"};
-  return k;
-}
-
 struct Config {
   int configVersion = 0;
   std::string profileName;   // informational, echoed into output JSON
@@ -142,8 +82,6 @@ struct Config {
   // rather than silently clamping it to 1 (a request this loader can't
   // fulfill must fail loudly, not be quietly downgraded).
   unsigned maxDelegationHops = 1;
-  InferencePolicy policy = InferencePolicy::Strict;
-  std::set<std::string> heuristics; // only consulted when policy==Relaxed
   std::map<std::string, FunctionContract> contracts; // exported symbol -> contract
   CoveragePolicy coverage;
 };

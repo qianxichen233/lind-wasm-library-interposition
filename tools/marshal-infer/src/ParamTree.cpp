@@ -57,7 +57,6 @@ const char *confidenceName(Confidence c) {
   switch (c) {
   case Confidence::Proven:     return "proven";
   case Confidence::Configured: return "configured";
-  case Confidence::Heuristic:  return "heuristic";
   }
   return "proven";
 }

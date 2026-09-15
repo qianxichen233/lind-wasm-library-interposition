@@ -53,11 +53,11 @@ _SLOT_WARNING_RE = re.compile(r"needs (\d+) raw ABI slots")
 # drop below it would let a silent generated-handler regression slip back
 # through unnoticed. GENERATED_TARGET records the actual goal instead:
 # roughly 80 of the 89 functions the transport can carry at all (see
-# "transport accepted" above). Closing that gap is inference-side work (more
-# contracts recovering more of OpenBLAS's real loop shapes, or -- per issue
-# #27 -- analysis-friendlier IR, not more compiler-output pattern guesses);
-# this script can only report it, not close it, so it's a NOTE below, not a
-# failure.
+# "transport accepted" above). Closing that gap is inference-side work
+# (recognizing more of OpenBLAS's real loop shapes as sound proofs, or an
+# analysis-friendlier compile profile for the library -- see PATTERNS.md --
+# never a guess at unproven compiler output); this script can only report
+# it, not close it, so it's a NOTE below, not a failure.
 GENERATED_FLOOR = 40
 GENERATED_TARGET = 80
 
@@ -76,7 +76,7 @@ REQUIRED_SYMBOLS = (
 # (see CONFIG.md's "Confidence model") -- every other marshalled shape
 # (const size, cstr, ptr_array, a scalar/handle passthrough, ...) is exact by
 # construction, with no proof to grade, and is implicitly "proven".
-CONFIDENCE_ORDER = ("proven", "configured", "heuristic")
+CONFIDENCE_ORDER = ("proven", "configured")
 
 
 def exceeds_slot_cap(f):
@@ -172,7 +172,9 @@ def main():
         print(f"\nNOTE: {len(generated)}/{GENERATED_TARGET} of the intended "
               f"target reached ({transport_accepted} transport-eligible total) "
               f"-- not a failure; closing this gap is inference-side work "
-              f"(more contracts/heuristics), tracked separately.")
+              f"(more contracts, or recognizing more of OpenBLAS's real loop "
+              f"shapes as sound proofs -- see PATTERNS.md), tracked "
+              f"separately.")
 
     wide = discovered - transport_accepted
     print(f"\n{wide} of {discovered} functions exceed the "

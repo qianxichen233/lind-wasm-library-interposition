@@ -4,7 +4,7 @@ Tracking issue: [lind-wasm-library-interposition#27](https://github.com/qianxich
 
 An optional `--config <file.json>` file gives a library a checked-in,
 versioned, reviewable place to hold analysis knobs, human-asserted
-per-argument overrides, and coverage expectations — instead of those
+per-argument contracts, and coverage expectations — instead of those
 choices living as magic numbers in a shell script, or (issue #26's actual
 failure mode) nowhere at all, so a soundness fix elsewhere in the tool can
 silently swing a library's marshal count with nothing to notice.
@@ -25,9 +25,8 @@ exactly — this is not a required file.
 
 ## Confidence model
 
-Every StrideVector decision (the only sizeKind this dimension currently
-applies to) is one of three confidence levels, always recorded in the
-output JSON as `"confidence"`:
+Every StrideVector decision is one of two confidence levels, always
+recorded in the output JSON as `"confidence"`:
 
 - **`proven`** — the length AND the address induction variable's zero
   start were both established by a genuine algebraic proof: either
@@ -35,41 +34,53 @@ output JSON as `"confidence"`:
   single index variable serves as both address and exit counter, stepping
   by the stride rather than by 1 — see "The factored-bound proof" below)
   `detectFactoredStrideTripCount`'s decomposition of the loop's own
-  pre-scaled bound. Runtime memory safety follows from either proof. This
-  is what `analysis.policy:"strict"` (the default) accepts — neither proof
-  needs `--config` or any policy opt-in at all.
-- **`configured`** — a `contracts` entry (below) asserted the value; a
-  human verified it, presumably because static analysis couldn't.
-- **`heuristic`** — `analysis.policy:"relaxed"` opted into a NAMED
-  heuristic (below) that accepts an UNPROVEN pairing anyway.
+  pre-scaled bound. Runtime memory safety follows from either proof
+  directly, with no config or opt-in of any kind.
+- **`configured`** — a checked-in config file's `contracts` entry (below)
+  asserted the value; a human verified it, presumably because static
+  analysis couldn't, and it was validated against the function's real
+  signature before being applied (see "Why `contracts` exists" below).
 
-**Read this carefully before enabling `relaxed` policy or any heuristic:**
-the runtime has no reduced-trust code path for a lower-confidence spec — a
-`heuristic` decision is marshalled exactly like a `proven` one. Lowering
-confidence makes a wrong guess *visible and attributable*, not *safer*. A
-wrong `heuristic` decision carries the identical memory-safety exposure a
-wrong `proven` one would (impossible by construction) or a wrong
-`configured` one would (only possible if the human who wrote the contract
-made a mistake).
+There is no third, unproven-and-unasserted level: a pairing this tool
+cannot prove and no contract asserts fails closed (force_local), never
+accepted at reduced confidence. An earlier revision of this tool supported
+exactly that — named, unproven compiler-shape heuristics, opted into via
+`analysis.policy:"relaxed"` — and it has been removed entirely (see
+"Historical note" below).
 
 ## What is, and is NOT, configurable
 
-Besides `policy`/`heuristics`, this file can only ever let a library
-declare it needs **more scrutiny or narrower scope** than the defaults —
-resource limits, delegation depth, and verified per-argument overrides in
-the analyzer's own vocabulary. Nothing here can touch:
+Besides `contracts` and the coverage floor, this file can only ever let a
+library declare it needs **more scrutiny or narrower scope** than the
+defaults — resource limits and delegation depth, in the analyzer's own
+vocabulary. Nothing here can touch:
 
-- The escape-based fail-closed gate (a pointer with no proven extent that
-  escapes to an unanalyzable callee force_locals, never defaults to
-  `sizeof(T)`) — unconditional, no heuristic relaxes it.
-- The address-induction-variable zero-start proof — unconditional even
-  under `relaxed` policy; only the LENGTH side (`guard_based_length`) and
-  the per-iteration STEP's unroll-scaling (`unroll_scaled_stride`) can be
-  relaxed, independently, each requiring its own explicit opt-in.
+- The escape-based fail-closed gate (a pointer with no proven or asserted
+  extent that escapes to an unanalyzable callee force_locals, never
+  defaults to `sizeof(T)`).
+- The dynamic-extent fail-closed gate (a pointer indexed by an offset
+  that isn't provably a constant zero force_locals unless an exact extent
+  was proven or asserted — never silently treated as a single scalar
+  element; see "The single-element fallback requires full local
+  visibility" below).
+- The address-induction-variable zero-start proof, for the `proven` path
+  (a `configured` contract instead asserts the whole envelope directly,
+  including its start).
 - Ambiguous cross-module callee resolution is always rejected, never
   first-picked.
 - The raw-ABI-slot cap (`LIND_RAW_ARGS_MAX`) is a hardware/runtime
   constant, not a policy choice, and is not exposed here at all.
+- No amount of configuration can make inference itself depend on a
+  specific symbol's name -- a `contracts` entry is keyed by name because
+  it is a per-symbol human assertion, not a recognizer; the analyzer code
+  in Infer.cpp never branches on what function it is analyzing.
+
+A `contracts` entry is the one thing in this file that CAN affect what
+gets marshalled, and it does not weaken any of the above: it supplies the
+exact same size/direction vocabulary the analyzer itself would have
+produced had it been able to prove the value, checked against the target
+function's real signature before it is ever applied. There is no opt-in
+to accept an algebraically-unproven, human-unverified pairing.
 
 ## Schema (version 1)
 
@@ -80,31 +91,15 @@ the analyzer's own vocabulary. Nothing here can touch:
 
   "analysis": {
     "max_type_depth": 6,         // 1..64, struct/pointer nesting recursion cap
-    "max_delegation_hops": 1,    // 0 or 1 only -- multi-hop delegation isn't
+    "max_delegation_hops": 1     // 0 or 1 only -- multi-hop delegation isn't
                                   // implemented; requesting anything else is
                                   // a hard error, not a silent clamp. 0
                                   // disables one-hop delegation entirely.
-    "policy": "strict",          // "strict" (default) | "relaxed"
-    "heuristics": [              // only consulted when policy=="relaxed";
-                                  // required together with policy=="relaxed"
-                                  // (each vacuous alone -- either shape is
-                                  // rejected as a mistake)
-      "guard_based_length",      // accept a length from dominatingArgumentGuard's
-                                  // dominator-tree walk (proves "array-shaped",
-                                  // never an exact count) instead of ScalarEvolution's
-                                  // exact trip-count proof -- ONLY once the loop's
-                                  // OWN latch comparison structurally confirms the
-                                  // guard-derived candidate as the exclusive bound
-                                  // (see "Why the heuristics exist" below)
-      "unroll_scaled_stride"     // accept a `K*incx` step recurrence (K a small
-                                  // power of two -- LLVM's loop-unroll artifact)
-                                  // as meaning plain `incx`
-    ]
   },
 
   "coverage": {
     "enabled": true,
-    "min_marshal_count": 46,     // absolute floor: #records with decision=="marshal"
+    "min_marshal_count": 42,     // absolute floor: #records with decision=="marshal"
     "min_marshal_pct": 5.0       // 0..100: marshal-decision records as a % of
                                   // exported symbols (--exports) when given,
                                   // else of all covered records. At least one
@@ -150,12 +145,20 @@ mistaken for an omission and silently ignored.
 `"value"` — the raw wasm argument slot IS the number itself (CBLAS-style
 `int n`). `"pointee_i32"` — the raw slot is a pointer to a 32-bit int
 holding the number (classic Fortran BLAS-style `int *N`, unpacked as
-`n = *N` at function entry). See `ParamTree.h`'s `ExtentSource`.
+`n = *N` at function entry). See `ParamTree.h`'s `ExtentSource`. This
+vocabulary isn't specific to `contracts` — it's how the analyzer itself
+describes, in its own JSON output, where a `size_operand`/`stride_operand`
+value comes from; it appears on every StrideVector record, `proven` or
+`configured` alike. A `contracts` entry just lets a human assert a
+specific `(arg_index, source)` pair directly, in that same vocabulary,
+instead of the analyzer discovering it.
 
-The `analysis`/`heuristics`/`contracts` blocks above illustrate the full
-schema; the checked-in OpenBLAS profile (`profiles/openblas.json`)
-currently uses none of them — see "Why analyze at a different
-optimization level" and "Why contracts exists" below for why.
+The checked-in OpenBLAS profile (`profiles/openblas.json`) sets only
+`coverage.min_marshal_count` — no `contracts` entry is currently needed
+against OpenBLAS's real binary once `infer_openblas.sh` analyzes it at
+`-O1` (see "Why analyze at a different optimization level" below), though
+the mechanism remains available for the library's still-unresolved cases
+(see "Why `contracts` exists" below).
 
 ## Why analyze at a different optimization level than the shipped library
 
@@ -186,14 +189,15 @@ Getting the lower optimization level to actually take effect requires
 setting `COMMON_OPT` directly (confirmed by tracing the real compile
 command generated both ways).
 
-Practically: this recovers strictly more than the heuristics ever did.
-Against OpenBLAS, `guard_based_length`/`unroll_scaled_stride` together
-used to recover 26/203 marshal (from a 20/203 strict baseline) by
-reproducing a bounded slice of the pre-issue-#26 loop-shape analysis, as
-an explicit, unproven, opt-in guess. Switching the analysis build to
-`-O1` recovers 42/203 with ZERO heuristics, ZERO config, every decision
-`proven` — the loops the heuristics used to guess about are simply no
-longer unrolled, so ScalarEvolution's own exact proof succeeds directly.
+Practically: this recovers strictly more than the removed heuristic layer
+ever did (see "Historical note" below) — 42/203 marshal, every decision an
+exact proof, with no per-library opt-in of any kind. `cblas_daxpy`/
+`daxpy_` are among the functions this recovers directly: their real `-O2`
+build couldn't be proven exactly, but at `-O1`, `daxpy_k`'s loop has the
+same clean, separately-provable counter/accumulator shape as `dcopy_k` --
+before this fix, `daxpy_`/`cblas_daxpy` needed a `contracts` entry
+(below); moving the analysis build to `-O1` proved the same fact directly
+instead, and the contract was removed as no longer necessary.
 
 ## Why `contracts` exists
 
@@ -204,11 +208,11 @@ fail to resolve, even though the loop's real semantics are exactly the
 canonical `(length, stride)` pair a human reading the *source* can see
 immediately. Rather than loosen the analyzer's proof requirements (which
 would reintroduce exactly the under-allocation bug issue #26 was filed
-over), a `contracts` entry lets a human assert the verified answer for that
-one, specific, reviewed argument — with the assertion itself checked into
-version control, validated against the same schema as everything else, and
-visibly marked in the output (`"confidence":"configured"`) so nobody
-mistakes it for something the tool proved on its own.
+over), a `contracts` entry lets a human assert the verified answer for
+that one, specific, reviewed argument — with the assertion itself checked
+into version control, validated against the same schema as everything
+else, and visibly marked in the output (`"confidence":"configured"`) so
+nobody mistakes it for something the tool proved on its own.
 
 `loadConfig` validates a contract's own JSON *shape* (argument indices are
 non-negative integers, `source` is one of the two known strings, `dir` is
@@ -236,13 +240,22 @@ all — unlike a coverage-threshold shortfall (below), a bad contract could
 otherwise mean the output actively contains a wrong-typed or out-of-range
 spec, so nothing from that run should be treated as trustworthy.
 
-OpenBLAS's own checked-in profile currently has no `contracts` at all:
-`cblas_daxpy`/`daxpy_` originally needed one (their real `-O2` build
-couldn't be proven exactly), but once the analysis build moved to `-O1`
-(see above), `daxpy_k`'s loop turned out to have the same clean,
-separately-provable counter/accumulator shape as `dcopy_k` — proven
-directly, no assertion needed. The mechanism stays available for whatever
-the next library's build genuinely can't prove on its own.
+OpenBLAS's own checked-in profile currently has no `contracts` at all —
+`cblas_daxpy`/`daxpy_` are the one case that used to need one, and no
+longer does (see above). The mechanism stays available, and matters, for
+OpenBLAS's own remaining unresolved cases: the peeled-prefix max/min
+family (`isamax_k` and 27 other exported symbols in the same kernel
+family — see "Compound guard disambiguation" below), for instance, has a
+real, sound `(length=n,
+stride=inc_x)` relationship that this tool's automatic analysis cannot
+currently derive (the address induction variable's provable start is
+nonzero, because the loop's first element is handled by hand before the
+loop begins) but that a human reading the source can verify directly. A
+checked, signature-validated contract is the supported way to cover a
+case like that -- preferable to inventing another narrow, single-purpose
+inference recognizer for one library's idiom (see also KSplit's own
+automatic-analysis-plus-manual-residue model, referenced in
+research/arg-marshalling/).
 
 ## The factored-bound proof
 
@@ -289,8 +302,7 @@ condition:
 Every condition here is either a direct IR match or an already-
 independent proof (the stride's own SCEV proof, a dominating comparison
 against a constant) — nothing is approximated. A successful result is
-unconditionally `Confidence::Proven`: no `--config`, no policy opt-in,
-available even under the default strict policy. Covered by an adversarial
+unconditional: no `--config` needed, no opt-in of any kind. Covered by an adversarial
 test matrix (`tests/config/factored_bound_pos.c`/`factored_bound_neg.c`)
 exercising reversed comparison operands, Fortran-by-reference operands,
 and every one of the failure modes above individually.
@@ -358,115 +370,92 @@ bound, a dynamic non-loop index, a constant nonzero index, and a negative
 offset must all force_local; a direct dereference, an explicit `p[0]`, and
 a genuine scalar out-param must all still marshal as one element.
 
-## Why the heuristics exist, and their real ceiling
+## Compound guard disambiguation, and the remaining coverage ceiling
 
-`guard_based_length` and `unroll_scaled_stride` exist for a library
-that's only analyzable at a higher, unrolling optimization level (this
-tool must analyze whatever bitcode it's actually given — not every
-library's build necessarily has an `-O1`-equivalent option, or one that
-still exposes the debug info this tool needs). Enabled TOGETHER (a real
-`-O2` unrolled loop entangles both the trip-count computation and the
-address induction variable's own step at once, so recovering one without
-the other rarely helps), they reproduce a bounded slice of the loop-shape
-analysis that existed before issue #26's soundness fix, but as an
-explicit, attributable, per-library opt-in instead of the tool's
-unconditional default.
-
-**Against OpenBLAS specifically, neither is needed at all anymore.**
-Historically (analyzing the real `-O2` release build), they took OpenBLAS
-from 20/203 strict to 26/203 relaxed. Once the analysis build moved to
-`-O1` (see above), the strict baseline alone reached 42/203 — MORE than
-the old heuristic-relaxed number, with zero guessing — and the heuristics
-added nothing further on top (they have nothing left to do: the loops
-they used to guess about are no longer unrolled). `profiles/openblas.json`
-does not enable them. The mechanism, and the safety history below, stay
-relevant for whatever future library genuinely can't be analyzed
-un-unrolled.
+`dominatingArgumentGuard` finds a COMPOUND dominating guard
+(`if (n<=0 || inc_x<=0) return;` — confirmed across 46 of OpenBLAS's own
+riscv64 kernel files, e.g. `kernel/riscv64/iamax.c`) and collects EVERY
+candidate the branch could name, then `loopBoundValues` picks whichever
+one does NOT collide with the independently-resolved stride (a parameter
+can never legitimately be its own stride) — this disambiguation is only
+ever used to make the descriptive "array-shaped" force_local warning name
+the right argument (see "What is, and is NOT, configurable" above: no
+guard-derived candidate is ever promoted to a real pairing on its own).
+Confirmed correct with a dedicated synthetic test
+(`tests/config/compound_guard.c`).
 
 Of the 203-42=161 remaining `force_local` functions, 114 are blocked by
 the raw-ABI-slot cap (`LIND_RAW_ARGS_MAX`, untouchable by any config or
 analysis choice) — an absolute floor. 203-114-1(variadic) = 88 is the
 practical ceiling for source-shape analysis against OpenBLAS's current
-binary, not 203.
+binary, not 203. Two families sit in that remaining gap, both real
+candidates for a `contracts` entry (above) rather than a new inference
+recognizer: the peeled-prefix max/min family (`isamax_k` and 27 other
+exported symbols in the same kernel family — `PATTERNS.md`'s "peeled
+first iteration" entry) handles its first element
+before the loop starts, so the address induction variable's provable
+start is nonzero even though the true touched region does start at
+offset 0; and OpenBLAS's `ssum_`/`dsum_` family (`kernel/arm/sum.c`,
+OpenBLAS's shared fallback for targets with no dedicated plain-sum
+kernel) reassigns `n *= inc_x` and branches on a SIMD fast path before
+its final scalar tail loop, so the tail loop's own address induction
+variable is a phi merged from two different control-flow paths and
+ScalarEvolution can't prove its start is the constant 0 the zero-start
+proof requires. Neither is solvable by widening a compiler-output pattern
+match (see "Historical note" below for why that's the wrong tool); both
+have a real, source-verifiable `(length, stride)` relationship a
+`contracts` entry could assert directly.
 
-**A real safety gap, found and fixed:** `boundConfirmsExclusiveLength`'s
-first version accepted a DIRECT (unmasked) match between a latch
-comparison's operand and a guard-derived candidate length with NO check of
-the comparison's actual predicate at all -- so a non-unrolled,
-directly-inclusive loop (`for (int i = 0; i <= n; ++i)`, no masking
-involved anywhere, nothing for the mask-shape check below to even look at)
-sailed through exactly as if `n` were an exclusive bound, undercounting by
-one stride's worth. This is exactly the class of bug issue #26 was filed
-over, now living inside that fix's own safety check. Fixed
-(`loopLatchConfirmsExclusiveLength` in Infer.cpp) by requiring, for a
-direct match, that the comparison's predicate be PROVABLY STRICT
-(`slt`/`ult`, or `sgt`/`ugt` with the bound read from the correspondingly
-opposite operand) -- an inclusive or opaque predicate now NEVER accepts a
-direct match, regardless of which operand happens to equal the candidate.
-Covered by a dedicated test matrix (`tests/config/matrix.c`) crossing
-signed/unsigned counters, forward/reversed comparison operand order, and
-plain/Fortran-by-reference count arguments, all compiled WITHOUT
-unrolling (`-fno-unroll-loops`) so the direct-match path specifically is
-what's exercised, alongside the pre-existing unrolled-mask regression test
-(`tests/config/inclusive_reject.c`).
+## Historical note: the removed relaxed-heuristic layer
 
-A SEPARATE instance of the same missing check was found and fixed in the
-one-hop delegation path (`detectDelegatedArrayBound`): its own
-`lengthOk` computation accepted `allowGuardHeuristic` alone, without ALSO
-requiring `loopLatchConfirmsExclusiveLength`'s confirmation -- meaning a
-length recovered from a DELEGATED callee's guard was accepted completely
-unconditionally, never checked against the callee's own loop shape at
-all. Fixing this dropped OpenBLAS's `-O2`-analysis relaxed count from a
-previously-reported 50/203 to an honestly-verified 26/203 at the time:
-roughly two dozen functions (the `cblas_dcopy`/`cblas_dswap`/... family,
-delegating into `kernel/riscv64`'s plain unrolled kernels) were being
-accepted via delegation with ZERO structural confirmation of loop
-exclusivity, not even the always-available masked-bound check -- those
-kernels' real `-O2` IR mask constant for a SIGNED 32-bit counter is the
-sign-bit-cleared form (`n & 2147483644`, i.e. `n & (-4 & INT_MAX)`, not the
-simpler `n & -4`), which `maskConfirmsExclusiveLength`'s `m<0` check does
-not recognize. Widening that specific mask pattern would have been
-exactly the kind of guess issue #27 asks this tool to stop making --
-instead, moving the analysis build to `-O1` (above) sidestepped the mask
-question entirely by never unrolling the loop in the first place, which
-is how this whole family ended up recovered anyway, as `proven`.
+Earlier revisions of this tool (and this file) supported a second,
+opt-in acceptance path alongside the exact proofs and checked contracts
+above: `analysis.policy:"relaxed"` plus named heuristics
+(`guard_based_length`, `unroll_scaled_stride`) that accepted an
+algebraically-unproven, human-*unverified* `(length, stride)` pairing
+anyway. It existed for the same reason `contracts` does: analyzed at the
+library's real, unrolling `-O2` release optimization level, several
+OpenBLAS loops' exit tests became opaque, compiler-generated artifacts
+(masked bounds, remainder loops) that ScalarEvolution's exact proof
+couldn't see through, even though the source's own `(length, stride)`
+relationship was in each case exactly what a human reading the loop could
+see directly. Unlike a contract, though, a heuristic's guess was never
+individually reviewed -- it applied automatically to every loop matching
+its pattern, with no per-symbol sign-off.
 
-**A previously-known, still-open conservatism, unrelated to either fix
-above:** `dominatingArgumentGuard` found a COMPOUND guard
-(`if (n<=0 || inc_x<=0) return;` -- confirmed across 46 of OpenBLAS's own
-riscv64 kernel files, e.g. `kernel/riscv64/iamax.c`) used to pick
-*whichever* operand resolved first, with no way to tell `n` apart from
-`inc_x` -- `dominatingArgumentGuard` now collects EVERY candidate from such
-a branch and `loopBoundValues` picks the one that does NOT collide with the
-independently-resolved stride (a parameter can never legitimately be its
-own stride), confirmed correct with a dedicated synthetic test
-(`tests/config/compound_guard.c`). OpenBLAS's `ssum_`/`dsum_` family
-(`kernel/arm/sum.c`, OpenBLAS's shared fallback for targets with no
-dedicated plain-sum kernel) has a DEEPER blocker the disambiguation fix
-doesn't touch -- the kernel reassigns `n *= inc_x` and branches on a SIMD
-fast path (`if (inc_x==1) {...}`) before its final scalar tail loop, so the
-tail loop's own address induction variable is a phi merged from BOTH the
-SIMD path's own advanced index and the skip-SIMD path's literal 0 --
-ScalarEvolution can't prove that phi's start is the constant 0 the
-zero-start proof requires, regardless of the guard being disambiguated
-correctly. Recovering these would need reasoning about which CONTROL-FLOW
-PATH into a loop is actually taken -- issue #27's OWN guidance is to
-prefer a hand-verified `contracts` entry or analysis-friendlier IR over
-building that, not another compiler-output pattern guess.
+That layer is gone. Once `infer_openblas.sh` was changed to analyze
+OpenBLAS at a lower, non-unrolling optimization level instead (see "Why
+analyze at a different optimization level" above), every loop shape the
+heuristics used to paper over went back to being provable directly — the
+relaxed-policy count these heuristics used to reach against the real
+`-O2` build (26/203) is now exceeded by the strict, unconditional
+baseline alone (42/203), with zero guessing. Removing
+`analysis.policy`/`analysis.heuristics` from the config schema and every
+heuristic-specific code path in Infer.cpp took real, load-bearing
+complexity out of the tool for zero remaining benefit to any
+currently-supported library. `contracts` and the `Confidence` enum's
+`Proven`/`Configured` distinction are unrelated to this removal and
+remain fully supported (above) -- a reviewed, signature-validated,
+per-symbol assertion is a fundamentally different (and safe) mechanism
+from an automatic, unverified pattern-match guess, and the two never
+shared an implementation, only this file's schema.
 
-Treat any further attempt to widen a mask-shape or predicate pattern-match
-with real suspicion: this class of check has already surprised its own
-author more than once, on both the direct-analysis and the delegated
-paths. A previously-explored third heuristic
-(`latch_comparison_length`, deriving length directly from a loop's own
-latch comparison when neither an exact proof nor a dominating guard found
-anything) was removed entirely after measurement showed it recovered ZERO
-additional OpenBLAS functions beyond what `guard_based_length` already
-finds -- LLVM's own unroll transform already inserts the same guard
-branches that heuristic looks for first, so the scenario it existed for
-("no dominating guard at all") does not occur in practice once a loop has
-been unrolled. Pure added complexity with no measured benefit; do not
-re-add it without first demonstrating coverage it uniquely provides.
+Two real safety bugs were found and fixed while the heuristic layer
+existed, worth knowing before ever reintroducing something like it: a
+guard-derived length was, at one point, accepted as an exclusive loop
+bound without checking that the loop's own latch predicate was actually
+strict (an inclusive `for (i = 0; i <= n; ++i)` undercounted by one
+stride's worth — exactly the class of bug issue #26 was filed over, now
+recurring inside its own proposed fix); and the one-hop delegation path
+independently accepted a callee's guard-derived length with no equivalent
+confirmation at all, inflating a previously-reported 50/203 down to an
+honestly verified 26/203 once fixed. A third candidate heuristic
+(`latch_comparison_length`) was measured and dropped before ever
+shipping, because it recovered zero additional functions beyond what
+`guard_based_length` already found. Treat any future pattern-match over
+compiler-generated loop shapes with the same suspicion: prefer moving the
+analysis to a friendlier compile profile, or a checked `contracts` entry,
+over widening a mask- or predicate-shape guess.
 
 ## Coverage thresholds
 
@@ -480,10 +469,10 @@ nothing but a human noticing the number looked different.
 ## See also
 
 - `profiles/openblas.json` — currently just a coverage floor
-  (`min_marshal_count: 42`) to catch any future regression; neither
-  `contracts` nor `analysis.policy:"relaxed"` is needed against OpenBLAS's
-  real binary once `infer_openblas.sh` analyzes it at `-O1` (see above) --
-  42/203 marshal, strict, every decision `proven`.
+  (`min_marshal_count: 42`) to catch any future regression; no other field
+  is needed against OpenBLAS's real binary once `infer_openblas.sh`
+  analyzes it at `-O1` (see above) -- 42/203 marshal, every decision an
+  exact proof.
 - `infer_openblas.sh` — the analysis-specific `-O1`/no-unroll/no-vectorize
   compile profile, and the `COMMON_OPT` gotcha for actually making it
   stick against OpenBLAS's own Makefile.
@@ -491,15 +480,14 @@ nothing but a human noticing the number looked different.
   still-open), across every part of the tool, not just this file's own
   config mechanisms.
 - `tests/config/` — regression tests for schema validation (including
-  present-but-wrong-typed fields), contract application + provenance,
-  contract-vs-signature validation and stale/never-applied contracts (all
-  hard errors), heuristic-gated marshalling (each heuristic combination
-  that should and shouldn't unlock a case), compound-guard disambiguation,
-  the inclusive-bound SAFETY property (`inclusive_reject.c`, unrolled) and
-  its direct-predicate counterpart (`matrix.c`, non-unrolled, crossing
+  present-but-wrong-typed fields), the unrollable-loop-with-no-recovery-
+  path safety case, compound-guard disambiguation, the inclusive-bound
+  SAFETY property (`inclusive_reject.c`, unrolled) and its
+  direct-predicate counterpart (`matrix.c`, non-unrolled, crossing
   signed/unsigned, forward/reversed, and plain/Fortran-by-reference
   counters), the factored-bound proof's own adversarial matrix
   (`factored_bound_pos.c`/`factored_bound_neg.c`), the single-element
-  fallback's required full local visibility (`dynamic_extent.c`), and
-  coverage-threshold
+  fallback's required full local visibility (`dynamic_extent.c`), contract
+  application + provenance, contract-vs-signature validation, and
+  stale/never-applied contracts (all hard errors), and coverage-threshold
   enforcement.

@@ -4,8 +4,9 @@
 // single index variable serves as both the array address and the exit
 // counter (see PATTERNS.md's "fused index/counter" entry). Each function
 // here violates exactly one of the proof's required conditions and must
-// stay force_local (or, for the no-guard case, fall back to unrelated
-// single-scalar evidence rather than resolve this pairing).
+// force_local -- the pointer is indexed by an offset that isn't provably
+// zero, so the dynamic-extent fail-closed check applies whenever no exact
+// extent is proven.
 //
 // NOT covered here: a latch branch whose "true" successor exits the loop
 // (rather than continuing it) -- the function also checks this
@@ -51,11 +52,10 @@ void neg_offset_bound(int n, int stride, double *x) {
 }
 
 // Missing positivity proof: same shape as the real case, but no guard.
-// This one is observably "marshal" in the output -- but only via the
-// pre-existing, unrelated single-scalar fallback (no array evidence at
-// all -> treat the pointer as one element), not this pairing: its
-// stride_vector confidence is absent because the factored-bound proof
-// never fires without a positivity guard.
+// force_locals directly: the pointer is indexed by a loop-carried offset
+// that isn't provably a constant zero, and no exact extent was proven, so
+// the dynamic-extent fail-closed check applies -- never silently treated
+// as a single scalar element.
 void neg_missing_guard(int n, int stride, double *x) {
   int bound = n * stride;
   int i = 0;

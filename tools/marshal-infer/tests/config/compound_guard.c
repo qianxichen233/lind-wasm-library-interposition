@@ -6,8 +6,11 @@
 // parameter can never legitimately be its own stride), not just take
 // whichever comparison resolves first -- see Infer.cpp's
 // dominatingArgumentGuard and loopBoundValues. Forced to unroll (like
-// walk_heuristic.c) so ScalarEvolution's own exact trip-count proof fails
-// and this guard-based path is actually exercised.
+// walk_heuristic.c) so ScalarEvolution's own exact trip-count proof fails:
+// the disambiguated guard candidate is never promoted to a real pairing
+// (this function always force_locals), but it's still what the
+// "array-shaped" warning names, so the disambiguation itself stays
+// checkable even though nothing here marshals.
 void walk_compound_guard(int n, int stride, double *x) {
   if (n <= 0 || stride <= 0) return;
   int ix = 0;

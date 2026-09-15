@@ -96,24 +96,6 @@ bool requireObj(const json::Object &obj, StringRef key, const std::string &conte
   }
   return true;
 }
-bool requireArr(const json::Object &obj, StringRef key, const std::string &context,
-                const json::Array *&out, std::string &err) {
-  const json::Value *v = obj.get(key);
-  if (!v) { out = nullptr; return true; }
-  out = v->getAsArray();
-  if (!out) {
-    err = context + "." + key.str() + ": must be an array";
-    return false;
-  }
-  return true;
-}
-
-// Argument-index values pass through a JSON int64_t -> int narrowing
-// conversion wherever they're stored (ContractExtentOperand::argIndex,
-// FunctionContract's map key). No real function has anywhere close to this
-// many parameters; the bound exists purely to make that narrowing provably
-// safe rather than implementation-defined for a pathological config value.
-constexpr int64_t kMaxArgIndex = 4096;
 
 // Rejects any key in `obj` not listed in `allowed` -- a closed schema, not
 // an ignore-unknown-fields merge: a typo or a hoped-for-but-unimplemented
@@ -129,6 +111,13 @@ bool checkKeys(const json::Object &obj, const std::set<std::string> &allowed,
   }
   return true;
 }
+
+// Argument-index values pass through a JSON int64_t -> int narrowing
+// conversion wherever they're stored (ContractExtentOperand::argIndex,
+// FunctionContract's map key). No real function has anywhere close to this
+// many parameters; the bound exists purely to make that narrowing provably
+// safe rather than implementation-defined for a pathological config value.
+constexpr int64_t kMaxArgIndex = 4096;
 
 bool parseExtentOperand(const json::Object &obj, const char *field,
                         ContractExtentOperand &out, const std::string &context,
@@ -259,10 +248,7 @@ bool loadConfig(const std::string &path, Config &out, std::string &err) {
     return false;
   if (an) {
     std::string actx = path + ".analysis";
-    if (!checkKeys(*an,
-                  {"max_type_depth", "max_delegation_hops", "policy",
-                   "heuristics"},
-                  actx, err))
+    if (!checkKeys(*an, {"max_type_depth", "max_delegation_hops"}, actx, err))
       return false;
     std::optional<int64_t> d;
     if (!requireInt(*an, "max_type_depth", actx, d, err))
@@ -287,55 +273,6 @@ bool loadConfig(const std::string &path, Config &out, std::string &err) {
         return false;
       }
       cfg.maxDelegationHops = (unsigned)*h;
-    }
-    bool sawPolicy = false;
-    std::optional<StringRef> pol;
-    if (!requireStr(*an, "policy", actx, pol, err))
-      return false;
-    if (pol) {
-      if (*pol == "strict") {
-        cfg.policy = InferencePolicy::Strict;
-      } else if (*pol == "relaxed") {
-        cfg.policy = InferencePolicy::Relaxed;
-      } else {
-        err = actx + ".policy: must be \"strict\" or \"relaxed\"";
-        return false;
-      }
-      sawPolicy = true;
-    }
-    bool sawHeuristics = false;
-    const json::Array *hs = nullptr;
-    if (!requireArr(*an, "heuristics", actx, hs, err))
-      return false;
-    if (hs) {
-      sawHeuristics = true;
-      for (const json::Value &v : *hs) {
-        auto s = v.getAsString();
-        if (!s || !knownHeuristics().count(s->str())) {
-          err = actx + ".heuristics: unknown heuristic " +
-                (s ? ("\"" + s->str() + "\"") : std::string("(not a string)"));
-          return false;
-        }
-        cfg.heuristics.insert(s->str());
-      }
-    }
-    // Both halves of a relaxation must be stated together: naming a
-    // heuristic under the (default) strict policy would silently do
-    // nothing (never consulted -- see detectDirectArrayBound's
-    // allowGuardHeuristic gate), and declaring policy=="relaxed" with no
-    // heuristics enabled relaxes nothing at all. Either shape is a vacuous
-    // or contradictory config, almost certainly a mistake.
-    if (sawHeuristics && !(sawPolicy && cfg.policy == InferencePolicy::Relaxed)) {
-      err = actx +
-            ".heuristics: set but policy is not \"relaxed\" -- "
-            "these heuristics would never be consulted";
-      return false;
-    }
-    if (sawPolicy && cfg.policy == InferencePolicy::Relaxed && cfg.heuristics.empty()) {
-      err = actx +
-            ".policy: \"relaxed\" but analysis.heuristics is empty "
-            "-- this relaxes nothing; name at least one heuristic";
-      return false;
     }
   }
 

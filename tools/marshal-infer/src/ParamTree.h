@@ -80,24 +80,21 @@ struct ExtentOperand {
   bool valid() const { return argIndex >= 0; }
 };
 
-// How a StrideVector decision was reached (issue #27's confidence model).
+// How a StrideVector decision was reached.
 //   Proven     — the length AND the address induction variable's zero start
-//                were both proven exactly by ScalarEvolution (see Infer.cpp's
-//                loopBoundValues); runtime memory safety follows from that
-//                proof.
+//                were both proven exactly by static analysis (an exact
+//                ScalarEvolution trip-count proof, or
+//                detectFactoredStrideTripCount's decomposition -- see
+//                Infer.cpp); runtime memory safety follows from that proof.
 //   Configured — a checked-in config file's "contracts" entry (Config.h)
 //                asserted this argument's extent: a human verified it,
-//                presumably because static analysis couldn't.
-//   Heuristic  — a checked-in config file's "analysis.policy":"relaxed"
-//                opted into a NAMED heuristic (Config::heuristics) that
-//                pairs an UNPROVEN (dominatingArgumentGuard-derived) length
-//                with a stride anyway. This carries the SAME runtime
-//                memory-safety exposure a Proven decision would if the
-//                heuristic's guess is wrong -- the runtime has no reduced-
-//                trust code path for a lower-confidence spec -- made
-//                visible and attributable rather than silently accepted or
-//                silently rejected.
-enum class Confidence { Proven, Configured, Heuristic };
+//                presumably because static analysis couldn't. Validated
+//                against the target function's real signature before it is
+//                ever applied (see validateContractAgainstSignature).
+// There is no third, unproven-and-unasserted level: a pairing this tool
+// cannot prove and no contract asserts fails closed (force_local) instead
+// of being accepted at reduced confidence.
+enum class Confidence { Proven, Configured };
 const char *confidenceName(Confidence c);
 
 // What the return value is / how it must be translated.
@@ -156,10 +153,11 @@ struct TreeNode {
   ExtentOperand sizeOperand;
   ExtentOperand strideOperand;
   uint64_t constSize = 0;  // Const: byte count. StrideVector: per-element byte size.
-
-  // How this StrideVector decision was reached (issue #27's confidence
-  // model -- meaningful only for sizeKind==StrideVector; every other kind
-  // stays at the default and is not emitted). See Confidence's own comment.
+  // How this StrideVector decision was reached -- Proven unless a checked-in
+  // config's contract asserted it (Configured). Emitted in the output JSON
+  // as "confidence" only for StrideVector nodes; every other sizeKind's
+  // decision has exactly one way to be reached, so the field stays at the
+  // default and is not emitted. See Confidence's own comment.
   Confidence confidence = Confidence::Proven;
 
   // For Pointer nodes: this pointer is an opaque handle (translate via token

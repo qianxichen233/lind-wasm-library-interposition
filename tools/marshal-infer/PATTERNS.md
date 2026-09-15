@@ -63,14 +63,18 @@ by the time the loop's own address accumulator (`ix`) begins, it already
 starts at `inc_x`, not `0`.
 
 **Status: unhandled by design.** The address induction variable's
-zero-start proof is unconditional — never relaxed by any heuristic or
-config, because a nonzero start means the real touched region doesn't
-begin where the spec would claim it does. The LENGTH side still resolves
-fine (`n` — the loop's own trip count is otherwise clean), which is why
-this shows up as "array-shaped ... but no distinct stride operand", not a
-length failure. Only a hand-verified `contracts` entry can cover this
-shape; the real touched region genuinely does start at offset 0 (`x[0]`
-is read, just outside the loop), so such a contract would be sound.
+zero-start proof is unconditional, because a nonzero start means the real
+touched region doesn't begin where the spec would claim it does. The
+LENGTH side still resolves fine (`n` — the loop's own trip count is
+otherwise clean), which is why this shows up as "array-shaped ... but no
+distinct stride operand", not a length failure. The real touched region
+genuinely does start at offset 0 (`x[0]` is read, just outside the loop),
+so a sound fix exists in principle — recognizing that the address
+recurrence's true start is the pre-loop read, not the recurrence's own
+first value — but nothing in the analyzer currently proves it. A checked,
+signature-validated `contracts` entry (CONFIG.md) is the supported way to
+cover this family today, rather than adding a recognizer for one
+library's peeled-prefix idiom.
 
 Not just `isamax_k`: this exact idiom is shared verbatim by all 8 kernel
 files in the family — `amax.c`, `amin.c`, `iamax.c`, `iamin.c`, `imax.c`,
@@ -111,9 +115,9 @@ reach the same bound -- an early version skipped this and accepted an
 unrelated second counter, undercounting; see `neg_unrelated_counter` in
 `tests/config/factored_bound_neg.c`), the length candidate resolves to an
 argument, and both the length and the stride are independently proven
-positive by the same dominating guard -- an unconditional exact proof
-(`Confidence::Proven`, no `--config` needed), not a pattern-matched
-guess. `cblas_sasum`/`sasum_`/`cblas_dasum`/`dasum_` marshal correctly
+positive by the same dominating guard -- an unconditional exact proof, no
+`--config` needed, not a pattern-matched guess.
+`cblas_sasum`/`sasum_`/`cblas_dasum`/`dasum_` marshal correctly
 today. `kernel/arm/sum.c` (`ssum_`/`dsum_`) has the
 identical rescaling but ALSO an extra SIMD-fast-path branch merging the
 address induction variable's start value from two different control-flow
@@ -183,7 +187,7 @@ non-negative. Marshalling the wrapper (not the kernel) with a stride of
 only knows how to read an argument's raw value or one pointer dereference
 (`ExtentSource::Value`/`PointeeI32`); there's no "absolute value of an
 argument" source. Closing this needs a schema addition on *both* sides
-(marshal-infer's `ExtentOperand`/`Confidence` machinery, and the runtime's
+(marshal-infer's `ExtentOperand`, and the runtime's
 `lind_extent_operand`/`_lind_eval_extent_operand`), not a marshal-infer-only
 change -- coordinate with whoever owns the runtime marshalling code before
 attempting it.
@@ -213,10 +217,12 @@ counter and address accumulators, unit step, zero start). But OpenBLAS's
 real `-O2` release build unrolls it by 4 with a remainder tail, rewriting
 the exit test into `i == (n & mask)`. For a *signed* counter, LLVM emits
 the mask as a sign-bit-cleared positive constant (`n & 2147483644`, not
-the simpler `n & -4`), which the exclusivity checker doesn't recognize.
+the simpler `n & -4`), which no longer resembles the loop's original
+source-level exit condition at all.
 
-**Status: solved, but not by widening the pattern match.** marshal-infer
-analyzes a dedicated `-O1`, no-unroll/no-vectorize build of the library
-instead of matching the real release flags — the loop's semantics are
-unaffected by optimization level, so this is sound, and it recovers this
-function (and the ~20 others like it) as `proven`, no heuristic needed.
+**Status: solved, but not by widening a pattern match against the
+unrolled form.** marshal-infer analyzes a dedicated `-O1`, no-unroll/
+no-vectorize build of the library instead of matching the real release
+flags — the loop's semantics are unaffected by optimization level, so
+this is sound, and it recovers this function (and the ~20 others like it)
+as a direct, unconditional proof.
