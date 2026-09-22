@@ -50,9 +50,65 @@ enum class SizeKind {
   FromArgPointee,// *(*lenptr) — length read through another pointer arg
   Cstr,          // NUL-terminated
   PtrArray,      // NULL-terminated array of pointers (argv/envp); pointee = element
+  // Strided vector: bytes = (1 + (n-1)*stride) * constSize, where n and
+  // stride each independently come from sizeOperand/strideOperand -- either
+  // read from a caller argument at dispatch time (BLAS-style, e.g. `incx`;
+  // neither knowable statically) or a compile-time constant baked into the
+  // spec (an ordinary `x[i]` loop with no separate increment argument at
+  // all). Mirrors lind_marshal.h's LIND_SIZE_STRIDE_VECTOR exactly; see its
+  // doc comment there for the n<=0 / negative-stride edge cases (an
+  // argument-sourced negative stride aborts the whole grate at dispatch
+  // time -- a deliberate runtime-side choice, not something inference can
+  // avoid by not emitting this kind for a function that might see a
+  // negative stride at some call site; a constant-sourced stride is always
+  // proven positive before inference ever emits it).
+  StrideVector,
   Unknown,       // could not size — residue
 };
 const char *sizeKindName(SizeKind s);
+
+// How a StrideVector extent operand's raw wasm value is obtained. A scalar
+// may be passed BY VALUE (CBLAS: `int n`) or BY REFERENCE (classic Fortran
+// BLAS: `int *N`, unpacked as `n = *N` at function entry) -- the runtime
+// needs, per operand, whether the raw argument slot IS the number or points
+// to it. A third source, Constant, has no argument behind it at all: a
+// genuine compile-time-constant element count (most commonly a stride of 1
+// for an ordinary `x[i]` loop with no separate increment parameter --
+// proven directly from the loop's own IR, see unwrapConstantStride in
+// Infer.cpp). Mirrors lind_marshal.h's lind_extent_source.
+enum class ExtentSource { Value, PointeeI32, Constant };
+const char *extentSourceName(ExtentSource s);
+
+// One runtime extent operand (a StrideVector length or stride): either
+// which top-level argument and how to read it (Value/PointeeI32 -- argIndex
+// meaningful, argIndex<0 means "not found"), or a value fixed at analysis
+// time with no argument behind it (Constant -- constValue meaningful,
+// argIndex unused). Mirrors lind_marshal.h's lind_extent_operand.
+struct ExtentOperand {
+  int argIndex = -1;
+  ExtentSource source = ExtentSource::Value;
+  uint64_t constValue = 0; // meaningful only when source == Constant
+  bool valid() const {
+    return source == ExtentSource::Constant ? constValue > 0 : argIndex >= 0;
+  }
+};
+
+// How a StrideVector decision was reached.
+//   Proven     — the length AND the address induction variable's zero start
+//                were both proven exactly by static analysis (an exact
+//                ScalarEvolution trip-count proof, or
+//                detectFactoredStrideTripCount's decomposition -- see
+//                Infer.cpp); runtime memory safety follows from that proof.
+//   Configured — a checked-in config file's "contracts" entry (Config.h)
+//                asserted this argument's extent: a human verified it,
+//                presumably because static analysis couldn't. Validated
+//                against the target function's real signature before it is
+//                ever applied (see validateContractAgainstSignature).
+// There is no third, unproven-and-unasserted level: a pairing this tool
+// cannot prove and no contract asserts fails closed (force_local) instead
+// of being accepted at reduced confidence.
+enum class Confidence { Proven, Configured };
+const char *confidenceName(Confidence c);
 
 // What the return value is / how it must be translated.
 enum class RetKind {
@@ -101,8 +157,21 @@ struct TreeNode {
   // For Pointer nodes: how the referenced region is sized.
   SizeKind sizeKind = SizeKind::NA;
   int sizeArgIndex = -1;   // FromArg/FromArgPointee: which arg (top-level) or
-                           // sibling field index (struct context) holds the size
-  uint64_t constSize = 0;  // Const: byte count
+                           // sibling field index (struct context) holds the
+                           // element count. Unused for StrideVector -- see
+                           // sizeOperand below.
+  // StrideVector only: the length (element count) and per-element stride
+  // operands, each independently carrying how its raw value is obtained
+  // (direct vs. loaded through a pointer argument -- see ExtentOperand).
+  ExtentOperand sizeOperand;
+  ExtentOperand strideOperand;
+  uint64_t constSize = 0;  // Const: byte count. StrideVector: per-element byte size.
+  // How this StrideVector decision was reached -- Proven unless a checked-in
+  // config's contract asserted it (Configured). Emitted in the output JSON
+  // as "confidence" only for StrideVector nodes; every other sizeKind's
+  // decision has exactly one way to be reached, so the field stays at the
+  // default and is not emitted. See Confidence's own comment.
+  Confidence confidence = Confidence::Proven;
 
   // For Pointer nodes: this pointer is an opaque handle (translate via token
   // table, never deep-copy the pointee). E.g. FILE*, z_stream's state, toy_ctx.

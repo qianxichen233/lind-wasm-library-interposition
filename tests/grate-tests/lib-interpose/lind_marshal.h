@@ -113,6 +113,46 @@ enum lind_size_kind {
     LIND_SIZE_FROM_ARG_POINTEE  = 3,  // *(uint32_t at raw_args[i]) — two-pass, read from source cage
     LIND_SIZE_CSTR              = 4,  // scan for '\0', capped at LIND_MARSHAL_CSTR_CAP
     LIND_SIZE_PTR_ARRAY         = 5,  // NULL-terminated array of pointers (argv); `element` describes each
+    // Strided vector: bytes = (1 + (n-1)*stride) * const_size, where n and
+    // stride are each evaluated per their own lind_extent_operand (a direct
+    // argument value, a value loaded through a pointer argument, or a
+    // compile-time constant baked into the spec itself -- see that struct's
+    // doc), and const_size is the element size. n<=0 sizes to 0 (an empty
+    // vector, not an error); a negative stride is rejected (fail closed)
+    // rather than mishandled -- see _lind_compute_size's doc for both.
+    // Plain n*const_size (LIND_SIZE_FROM_ARG) undercounts any call whose
+    // stride isn't 1: only every stride'th element is itself touched, but
+    // the elements in between are still part of the buffer the real
+    // function may read or write. A plain contiguous walk (stride==1, the
+    // common case for an ordinary `x[i]` loop with no separate increment
+    // argument at all) still goes through this same kind, with its stride
+    // operand sourced as LIND_EXTENT_CONSTANT rather than read from an
+    // argument.
+    LIND_SIZE_STRIDE_VECTOR     = 6,
+};
+
+// One scalar input to a size computation (currently: LIND_SIZE_STRIDE_VECTOR's
+// n and stride): the argument's own value, an i32 loaded through the
+// pointer at that argument via the checked cross-cage copy path (for
+// calling conventions that pass scalars by reference, e.g. Fortran's,
+// where a length or stride argument is a pointer to the value, not the
+// value itself), or a value baked into the spec at generation time with no
+// argument behind it at all (a genuine compile-time-constant stride, e.g.
+// an ordinary `x[i]` loop with no separate increment parameter). `source`
+// is intentionally its own dimension, independent of arg_index, so a new
+// load shape (a different width, or a different byte layout) extends this
+// enum without touching the spec field that names which argument the
+// value comes from.
+enum lind_extent_source {
+    LIND_EXTENT_VALUE       = 0,  // raw_args[arg_index] is the value
+    LIND_EXTENT_POINTEE_I32 = 1,  // raw_args[arg_index] is a pointer to it
+    LIND_EXTENT_CONSTANT    = 2,  // const_value IS the value; arg_index unused
+};
+
+struct lind_extent_operand {
+    uint32_t                 arg_index;   // meaningful for VALUE/POINTEE_I32 only
+    enum lind_extent_source  source;
+    uint32_t                 const_value; // meaningful for CONSTANT only
 };
 
 enum lind_return_kind {
@@ -149,6 +189,11 @@ struct lind_arg_spec {
     enum lind_size_kind     size_kind;
     uint64_t                const_size;
     uint32_t                size_arg_index;  // arg index (top) or sibling field index (struct)
+    // LIND_SIZE_STRIDE_VECTOR only: the count (n) and stride operands.
+    // Independent of size_arg_index above (which LIND_SIZE_FROM_ARG and
+    // LIND_SIZE_FROM_ARG_POINTEE keep their own, unrelated meaning for).
+    struct lind_extent_operand size_operand;
+    struct lind_extent_operand stride_operand;
     struct lind_layout     *layout;          // NULL = flat buffer; non-NULL = structured pointee
     // PTR_ARRAY: describes each element of a NULL-terminated pointer array (argv).
     struct lind_arg_spec   *element;
@@ -523,6 +568,51 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
 // must not turn into an out-of-bounds read of this array -- fail closed.
 #define LIND_RAW_ARGS_MAX 6
 
+// Evaluates one lind_extent_operand: the argument's own value, an i32
+// loaded through a pointer argument via the checked cross-cage copy path
+// (see lind_extent_operand's doc for why a by-reference source exists), or
+// a value baked into the spec itself with no argument lookup at all. The
+// pointee case validates the argument index, rejects a NULL pointer, and
+// reads through _lind_copy_or_abort exactly like any other pointer-typed
+// argument -- provenance and range checking come from that existing
+// mechanism, not from anything new here. The constant case never touches
+// raw_args, since it has no argument to read: checked and range-limited
+// at generation time (gen_grate.py), not here.
+static inline int32_t _lind_eval_extent_operand(
+    const struct lind_extent_operand *op,
+    const uint64_t *raw_args,
+    uint64_t source_cage, uint64_t grate_cage,
+    const char *reason)
+{
+    if (op->source == LIND_EXTENT_CONSTANT)
+        return (int32_t)op->const_value;
+
+    if (op->arg_index >= LIND_RAW_ARGS_MAX)
+        _lind_marshal_abort(reason);
+    uint64_t raw = raw_args[op->arg_index];
+    switch (op->source) {
+        case LIND_EXTENT_VALUE:
+            return (int32_t)(uint32_t)raw;
+
+        case LIND_EXTENT_POINTEE_I32: {
+            if (raw == 0)
+                _lind_marshal_abort(reason);
+            if (raw > (uint64_t)UINT32_MAX)
+                _lind_marshal_abort(reason);
+            uint32_t val = 0;
+            _lind_copy_or_abort(grate_cage, source_cage,
+                raw, source_cage,
+                (uint64_t)(uintptr_t)&val, grate_cage,
+                sizeof(uint32_t), 0);
+            return (int32_t)val;
+        }
+
+        default:
+            _lind_marshal_abort(reason);
+            return 0; // unreachable (abort traps)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compute size for a top-level PTR arg from the raw_args array.
 //
@@ -561,6 +651,60 @@ static inline size_t _lind_compute_size(
         case LIND_SIZE_CSTR:
             // Caller must handle CSTR separately (needs src_ptr).
             return 0;
+
+        case LIND_SIZE_STRIDE_VECTOR: {
+            // For a non-negative stride, the pointee spans elements at
+            // 0, stride, 2*stride, ..., (n-1)*stride from the passed
+            // pointer -- byte footprint (1 + (n-1)*stride) * elem_size, not
+            // n*elem_size (which only holds for the contiguous stride==1
+            // case and silently undersizes every other call, corrupting
+            // whichever elements fall between the touched ones).
+            //
+            // A negative stride walks the vector backwards, which shifts
+            // the touched span to BEFORE the passed pointer, not after it
+            // -- shadow allocation here, like every other pointer arg,
+            // always treats the passed address as the start of the copied
+            // region. Handling a negative stride correctly would mean
+            // copying from (and translating pointers relative to) an
+            // address computed behind the one the callee passed, which no
+            // other lind_arg_spec kind does and this one doesn't attempt:
+            // fail closed rather than copy the wrong bytes or expose an
+            // address outside the real buffer. Left for whichever future
+            // change actually needs it.
+            int32_t n = _lind_eval_extent_operand(
+                &as->size_operand, raw_args, source_cage, grate_cage,
+                "strided vector: invalid count operand");
+            // n<=0 sizes to 0 (nothing touched), not an error.
+            if (n <= 0)
+                return 0;
+            int32_t stride = _lind_eval_extent_operand(
+                &as->stride_operand, raw_args, source_cage, grate_cage,
+                "strided vector: invalid stride operand");
+            if (stride < 0)
+                _lind_marshal_abort("strided vector: negative stride not supported");
+
+            uint64_t ustride = (uint64_t)stride;
+            uint64_t elem_size = as->const_size;
+            uint64_t n_minus_1 = (uint64_t)(n - 1);
+            if (ustride != 0 && n_minus_1 > (uint64_t)-1 / ustride)
+                _lind_marshal_abort("strided vector size overflow");
+            uint64_t span = n_minus_1 * ustride;
+            if (span > (uint64_t)-1 - 1)
+                _lind_marshal_abort("strided vector size overflow");
+            span += 1;
+            if (elem_size != 0 && span > (uint64_t)-1 / elem_size)
+                _lind_marshal_abort("strided vector size overflow");
+            uint64_t total = span * elem_size;
+            // The 64-bit computation above can succeed while still being
+            // too large for size_t on this port's real target: the grate
+            // is wasm32, where size_t is 32 bits, so a value that fits in
+            // uint64_t can still silently truncate on the cast below (e.g.
+            // 4294967304 truncates to 8) unless checked against the
+            // narrower type first.
+            if (total > (uint64_t)(size_t)-1)
+                _lind_marshal_abort("strided vector size overflow");
+            return (size_t)total;
+        }
 
         default:
             return 0;
@@ -604,6 +748,7 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
         case LIND_SIZE_CONST:
         case LIND_SIZE_FROM_ARG:
         case LIND_SIZE_FROM_ARG_POINTEE:
+        case LIND_SIZE_STRIDE_VECTOR:
             size = _lind_compute_size(as, raw_or_sibling, source_cage, grate_cage);
             break;
         default:

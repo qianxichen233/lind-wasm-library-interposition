@@ -31,6 +31,8 @@ tests/grate-tests/lib-interpose/full-libm/generated/
 **/*.marshal.json
 /tests/playground/
 /tests/grate-tests/lib-interpose/full-*/*_full_grate.c
+/tests/grate-tests/lib-interpose/auto-openblas-daxpy/openblas_daxpy_auto_grate.c
+/tests/grate-tests/lib-interpose/auto-conststride/conststride_auto_grate.c
 
 # Local library-interposition research and working notes
 /impl-log.md
@@ -39,6 +41,7 @@ tests/grate-tests/lib-interpose/full-libm/generated/
 /tests/grate-tests/lib-interpose/*.md
 /tools/marshal-infer/README.md
 /tools/marshal-infer/example/README.md
+/tools/marshal-infer/PATTERNS.md
 /.codex/
 /AGENTS.md
 

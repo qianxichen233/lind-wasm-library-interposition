@@ -68,6 +68,33 @@ fi
 cp "$SCRIPT_DIR/custom-lib/libtoy.so" "$LINDFS/lib/libtoy.so"
 echo ""
 
+# auto-openblas-daxpy/libblastoy.c is the preloaded fixture library for the
+# auto-openblas-daxpy test below (real OpenBLAS symbol names/ABI shapes, see
+# that test's own comment for why).
+echo "Building shared fixture: libblastoy.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-openblas-daxpy/libblastoy.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-openblas-daxpy/libblastoy.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-openblas-daxpy/libblastoy.so" "$LINDFS/lib/libblastoy.so"
+echo ""
+
+# auto-conststride/libconststride.c is the preloaded fixture library for the
+# auto-conststride test below (constant-sourced StrideVector extent
+# operands -- an ordinary contiguous `x[i]` walk with no increment
+# argument at all).
+echo "Building shared fixture: libconststride.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-conststride/libconststride.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-conststride/libconststride.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-conststride/libconststride.so" "$LINDFS/lib/libconststride.so"
+echo ""
+
 PASS=0
 FAIL=0
 SKIP=0
@@ -255,6 +282,102 @@ echo ""
 echo "Running lib3i-portal-signature-check (issue #13)..."
 if ! (cd "$REPO_ROOT/src/wasmtime" && cargo run --quiet -p lib3i-portal-signature-check); then
     echo "FATAL: lib3i-portal-signature-check failed (see above)" >&2
+    exit 1
+fi
+echo ""
+
+# Pre-flight: no config/profile knob can weaken lind_marshal.h's own runtime
+# checks (issue #26/#27 follow-up, item 8) -- confidence/policy/heuristic/
+# contract are purely inference-time bookkeeping (see CONFIG.md) that never
+# reaches the runtime spec gen_grate.py emits; this pins that by construction
+# instead of trusting it to stay true. A hit here means something started
+# threading config-derived trust into a runtime check, which must not happen.
+echo "Checking lind_marshal.h has no config/confidence-conditional runtime check..."
+if grep -Eqi '\b(confidence|policy|relaxed|heuristics?|contracts)\b' "$SCRIPT_DIR/lind_marshal.h"; then
+    echo "FATAL: lind_marshal.h references a config/confidence concept -- a profile" >&2
+    echo "must never be able to weaken overflow/pointer-provenance/arena/ABI-width/" >&2
+    echo "copy-back validation (issue #26/#27 item 8)" >&2
+    exit 1
+fi
+echo ""
+
+# Pre-flight: OpenBLAS coverage/required-symbol gate and, from it, the
+# auto-openblas-daxpy grate itself (issue #26/#27 follow-up). Both need a
+# real openblas.marshal.json (tools/marshal-infer/infer_openblas.sh, which
+# needs a sibling lind-wasm-apps/openblas checkout) -- gitignored, so this
+# skips (not fails) the whole run when it's absent, same as the LIBZ_A check.
+OPENBLAS_JSON="$REPO_ROOT/openblas.marshal.json"
+OPENBLAS_DAXPY_GEN_OK="no"
+if [[ -f "$OPENBLAS_JSON" ]]; then
+    echo "Running OpenBLAS coverage/required-symbol gate..."
+    if ! python3 "$REPO_ROOT/tools/marshal-infer/openblas_coverage.py" "$OPENBLAS_JSON"; then
+        echo "FATAL: OpenBLAS coverage/required-symbol gate failed (see above)" >&2
+        exit 1
+    fi
+    echo ""
+
+    # Regenerates straight from the LIVE openblas.marshal.json every run --
+    # same "nothing here trusts a locally-built artifact" reasoning as every
+    # cage/grate above, one level up: this is what actually proves TODAY's
+    # inference+config output produces a runnable handler for these two
+    # required symbols (item 6), not a frozen fixture that could go stale
+    # the moment inference's output shape changes under it.
+    echo "Generating auto-openblas-daxpy/openblas_daxpy_auto_grate.c from $(basename "$OPENBLAS_JSON")"
+    if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_grate.py" "$OPENBLAS_JSON" \
+            --lib-name libblastoy --only cblas_daxpy,daxpy_ \
+            --out "$SCRIPT_DIR/auto-openblas-daxpy/openblas_daxpy_auto_grate.c" \
+            > /tmp/lib-interpose-gen-openblas.log 2>&1; then
+        echo "FATAL: gen_grate.py failed to generate cblas_daxpy/daxpy_ handlers:" >&2
+        cat /tmp/lib-interpose-gen-openblas.log >&2
+        exit 1
+    fi
+    gen_missing=()
+    for sym in cblas_daxpy daxpy_; do
+        grep -q "\"$sym\"" "$SCRIPT_DIR/auto-openblas-daxpy/openblas_daxpy_auto_grate.c" \
+            || gen_missing+=("$sym")
+    done
+    if [[ ${#gen_missing[@]} -gt 0 ]]; then
+        echo "FATAL: generated grate is missing required symbol(s): ${gen_missing[*]}" >&2
+        exit 1
+    fi
+    OPENBLAS_DAXPY_GEN_OK="yes"
+    echo ""
+else
+    echo "Skipping OpenBLAS coverage gate and auto-openblas-daxpy generation:" \
+         "$OPENBLAS_JSON not found (run tools/marshal-infer/infer_openblas.sh first)"
+    echo ""
+fi
+
+# Regenerates straight from a fresh inference run over libconststride.c
+# every run -- same "nothing here trusts a locally-built artifact"
+# reasoning as auto-openblas-daxpy above, one level up: this proves TODAY's
+# inference+generation output produces a runnable handler for a
+# constant-sourced StrideVector extent operand, not a frozen fixture that
+# could go stale the moment that output shape changes under it. No
+# gitignored external checkout needed (unlike OpenBLAS), so this always runs.
+echo "Generating auto-conststride/conststride_auto_grate.c from libconststride.c"
+if ! ( cd "$SCRIPT_DIR/auto-conststride" && "$LIND_COMPILE" --emit-marshal libconststride.c ) \
+        > /tmp/lib-interpose-gen-conststride.log 2>&1; then
+    echo "FATAL: lind_compile --emit-marshal failed for libconststride.c:" >&2
+    cat /tmp/lib-interpose-gen-conststride.log >&2
+    exit 1
+fi
+if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_grate.py" \
+        "$SCRIPT_DIR/auto-conststride/libconststride.marshal.json" \
+        --lib-name libconststride \
+        --out "$SCRIPT_DIR/auto-conststride/conststride_auto_grate.c" \
+        > /tmp/lib-interpose-gen-conststride2.log 2>&1; then
+    echo "FATAL: gen_grate.py failed to generate toy_vec_scale handler:" >&2
+    cat /tmp/lib-interpose-gen-conststride2.log >&2
+    exit 1
+fi
+if ! grep -q '"toy_vec_scale"' "$SCRIPT_DIR/auto-conststride/conststride_auto_grate.c"; then
+    echo "FATAL: generated grate is missing toy_vec_scale" >&2
+    exit 1
+fi
+if ! grep -q 'LIND_EXTENT_CONSTANT' "$SCRIPT_DIR/auto-conststride/conststride_auto_grate.c"; then
+    echo "FATAL: generated grate's toy_vec_scale handler does not use a" \
+         "constant-sourced extent operand -- inference regressed" >&2
     exit 1
 fi
 echo ""
@@ -699,6 +822,62 @@ run_test "fail-closed-provenance-stream" \
        "[Grate|provenance] toy_stream_process handler ran, mode=5" \
        "[Grate|provenance] toy_stream_process handler ran, mode=6"
 
+# fail-closed-stridevec-*: LIND_SIZE_STRIDE_VECTOR and lind_extent_operand
+# (issue #26 review). See stridevec_grate.c/stridevec_cage.c for what each
+# mode targets and why. Acceptance modes assert the real handler ran
+# (evidence a genuine dispatch happened, not a lucky coincidence);
+# rejection modes forbid it (LIND_GRATE_ERR alone doesn't prove the real
+# handler never executed).
+for mode_desc in \
+    "basic:toy_daxpy" \
+    "zero:toy_daxpy" \
+    "zerostride:toy_daxpy" \
+    "pointee:toy_daxpy_ref" \
+    "mixed:toy_daxpy_mixed"
+do
+    mode="${mode_desc%%:*}"
+    fn="${mode_desc#*:}"
+    GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+    run_test "fail-closed-stridevec-$mode" \
+        "fail-closed/stridevec_cage.c" \
+        "fail-closed/stridevec_grate.c" \
+        "env=/lib/libtoy.so" "yes" \
+        "/stridevec_cage.cwasm" "$mode" \
+        -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: $mode" \
+        -- "[Grate|stridevec] $fn handler ran"
+done
+
+for mode_desc in \
+    "negstride:toy_daxpy" \
+    "overflow:toy_daxpy" \
+    "narrow:toy_daxpy" \
+    "arenaexhaust:toy_daxpy" \
+    "nullpointee:toy_daxpy_ref" \
+    "wrongptr:toy_daxpy_ref"
+do
+    mode="${mode_desc%%:*}"
+    fn="${mode_desc#*:}"
+    GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+    run_test "fail-closed-stridevec-$mode" \
+        "fail-closed/stridevec_cage.c" \
+        "fail-closed/stridevec_grate.c" \
+        "env=/lib/libtoy.so" "yes" \
+        "/stridevec_cage.cwasm" "$mode" \
+        -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: $mode" \
+        -- \
+        -- "[Grate|stridevec] $fn handler ran"
+done
+
+GRATE_EXTRA=("$SCRIPT_DIR/custom-lib/libtoy.c")
+run_test "fail-closed-stridevec-badindex" \
+    "fail-closed/stridevec_cage.c" \
+    "fail-closed/stridevec_grate.c" \
+    "env=/lib/libtoy.so" "yes" \
+    "/stridevec_cage.cwasm" "badindex" \
+    -- "[Grate|stridevec] registered 4/4 handlers" "[Cage|stridevec] PASS: badindex" \
+    -- \
+    -- "[Grate|stridevec] toy_daxpy_badindex handler ran (should not happen)"
+
 DECLARED_TESTS+=("fail-closed")
 
 # --------------------------------------------------------------------------
@@ -720,6 +899,52 @@ run_test "fail-registration" \
        "[Grate|fail-registration] registered 1/2 handlers" \
        "[Grate|fail-registration] FATAL: 1 handler registration(s) failed, aborting startup" \
     --
+
+# --------------------------------------------------------------------------
+# auto-openblas-daxpy: cblas_daxpy/daxpy_ handlers generated by gen_grate.py
+# straight from the live openblas.marshal.json (issue #26/#27 follow-up,
+# items 6-7) -- proves a REAL, contract-backed StrideVector inference record
+# is actually usable through generation (gen_grate.py) and execution (a real
+# compiled-and-run grate), not just through the hand-written specs
+# fail-closed/stridevec_grate.c uses to isolate the evaluator. Multiple
+# elements and non-unit strides on both arrays (see daxpy_cage.c). Strict-safe:
+# the cage calls only cblas_daxpy/daxpy_ from libblastoy.
+# --------------------------------------------------------------------------
+if [[ "$OPENBLAS_DAXPY_GEN_OK" == "yes" ]]; then
+    GRATE_EXTRA=("$SCRIPT_DIR/auto-openblas-daxpy/libblastoy.c")
+    run_test "auto-openblas-daxpy" \
+        "auto-openblas-daxpy/daxpy_cage.c" \
+        "auto-openblas-daxpy/openblas_daxpy_auto_grate.c" \
+        "env=/lib/libblastoy.so" "yes" \
+        "/daxpy_cage.cwasm" \
+        -- "[libblastoy-grate] registered 2/2 handlers" \
+           "[Cage|openblas-daxpy] PASS: cblas_daxpy" "[Cage|openblas-daxpy] PASS: daxpy_" \
+        -- "[libblastoy] cblas_daxpy handler ran n=5 incx=2 incy=3" \
+           "[libblastoy] daxpy_ handler ran n=5 incx=2 incy=3"
+else
+    DECLARED_TESTS+=("auto-openblas-daxpy")
+    skip_test "auto-openblas-daxpy" "$OPENBLAS_JSON not found (run tools/marshal-infer/infer_openblas.sh first)"
+fi
+
+# --------------------------------------------------------------------------
+# auto-conststride: toy_vec_scale handler generated by gen_grate.py from a
+# fresh inference run, exercising a constant-sourced StrideVector extent
+# operand (ExtentSource::Constant/LIND_EXTENT_CONSTANT) end to end -- an
+# ordinary contiguous `x[i]` walk with no separate increment argument at
+# all, proven directly from the loop's own IR. Multiple elements (n=5) are
+# required: n==1 can't distinguish a correct constant-stride extent
+# computation spanning all n elements from an accidental single-element
+# copy. Strict-safe: the cage calls only toy_vec_scale from libconststride.
+# --------------------------------------------------------------------------
+GRATE_EXTRA=("$SCRIPT_DIR/auto-conststride/libconststride.c")
+run_test "auto-conststride" \
+    "auto-conststride/conststride_cage.c" \
+    "auto-conststride/conststride_auto_grate.c" \
+    "env=/lib/libconststride.so" "yes" \
+    "/conststride_cage.cwasm" \
+    -- "[libconststride-grate] registered 1/1 handlers" \
+       "[Cage|conststride] PASS: toy_vec_scale" \
+    -- "[libconststride] toy_vec_scale handler ran n=5"
 
 # --------------------------------------------------------------------------
 # Completeness check: every directory with a *_grate.c must be declared

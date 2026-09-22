@@ -13,7 +13,7 @@ message(STATUS "marshal-infer: using ${LLVM_CONFIG}")
 
 execute_process(COMMAND ${LLVM_CONFIG} --includedir
   OUTPUT_VARIABLE LLVM_INCLUDE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND ${LLVM_CONFIG} --link-static --libs core irreader support
+execute_process(COMMAND ${LLVM_CONFIG} --link-static --libs core irreader support analysis
   OUTPUT_VARIABLE LLVM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND ${LLVM_CONFIG} --link-static --system-libs
   OUTPUT_VARIABLE LLVM_SYSTEM_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -45,6 +45,7 @@ add_executable(marshal-infer
   src/ParamTree.cpp
   src/Infer.cpp
   src/Annotations.cpp
+  src/Config.cpp
 )
 target_include_directories(marshal-infer PRIVATE
   ${LLVM_INCLUDE_DIR}

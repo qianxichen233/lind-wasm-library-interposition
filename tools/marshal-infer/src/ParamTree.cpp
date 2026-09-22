@@ -39,9 +39,27 @@ const char *sizeKindName(SizeKind s) {
   case SizeKind::FromArgPointee: return "from_arg_pointee";
   case SizeKind::Cstr:           return "cstr";
   case SizeKind::PtrArray:       return "ptr_array";
+  case SizeKind::StrideVector:   return "stride_vector";
   case SizeKind::Unknown:        return "unknown";
   }
   return "unknown";
+}
+
+const char *extentSourceName(ExtentSource s) {
+  switch (s) {
+  case ExtentSource::Value:      return "value";
+  case ExtentSource::PointeeI32: return "pointee_i32";
+  case ExtentSource::Constant:   return "constant";
+  }
+  return "value";
+}
+
+const char *confidenceName(Confidence c) {
+  switch (c) {
+  case Confidence::Proven:     return "proven";
+  case Confidence::Configured: return "configured";
+  }
+  return "proven";
 }
 
 const char *retKindName(RetKind r) {
