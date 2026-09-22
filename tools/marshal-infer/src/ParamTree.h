@@ -50,14 +50,18 @@ enum class SizeKind {
   FromArgPointee,// *(*lenptr) — length read through another pointer arg
   Cstr,          // NUL-terminated
   PtrArray,      // NULL-terminated array of pointers (argv/envp); pointee = element
-  // BLAS-style strided vector: bytes = (1 + (n-1)*stride) * constSize, where
-  // n = arg[sizeArgIndex], stride = arg[strideArgIndex] (both read as signed
-  // at dispatch time -- neither is knowable statically), constSize = element
-  // size. Mirrors lind_marshal.h's LIND_SIZE_STRIDE_VECTOR exactly; see its
-  // doc comment there for the n<=0 / negative-stride edge cases (the latter
-  // aborts the whole grate at dispatch time -- a deliberate runtime-side
-  // choice, not something inference can avoid by not emitting this kind for
-  // a function that might see a negative stride at some call site).
+  // Strided vector: bytes = (1 + (n-1)*stride) * constSize, where n and
+  // stride each independently come from sizeOperand/strideOperand -- either
+  // read from a caller argument at dispatch time (BLAS-style, e.g. `incx`;
+  // neither knowable statically) or a compile-time constant baked into the
+  // spec (an ordinary `x[i]` loop with no separate increment argument at
+  // all). Mirrors lind_marshal.h's LIND_SIZE_STRIDE_VECTOR exactly; see its
+  // doc comment there for the n<=0 / negative-stride edge cases (an
+  // argument-sourced negative stride aborts the whole grate at dispatch
+  // time -- a deliberate runtime-side choice, not something inference can
+  // avoid by not emitting this kind for a function that might see a
+  // negative stride at some call site; a constant-sourced stride is always
+  // proven positive before inference ever emits it).
   StrideVector,
   Unknown,       // could not size — residue
 };
@@ -67,17 +71,26 @@ const char *sizeKindName(SizeKind s);
 // may be passed BY VALUE (CBLAS: `int n`) or BY REFERENCE (classic Fortran
 // BLAS: `int *N`, unpacked as `n = *N` at function entry) -- the runtime
 // needs, per operand, whether the raw argument slot IS the number or points
-// to it. Mirrors lind_marshal.h's lind_extent_source.
-enum class ExtentSource { Value, PointeeI32 };
+// to it. A third source, Constant, has no argument behind it at all: a
+// genuine compile-time-constant element count (most commonly a stride of 1
+// for an ordinary `x[i]` loop with no separate increment parameter --
+// proven directly from the loop's own IR, see unwrapConstantStride in
+// Infer.cpp). Mirrors lind_marshal.h's lind_extent_source.
+enum class ExtentSource { Value, PointeeI32, Constant };
 const char *extentSourceName(ExtentSource s);
 
-// One runtime extent operand (a StrideVector length or stride): which
-// top-level argument, and how to read it. argIndex<0 means "not found".
-// Mirrors lind_marshal.h's lind_extent_operand.
+// One runtime extent operand (a StrideVector length or stride): either
+// which top-level argument and how to read it (Value/PointeeI32 -- argIndex
+// meaningful, argIndex<0 means "not found"), or a value fixed at analysis
+// time with no argument behind it (Constant -- constValue meaningful,
+// argIndex unused). Mirrors lind_marshal.h's lind_extent_operand.
 struct ExtentOperand {
   int argIndex = -1;
   ExtentSource source = ExtentSource::Value;
-  bool valid() const { return argIndex >= 0; }
+  uint64_t constValue = 0; // meaningful only when source == Constant
+  bool valid() const {
+    return source == ExtentSource::Constant ? constValue > 0 : argIndex >= 0;
+  }
 };
 
 // How a StrideVector decision was reached.

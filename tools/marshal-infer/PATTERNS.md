@@ -35,6 +35,20 @@ whichever one does *not* coincide with the independently-resolved stride
 (an argument can never legitimately be its own stride). `cblas_sscal`/
 `sscal_`/`cblas_dscal`/`dscal_` marshal correctly today.
 
+**A second, unrelated issue in the SAME kernel, found later:** the real
+body isn't one loop -- it's `if (dummy2 == 1) { while(j<n) {
+if(isfinite(x[i])) ...; ... } } else { while(j<n) { ...; ... } }`, an
+`isfinite`-checking loop and a plain loop in mutually exclusive branches,
+each its own separate GEP, both walking the identical `(n, inc_x)` range.
+Accepting the FIRST loop found while the second's GEP was still an
+unexplained access (see noOtherAccesses' own comment in Infer.cpp) would
+incorrectly reject this function even though the pairing is sound -- both
+branches prove the exact same extent.
+`collectAgreeingGeps` (Infer.cpp) closes this: any OTHER loop bound
+proving the IDENTICAL (length, stride) pair (exact `Value*` identity, not
+a heuristic match) is treated as redundant confirmation, not a
+contradiction.
+
 ## Peeled first iteration — `kernel/riscv64/{i,}{max,min,amax,amin}.c` — OpenBLAS
 *Category: StrideVector length/stride inference*
 
@@ -194,6 +208,53 @@ attempting it.
 
 **Status: unhandled, correctly declined rather than guessed at.**
 `cblas_snrm2`/`snrm2_`/`cblas_dnrm2`/`dnrm2_` stay `force_local`.
+
+## SIMD fast path with a different constant stride — `kernel/generic/dot.c` (`dsdot_k`/`sdsdot_k`) — OpenBLAS
+*Category: StrideVector length/stride inference*
+
+```c
+// kernel/generic/dot.c -- DSDOT_K/SDSDOT_K's own body (a DIFFERENT,
+// heavier source file than the plain sdot_k/ddot_k use -- see the trace
+// of the real build command, `-DDSDOT ../kernel/riscv64/../generic/dot.c`)
+double CNAME(BLASLONG n, FLOAT *x, BLASLONG inc_x, FLOAT *y, BLASLONG inc_y) {
+  BLASLONG i = 0;
+  if (n < 1) return dot;
+  if (inc_x == 1 && inc_y == 1) {
+    int n1 = n & -4;
+    for (; i < n1; i += 4) { dot += ...x[i..i+3]...; }  // unrolled by 4, stride 1
+    while (i < n) { dot += ...x[i]...; i++; }           // remainder, stride 1
+    return dot;
+  }
+  while (i < n) { dot += ...x[ix]...; ix += inc_x; iy += inc_y; i++; }  // general case
+  return dot;
+}
+```
+
+**Issue:** two GENUINELY DIFFERENT loop shapes in mutually exclusive
+branches, not the same extent proven twice (contrast the compound-guard
+entry above, where duplicate branches prove the IDENTICAL pairing). The
+`inc_x==1` fast path's unrolled-by-4 and remainder loops both walk with a
+literal CONSTANT stride of 1 (`ExtentSource::Constant`); the general
+path's loop walks with the ARGUMENT `inc_x`. Both are sound envelopes
+FOR THEIR OWN BRANCH (and, since the fast path only runs when `inc_x`
+really is 1, `(length=n, stride=inc_x)` evaluated at dispatch time would
+actually cover the fast path too) -- but `collectAgreeingGeps` (Infer.cpp)
+only merges two loop bounds when they prove the EXACT SAME Value*-identical
+stride, deliberately: recognizing "a constant 1 is compatible with an
+argument that happens to equal 1" would need a real symbolic-equivalence
+prover, not the exact-identity check this tool intentionally limits
+itself to (see that function's own comment on why nothing looser is
+attempted). The general path's otherwise-sound `(n, inc_x)` pairing is
+correctly held to the same all-access-correctness-blocker requirement as
+any other candidate, and the fast path's own GEPs are unexplained by it.
+
+**Status: unhandled, correctly declined rather than guessed at.**
+`dsdot_`/`sdsdot_`/`cblas_dsdot`/`cblas_sdsdot` stay `force_local`. Not a
+required symbol (only `{s,d}axpy`/`{s,d}scal}` are), so this does not fail
+the coverage gate. `sdot_`/`ddot_` (the plain, non-mixed-precision dot
+product) are unaffected -- they delegate to the much simpler
+`kernel/riscv64/dot.c`, a single loop with no fast path at all, and
+continue to marshal correctly.
 
 ## Signed counter unrolled at `-O2` — `kernel/riscv64/copy.c` (`dcopy_k`) — OpenBLAS
 *Category: StrideVector length/stride inference*

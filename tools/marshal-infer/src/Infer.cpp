@@ -26,7 +26,7 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 
 #include <algorithm>
-
+#include <optional>
 #include <string>
 
 using namespace llvm;
@@ -378,10 +378,13 @@ struct DelegateCall {
 // ELEMENT-count (and, separately, per-element stride) evidence from ONE
 // hand-written counted loop indexing a pointer -- e.g. a BLAS-style
 // `while(i<n){ y[iy]+=da*x[ix]; ix+=inc_x; ...}` walk: length=n, stride=
-// inc_x. `stride` is null when no argument governs the per-iteration step
-// (e.g. a genuine compile-time-constant stride, or simply not found) --
+// inc_x. `stride` is null when no argument governs the per-iteration step;
+// `constStride` covers the other common case instead -- a genuine
+// compile-time-constant step (most often 1, an ordinary `x[i]`/pointer-walk
+// loop with no separate increment parameter at all -- see
+// unwrapConstantStride). At most one of `stride`/`constStride` is ever set.
 // length alone is still meaningful (see its consumption in inferFunction)
-// even without a stride.
+// even without either.
 struct LoopBound {
   const Value *length = nullptr;
   // True iff `length` came from an actual proof -- either ScalarEvolution's
@@ -395,6 +398,49 @@ struct LoopBound {
   // its own, but never accepted as a full extent pairing.
   bool lengthProven = false;
   const Value *stride = nullptr;
+  std::optional<uint64_t> constStride;
+  // Which GEP this bound was computed from -- needed both to exclude this
+  // GEP's own (loop-varying, hence otherwise-"unresolved") entry from
+  // Access::staticAccesses' coverage check, and to re-derive the same Loop/
+  // DominatorTree later (a LoopBound outlives the analysis scope it was
+  // computed under).
+  const GetElementPtrInst *gep = nullptr;
+
+  // Peeled-first-iteration candidate (PATTERNS.md's "peeled first
+  // iteration" entry; OpenBLAS's isamax_k and 27 siblings). Populated ONLY
+  // when the address induction variable provably starts at EXACTLY the
+  // stride recorded here instead of 0 -- kept in wholly SEPARATE fields
+  // from `stride`/`constStride` above, never merged into them: a "starts
+  // at stride" address recurrence must NEVER be accepted as grounds for
+  // the ordinary (zero-start) pairing above, only for this one, which
+  // additionally requires the loop's own trip count to be EXACTLY
+  // peeledLengthArg-1 (a strictly stronger, separately-proven condition
+  // from the ordinary exact-trip-count proof) and a corroborating
+  // dominating offset-zero access elsewhere on the same pointer
+  // (Access::staticAccesses) before this candidate is ever promoted to a
+  // real extent -- see detectPeeledPrefixBound/corroboratePeeledPrefix.
+  const Value *peeledLengthArg = nullptr;
+  const Value *peeledStride = nullptr;
+  std::optional<uint64_t> peeledConstStride;
+};
+
+// One access to the pointee through a SINGLE, non-loop-recurring GEP, or a
+// direct dereference of the pointer itself (offset 0) -- e.g. x[0], x[3],
+// x[-1], *x. Recorded for EVERY such access analyzeAccess finds, in
+// addition to (not instead of) the specialized loopBounds/lengths sinks
+// above. Consumed by noOtherAccesses to verify an accepted (length,
+// stride) pairing accounts for EVERY access through the pointer, not just
+// whichever loop happened to resolve first (see
+// plan-openblas-max-family-inference.md's "all-access correctness
+// blocker": a proof that covers one access pattern is not automatically
+// sound for the whole pointer), and by corroboratePeeledPrefix to find the
+// peeled family's own offset-zero access.
+struct StaticAccess {
+  // nullopt = a dynamic/unresolved index that isn't part of any recognized
+  // loop either -- e.g. `x[m]` for some OTHER, unrelated argument `m`.
+  // Never guessed at; an unresolved entry always fails the coverage check.
+  std::optional<int64_t> offset;
+  const Instruction *inst = nullptr;
 };
 
 // Per-argument access summary, accumulated by walking derived pointers.
@@ -429,6 +475,9 @@ struct Access {
   // closed (force_local) when only length resolves.
   SmallVector<LoopBound, 2> loopBounds;
   SmallVector<DelegateCall, 2> delegateCalls;
+  // Every single-point (non-loop-recurring) access found through this
+  // pointer -- see StaticAccess's own comment.
+  SmallVector<StaticAccess, 4> staticAccesses;
 };
 
 // Classify the role of operand `opIdx` in a call to a known lib function.
@@ -507,6 +556,98 @@ const Value *unwrapArgumentSCEV(const SCEV *S) {
     return nullptr; // Mul, unresolved Add, or any other shape -- reject
   }
   return nullptr;
+}
+
+// Peel a per-iteration step SCEV down to a small positive compile-time
+// constant -- the OTHER common shape a stride takes, distinct from
+// unwrapArgumentSCEV's argument-derived one: a plain `x[i]` or pointer-walk
+// (`*p; p++`) loop, where nothing in the source names a separate increment
+// parameter at all, just a fixed per-iteration element count (usually 1;
+// `x[k*i]` for a fixed compile-time `k` also qualifies). Only a BARE
+// SCEVConstant qualifies -- unlike unwrapArgumentSCEV, no cast-peeling or
+// smax/umax-clamp unwrapping is needed or attempted here, since a literal
+// step is never produced through either of those shapes. Anything else
+// (an Add, a Mul by a non-constant, a value that depends on an argument at
+// all) is not PROVABLY a fixed number and must be rejected, not guessed --
+// this is the mirror image of unwrapArgumentSCEV's own "reject the rest"
+// discipline, applied to the constant case instead of the argument case.
+// A zero or negative step is rejected too: SCEV's own no-wrap flag on the
+// address recurrence already rules out a step of exactly 0 meaning
+// anything but "not actually incrementing" for a loop that visits more
+// than one element, and a negative constant step would need the same
+// backwards-walk handling LIND_SIZE_STRIDE_VECTOR's negative-stride check
+// already fails closed on for an argument-derived stride -- not attempted
+// here either, for the same reason.
+std::optional<uint64_t> unwrapConstantStride(const SCEV *S) {
+  auto *c = dyn_cast<SCEVConstant>(S);
+  if (!c)
+    return std::nullopt;
+  const APInt &v = c->getAPInt();
+  // Width-agnostic: an adversarial/pathological IR index type could be
+  // arbitrarily wide, and getSExtValue()-style conversions assert rather
+  // than fail gracefully outside a bounded width -- checking activeBits
+  // first keeps this fail-closed (reject, don't crash) instead of trusting
+  // the operand to already be a sane width.
+  if (v.isNegative() || v.isZero() || v.getActiveBits() > 32)
+    return std::nullopt;
+  return v.getZExtValue();
+}
+
+// unwrapConstantStride above reads an ELEMENT-count step directly off a
+// GEP's own INDEX operand (the `x[i]` shape). The other IR shape clang
+// produces for an identical source-level fixed-stride walk -- `*p; p++`,
+// with no array-index syntax at all -- puts the recurrence on the GEP's
+// POINTER operand instead (see loopBoundValues' own comment on where this
+// is used), and ScalarEvolution expresses THAT recurrence's step in BYTES,
+// not elements, since it's a pointer-typed SCEV. This is the one place in
+// the file that converts between the two units, kept narrowly scoped to a
+// compile-time-constant byte step -- an argument-derived byte step (a
+// pointer advanced by a runtime `inc_x` each iteration) is a SCEVMulExpr,
+// not a bare constant, and is correctly left unattempted here for the same
+// reason unwrapArgumentSCEV rejects a Mul outright: recovering "inc_x" back
+// out of "8*inc_x" would need a scale-factor concept this schema doesn't
+// have, not a guess. Fails closed (nullopt) on a non-exact division too --
+// a byte step that isn't a whole multiple of the element size cannot be a
+// clean per-element stride at all.
+std::optional<uint64_t> unwrapConstantByteStride(const SCEV *S, uint64_t elemSize) {
+  if (elemSize == 0)
+    return std::nullopt;
+  std::optional<uint64_t> bytes = unwrapConstantStride(S);
+  if (!bytes || *bytes % elemSize != 0)
+    return std::nullopt;
+  return *bytes / elemSize;
+}
+
+// Peels a trip-count SCEV down to a bare argument when it's EXACTLY
+// `argument - 1` -- the shape SE.getTripCountFromExitCount produces for a
+// loop whose counter starts at the constant 1 instead of 0 (PATTERNS.md's
+// "peeled first iteration" family: `i=1; while(i<n)` runs n-1 times, the
+// first element having been handled by hand before the loop). Unlike
+// unwrapArgumentSCEV (which requires the value to reduce to a BARE
+// argument, rejecting any Add outright), this recognizes that one
+// further-removed shape and only that one: a plain two-operand SCEVAddExpr
+// of a SCEVUnknown-rooted argument and the constant -1. Anything else
+// (more operands, no argument, a constant other than -1, ...) is rejected
+// -- fail closed rather than approximate.
+const Value *unwrapArgumentMinusOne(const SCEV *S) {
+  auto *add = dyn_cast<SCEVAddExpr>(S);
+  if (!add || add->getNumOperands() != 2)
+    return nullptr;
+  const SCEV *a = add->getOperand(0);
+  const SCEV *b = add->getOperand(1);
+  auto *c = dyn_cast<SCEVConstant>(a);
+  const SCEV *other = b;
+  if (!c) {
+    c = dyn_cast<SCEVConstant>(b);
+    other = a;
+  }
+  // isAllOnes() is exactly "every bit set", which for any bit width IS the
+  // two's-complement encoding of -1 -- width-agnostic, no sign-extension
+  // or truncation needed to compare against a literal -1 of some other
+  // width.
+  if (!c || !c->getAPInt().isAllOnes())
+    return nullptr;
+  return unwrapArgumentSCEV(other);
 }
 
 // Collect every icmp/fcmp reachable from a branch condition through and/or
@@ -652,29 +793,31 @@ bool conditionContainsAnd(const Value *cond, unsigned depth = 0) {
   return false;
 }
 
-// Proves `target` is strictly positive on every path that reaches `L`,
-// by walking the SAME dominator-tree chain dominatingArgumentGuard walks
-// (deliberately not llvm::isImpliedByDomCondition: its no-DominatorTree
-// overload only inspects a single immediate predecessor block and is not
-// safe to call outside a full pass pipeline -- confirmed via a real
-// crash reproduction, not theorized). Requires the dominating branch's
-// condition to be a PURE Or-tree (rejects outright if any And appears
-// anywhere in it -- see conditionContainsAnd) containing a leaf of
+// Proves `target` is strictly positive on every path that reaches
+// `reachBlock`, walking the dominator-tree idom chain upward from
+// `walkStart` (deliberately not llvm::isImpliedByDomCondition: its
+// no-DominatorTree overload only inspects a single immediate predecessor
+// block and is not safe to call outside a full pass pipeline -- confirmed
+// via a real crash reproduction, not theorized). Requires the dominating
+// branch's condition to be a PURE Or-tree (rejects outright if any And
+// appears anywhere in it -- see conditionContainsAnd) containing a leaf of
 // exactly the form `target < 1` / `target <= 0` (or the operand-reflected
-// equivalent), AND that the loop is reached only through the edge where
-// the WHOLE condition evaluates false -- i.e. this is the standard
+// equivalent), AND that `reachBlock` is reached only through the edge
+// where the WHOLE condition evaluates false -- i.e. this is the standard
 // early-return guard idiom (`if (n<=0 || ...) return;`) this tool's own
 // dominatingArgumentGuard already targets, not a general theorem prover.
 // Refuses (returns false) on anything more complex than this exact,
 // already-observed idiom: a hard proof requirement, not a best-effort
-// heuristic, so it fails closed rather than guess.
-bool dominatorProvesPositive(const Value *target, const Loop *L, DominatorTree &DT) {
+// heuristic, so it fails closed rather than guess. Shared by
+// dominatorProvesPositive (target: a loop, reached only past its guard)
+// and dominatorProvesPositiveBeforeInst (target: an arbitrary instruction,
+// reached only past the SAME guard idiom) below -- identical reasoning,
+// differing only in which block the proof is FOR.
+bool dominatorProvesPositiveReaching(const Value *target, BasicBlock *walkStart,
+                                     BasicBlock *reachBlock, DominatorTree &DT,
+                                     BasicBlock **guardContinueOut) {
   const Value *t = stripIntCasts(target);
-  BasicBlock *start = L->getLoopPreheader();
-  if (!start)
-    start = L->getHeader();
-  BasicBlock *loopHeader = L->getHeader();
-  DomTreeNode *node = DT.getNode(start);
+  DomTreeNode *node = DT.getNode(walkStart);
   for (unsigned hops = 0; node && hops < 12; ++hops, node = node->getIDom()) {
     BasicBlock *bb = node->getBlock();
     if (!bb)
@@ -682,12 +825,12 @@ bool dominatorProvesPositive(const Value *target, const Loop *L, DominatorTree &
     auto *br = dyn_cast_or_null<BranchInst>(bb->getTerminator());
     if (!br || !br->isConditional())
       continue;
-    bool loopOnTrue = DT.dominates(br->getSuccessor(0), loopHeader);
-    bool loopOnFalse = DT.dominates(br->getSuccessor(1), loopHeader);
-    if (loopOnTrue == loopOnFalse)
-      continue; // ambiguous or unrelated to reaching the loop -- keep walking
-    if (!loopOnFalse)
-      continue; // loop reached on the TRUE edge -- not the guard idiom this
+    bool reachOnTrue = DT.dominates(br->getSuccessor(0), reachBlock);
+    bool reachOnFalse = DT.dominates(br->getSuccessor(1), reachBlock);
+    if (reachOnTrue == reachOnFalse)
+      continue; // ambiguous or unrelated to reaching the block -- keep walking
+    if (!reachOnFalse)
+      continue; // reached on the TRUE edge -- not the guard idiom this
                 // proof targets; fail closed rather than reason about it
     if (conditionContainsAnd(br->getCondition()))
       continue;
@@ -711,7 +854,7 @@ bool dominatorProvesPositive(const Value *target, const Loop *L, DominatorTree &
       }
       if (!C)
         continue;
-      // Leaf being FALSE (required, since the loop lies on the false
+      // Leaf being FALSE (required, since reachBlock lies on the false
       // edge of a pure Or-tree) must mean target > 0: `target < 1`
       // false -> target>=1; `target <= 0` false -> target>0. The
       // unsigned forms hold identically for a nonnegative type.
@@ -719,11 +862,46 @@ bool dominatorProvesPositive(const Value *target, const Loop *L, DominatorTree &
       bool leafProvesPositive =
           ((p == ICmpInst::ICMP_SLT || p == ICmpInst::ICMP_ULT) && cv == 1) ||
           ((p == ICmpInst::ICMP_SLE || p == ICmpInst::ICMP_ULE) && cv == 0);
-      if (leafProvesPositive)
+      if (leafProvesPositive) {
+        // `reachOnFalse` was already established true above (the branch
+        // above `continue`s otherwise) -- successor(1) is exactly the
+        // "continue toward reachBlock" edge, taken only when the guard
+        // condition evaluated false, i.e. only once `target` is proven
+        // positive. corroboratePeeledPrefix and
+        // wrapperAccountsForOwnAccesses reuse this to prove a SEPARATE
+        // access is reached only on that same path.
+        if (guardContinueOut)
+          *guardContinueOut = br->getSuccessor(1);
         return true;
+      }
     }
   }
   return false;
+}
+
+// dominatorProvesPositiveReaching specialized to a loop: the block whose
+// entry must be proven guarded is the loop header, and the walk starts one
+// edge earlier (the preheader, when one exists) so the loop's OWN exit-test
+// branch is never mistaken for the guard.
+bool dominatorProvesPositive(const Value *target, const Loop *L, DominatorTree &DT,
+                             BasicBlock **guardContinueOut = nullptr) {
+  BasicBlock *start = L->getLoopPreheader();
+  if (!start)
+    start = L->getHeader();
+  return dominatorProvesPositiveReaching(target, start, L->getHeader(), DT,
+                                         guardContinueOut);
+}
+
+// dominatorProvesPositiveReaching specialized to an arbitrary instruction:
+// the block whose entry must be proven guarded is the instruction's own
+// parent, and (mirroring the no-preheader loop fallback above) the walk
+// starts at that same block, checking its own terminator first before
+// climbing to its idom.
+bool dominatorProvesPositiveBeforeInst(const Value *target, const Instruction *inst,
+                                       DominatorTree &DT,
+                                       BasicBlock **guardContinueOut = nullptr) {
+  BasicBlock *bb = const_cast<BasicBlock *>(inst->getParent());
+  return dominatorProvesPositiveReaching(target, bb, bb, DT, guardContinueOut);
 }
 
 // A SECOND, independent exact proof for a loop's length, alongside the
@@ -951,19 +1129,84 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
     Value *idxOperand = gep->getOperand(gep->getNumOperands() - 1);
     const SCEV *idxSCEV = SE.getSCEV(idxOperand);
     if (auto *ar = dyn_cast<SCEVAddRecExpr>(idxSCEV)) {
-      auto *start = dyn_cast<SCEVConstant>(ar->getStart());
-      if (ar->getLoop() == L && start && start->getValue()->isZero()) {
-        addressAR = ar;
+      // `x[i]`: the recurrence is on the INDEX, over a pointer operand
+      // ScalarEvolution treats as loop-invariant.
+      if (ar->getLoop() == L) {
         const SCEV *step = ar->getStepRecurrence(SE);
-        result.stride = unwrapArgumentSCEV(step);
+        const Value *strideArg = unwrapArgumentSCEV(step);
+        std::optional<uint64_t> strideConstVal;
+        if (!strideArg)
+          strideConstVal = unwrapConstantStride(step);
+        if (strideArg || strideConstVal) {
+          auto *start = dyn_cast<SCEVConstant>(ar->getStart());
+          if (start && start->getValue()->isZero()) {
+            addressAR = ar;
+            result.stride = strideArg;
+            result.constStride = strideConstVal;
+          } else {
+            // Peeled-first-iteration candidate (PATTERNS.md): the address
+            // IV starts at EXACTLY the stride instead of 0 -- e.g.
+            // `ix = inc_x;` before the loop, seeded by a peeled `x[0]`
+            // access elsewhere. Recorded in wholly SEPARATE fields, never
+            // merged into result.stride/constStride above: this candidate
+            // is meaningless (and unsound to accept) on its own -- pairing
+            // an uncorroborated nonzero start with this loop's OWN
+            // (unrelated) trip count would silently under-cover the real
+            // accessed range, exactly the bug the zero-start requirement
+            // exists to prevent for the ordinary case. Only
+            // detectPeeledPrefixBound, after finding a dominating
+            // offset-zero access elsewhere AND a trip count proven to be
+            // EXACTLY (a further argument) - 1, may ever promote this to
+            // a real extent.
+            bool startsAtStride = false;
+            if (strideArg)
+              startsAtStride = (ar->getStart() ==
+                                 SE.getSCEV(const_cast<Value *>(strideArg)));
+            else if (strideConstVal && start && !start->getAPInt().isNegative() &&
+                     start->getAPInt().getActiveBits() <= 32)
+              startsAtStride = start->getAPInt().getZExtValue() == *strideConstVal;
+            if (startsAtStride) {
+              result.peeledStride = strideArg;
+              result.peeledConstStride = strideConstVal;
+            }
+          }
+        }
+      }
+    }
+    if (!addressAR) {
+      // `*p; p++`: clang's OTHER lowering of the identical source-level
+      // fixed-stride walk (see PATTERNS.md) -- no array-index syntax at
+      // all, so the GEP's own index is just a fixed per-iteration element
+      // offset (typically `1`) and the recurrence instead lives on the
+      // GEP's POINTER operand (a phi recurring on this same GEP around the
+      // loop). ScalarEvolution computes that pointer-typed recurrence
+      // directly; a bare SCEVUnknown start (no addition at all -- not even
+      // a zero one, since SCEV normalizes that away already) means the
+      // walk begins at exactly that one Value, the pointer-operand
+      // equivalent of the index case's "starts at the constant 0" above.
+      // Its step is in BYTES, not elements (see unwrapConstantByteStride);
+      // only a compile-time-constant byte step is ever attempted here, for
+      // the same reason unwrapArgumentSCEV never attempts a Mul.
+      const SCEV *ptrSCEV =
+          SE.getSCEV(const_cast<Value *>(gep->getPointerOperand()));
+      if (auto *ar = dyn_cast<SCEVAddRecExpr>(ptrSCEV)) {
+        if (ar->getLoop() == L && isa<SCEVUnknown>(ar->getStart())) {
+          addressAR = ar;
+          Type *elemTy = gep->getSourceElementType();
+          uint64_t elemSize = F->getParent()->getDataLayout().getTypeAllocSize(elemTy);
+          result.constStride =
+              unwrapConstantByteStride(ar->getStepRecurrence(SE), elemSize);
+        }
       }
     }
   }
 
   const SCEV *ec = SE.getBackedgeTakenCount(L);
-  if (ec && !isa<SCEVCouldNotCompute>(ec))
-    result.length = unwrapArgumentSCEV(
-        SE.getTripCountFromExitCount(ec, ec->getType(), L));
+  const SCEV *tripCount = nullptr;
+  if (ec && !isa<SCEVCouldNotCompute>(ec)) {
+    tripCount = SE.getTripCountFromExitCount(ec, ec->getType(), L);
+    result.length = unwrapArgumentSCEV(tripCount);
+  }
   if (result.length) {
     result.lengthProven = true;
   } else if (result.stride) {
@@ -976,6 +1219,14 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
       result.lengthProven = true;
     }
   }
+  // Peeled-first-iteration length candidate: independent of the ordinary
+  // ec/tripCount usage above (both may be attempted against the SAME
+  // tripCount SCEV; they ask different questions of it -- "is this a bare
+  // argument" vs. "is this exactly argument-1"). Gated on having found a
+  // peeled-eligible stride at all above; see detectPeeledPrefixBound for
+  // where this actually gets corroborated and accepted.
+  if ((result.peeledStride || result.peeledConstStride) && tripCount)
+    result.peeledLengthArg = unwrapArgumentMinusOne(tripCount);
   if (!result.lengthProven) {
     // Guard fallback: a COMPOUND dominating guard (`if (n<=0 || inc_x<=0)
     // return;` -- confirmed the standard idiom across dozens of OpenBLAS's
@@ -1005,7 +1256,14 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
   if (!result.length) {
     // No length -> a stride alone means nothing; never emit stride-only.
     result.stride = nullptr;
+    result.constStride.reset();
   }
+  if (!result.peeledLengthArg) {
+    // Same discipline as above, for the peeled candidate's own fields.
+    result.peeledStride = nullptr;
+    result.peeledConstStride.reset();
+  }
+  result.gep = gep;
   return result;
 }
 
@@ -1013,24 +1271,78 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
 // recording how the pointee memory is read/written and any paired length.
 Access analyzeAccess(const Argument *A) {
   Access acc;
-  SmallVector<const Value *, 16> work;
+  // Each worklist entry carries its OWN provable element-offset from `A`
+  // (0 for `A` itself, propagated through casts unchanged, combined with a
+  // GEP's own literal index when both are known) alongside the Value --
+  // needed so a Load/Store found several hops away records the offset it
+  // ACTUALLY dereferences, not just "0" (see StaticAccess). A PHI or
+  // Select MERGES potentially different incoming offsets (the pointer-walk
+  // idiom's own "current position" phi merges the base pointer with a
+  // loop-varying GEP result -- see loopBoundValues' case 2) and is always
+  // treated as unresolved rather than assuming either incoming value's
+  // offset carries through.
+  struct WorkItem {
+    const Value *v;
+    std::optional<int64_t> offset;
+  };
+  SmallVector<WorkItem, 16> work;
   SmallPtrSet<const Value *, 32> seen;
-  work.push_back(A);
+  work.push_back({A, 0});
   seen.insert(A);
+  // A GEP that IS actually dereferenced (loaded/stored through) is a real
+  // memory access, whatever else it's also used for; recorded here so the
+  // post-pass below (dropping pure-address-computation GEPs) never prunes
+  // one that's genuinely read or written.
+  SmallPtrSet<const Value *, 16> dereferencedGeps;
 
   while (!work.empty()) {
-    const Value *V = work.pop_back_val();
+    WorkItem item = work.pop_back_val();
+    const Value *V = item.v;
+    std::optional<int64_t> vOff = item.offset;
     for (const User *U : V->users()) {
       if (auto *ld = dyn_cast<LoadInst>(U)) {
-        if (ld->getPointerOperand() == V) acc.read = true;
+        if (ld->getPointerOperand() == V) {
+          acc.read = true;
+          // A GEP result already recorded ITS OWN staticAccess entry below
+          // -- recording the load that dereferences it too would double
+          // the same access, and (for a loop-varying GEP) the load isn't
+          // what noOtherAccesses' exclusion later matches against anyway.
+          if (!isa<GetElementPtrInst>(V))
+            acc.staticAccesses.push_back({vOff, ld});
+          else
+            dereferencedGeps.insert(V);
+        }
       } else if (auto *st = dyn_cast<StoreInst>(U)) {
-        if (st->getPointerOperand() == V) acc.written = true;
+        if (st->getPointerOperand() == V) {
+          acc.written = true;
+          if (!isa<GetElementPtrInst>(V))
+            acc.staticAccesses.push_back({vOff, st});
+          else
+            dereferencedGeps.insert(V);
+        }
         if (st->getValueOperand() == V) acc.escapes = true; // ptr stored away
       } else if (auto *gep = dyn_cast<GetElementPtrInst>(U)) {
         if (gep->getPointerOperand() == V && seen.insert(gep).second) {
-          work.push_back(gep);
           if (!gep->hasAllZeroIndices())
             acc.requiresDynamicExtent = true;
+          // Every GEP off this pointer is also a single-point access
+          // candidate for the all-access coverage check (see StaticAccess)
+          // -- a compile-time-constant index (x[0], x[3], x[-1]) records
+          // its literal offset (relative to A, via vOff); a loop-varying
+          // or otherwise dynamic index, or an unresolved base, is NOT
+          // resolvable here and is recorded as unresolved (the owning
+          // loop, if any, explains it separately via loopBounds below and
+          // is excluded from the coverage check by identity).
+          std::optional<int64_t> gepOffset;
+          if (vOff) {
+            if (gep->hasAllZeroIndices())
+              gepOffset = *vOff;
+            else if (gep->getNumOperands() == 2)
+              if (auto *ci = dyn_cast<ConstantInt>(gep->getOperand(1)))
+                gepOffset = *vOff + ci->getSExtValue();
+          }
+          work.push_back({gep, gepOffset});
+          acc.staticAccesses.push_back({gepOffset, gep});
           // A hand-written counted loop indexing this pointer (a shape
           // memcpy-style library calls don't cover at all -- e.g. a
           // BLAS-style `while(i<n){ y[iy]+=da*x[ix]; ... }` walk, possibly
@@ -1039,12 +1351,13 @@ Access analyzeAccess(const Argument *A) {
           // its declaration above), never acc.lengths, so it's never
           // trusted as a byte size.
           LoopBound lb = loopBoundValues(gep);
-          if (lb.length)
+          if (lb.length || lb.peeledLengthArg)
             acc.loopBounds.push_back(lb);
         }
-      } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U) ||
-                 isa<PHINode>(U) || isa<SelectInst>(U)) {
-        if (seen.insert(U).second) work.push_back(U);
+      } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) {
+        if (seen.insert(U).second) work.push_back({U, vOff});
+      } else if (isa<PHINode>(U) || isa<SelectInst>(U)) {
+        if (seen.insert(U).second) work.push_back({U, std::nullopt});
       } else if (auto *mi = dyn_cast<AnyMemIntrinsic>(U)) {
         // llvm.memcpy/memmove/memset
         if (auto *t = dyn_cast<AnyMemTransferInst>(mi)) {
@@ -1091,6 +1404,69 @@ Access analyzeAccess(const Argument *A) {
       }
     }
   }
+  // A Load/Store that dereferences a PHI which is ALSO the pointer operand
+  // of some GEP found during the walk (the pointer-walk idiom's own
+  // "current position" phi -- loopBoundValues' case 2, e.g.
+  // `%6=phi...; %8=load ptr %6; %10=gep ptr %6, i32 1`) is part of that
+  // SAME address chain, not an independent access needing its own
+  // coverage proof: the GEP's own staticAccesses entry (and, if it
+  // resolved, its loopBounds entry) already accounts for it. Done as a
+  // post-pass rather than inline: the walk can reach the load before the
+  // GEP sharing the same phi, so this can't be decided at record time.
+  SmallPtrSet<const Value *, 8> gepPointerOperands;
+  for (const StaticAccess &sa : acc.staticAccesses)
+    if (auto *g = dyn_cast<GetElementPtrInst>(sa.inst))
+      gepPointerOperands.insert(g->getPointerOperand());
+
+  // A GEP is address ARITHMETIC, not itself a memory access -- recording one
+  // unconditionally (above) is deliberately pessimistic for the common case
+  // (a loop's own indexing GEP, later loaded/stored), but over-conservative
+  // for a real, common OpenBLAS idiom: `if (incx<0) x -= (n-1)*incx;`
+  // rebases the pointer with a GEP whose result is NEVER dereferenced here
+  // at all, only handed to a recognized library call or a one-hop delegate
+  // (interface/axpy.c's negative-stride rebase before calling AXPYU_K, e.g.).
+  // Whatever that call does with the rebased pointer is already accounted
+  // for separately (a known LibRole's read/write/lengths effect, or the
+  // delegated callee's own proof via detectDelegatedArrayBound) -- so a GEP
+  // that is never itself dereferenced, and whose every other use is such a
+  // call, contributes no access of its own and needs no separate
+  // explanation. Deliberately narrow: ANY other use (an unnamed/indirect
+  // call, a comparison, escaping as plain data, ...) leaves it exactly as
+  // conservative as before.
+  auto isPureAddressComputation = [&](const GetElementPtrInst *gep) {
+    if (dereferencedGeps.count(gep))
+      return false;
+    for (const User *U : gep->users()) {
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+          isa<AddrSpaceCastInst>(U) || isa<PHINode>(U) || isa<SelectInst>(U))
+        continue;
+      auto *cb = dyn_cast<CallBase>(U);
+      if (!cb || !cb->getCalledFunction())
+        return false; // not a recognized address-chain link or named call
+      bool isArgUse = false;
+      for (unsigned oi = 0; oi < cb->arg_size(); ++oi)
+        if (cb->getArgOperand(oi) == gep) { isArgUse = true; break; }
+      if (!isArgUse)
+        return false; // e.g. called AS the function value -- a real hazard
+    }
+    return true;
+  };
+
+  SmallVector<StaticAccess, 4> filtered;
+  for (const StaticAccess &sa : acc.staticAccesses) {
+    const Value *ptrOp = nullptr;
+    if (auto *ld = dyn_cast<LoadInst>(sa.inst))
+      ptrOp = ld->getPointerOperand();
+    else if (auto *st = dyn_cast<StoreInst>(sa.inst))
+      ptrOp = st->getPointerOperand();
+    if (ptrOp && isa<PHINode>(ptrOp) && gepPointerOperands.count(ptrOp))
+      continue; // explained by that same phi's own GEP entry
+    if (auto *gep = dyn_cast<GetElementPtrInst>(sa.inst))
+      if (isPureAddressComputation(gep))
+        continue;
+    filtered.push_back(sa);
+  }
+  acc.staticAccesses = std::move(filtered);
   return acc;
 }
 
@@ -1117,6 +1493,132 @@ ExtentOperand resolveExtentOperand(const Value *v, unsigned sretOffset) {
   return {};
 }
 
+// Build the ExtentOperand for a LoopBound::constStride result -- no
+// argument to resolve at all, so unlike resolveExtentOperand above this
+// never fails: `v` already IS the value (proven by unwrapConstantStride).
+ExtentOperand constantExtentOperand(uint64_t v) {
+  return {-1, ExtentSource::Constant, v};
+}
+
+// True iff every access recorded in `acc.staticAccesses` is explained by
+// `explained` (the GEP(s)/instruction(s) that already justify the (length,
+// stride) pairing under consideration -- typically the winning loop's own
+// address GEP, and for a corroborated peeled candidate, the offset-zero
+// access too), AND the pointer never escapes (stored away, or passed to a
+// callee this tool can't account for -- an unresolved escape could do
+// anything to the pointee, so no static access proof can be sound in its
+// presence; plan-openblas-max-family-inference.md's Section 5), AND no
+// bulk-memory operation (memcpy/memmove/memset -- Access::lengths) was
+// ALSO found on the pointer. A memcpy's length is a BYTE count with no
+// proven relationship to the ELEMENT-based (length, stride) pair under
+// consideration -- e.g. a loop proving `n` elements at stride 1, followed
+// by `memcpy(dst, x, (n+1)*sizeof(*x))`, reads one element the loop-
+// derived envelope never covers. Likewise, AND no recognized-but-unbounded
+// C-string library call (strlen, strcpy, strchr, ... -- Access::stringOp)
+// was found on the pointer: classifyLibArg deliberately leaves these with
+// no length operand at all (they scan until a NUL byte, wherever that
+// falls), so a call like `strlen((char*)x)` after a loop proving `n`
+// elements is a real access the loop's own envelope has no relationship
+// to whatsoever -- it could read arbitrarily far past it. A single
+// UNEXPLAINED access -- resolved to some other offset, genuinely
+// unresolved, a bulk-memory length, or an unbounded string scan -- means
+// the pairing under consideration does not actually account for
+// everything the pointer touches, and must not be accepted: a proof that
+// covers ONE access pattern through a pointer is not automatically sound
+// for the WHOLE pointer (that same plan's "all-access correctness
+// blocker"). Deliberately conservative rather than attempting to
+// numerically prove an arbitrary resolved offset or byte length lies
+// within the proven envelope: length and stride are themselves runtime
+// argument VALUES at analysis time, not known numbers, so nothing beyond
+// "this exact instruction is already accounted for" can be proven sound
+// here without adding a symbolic range prover this tool does not have.
+bool noOtherAccesses(const Access &acc,
+                     const SmallPtrSetImpl<const Instruction *> &explained) {
+  if (acc.escapes || !acc.lengths.empty() || acc.stringOp)
+    return false;
+  for (const StaticAccess &sa : acc.staticAccesses)
+    if (!explained.count(sa.inst))
+      return false;
+  return true;
+}
+
+// Every OTHER loopBound entry whose OWN proven (length, stride) pair is
+// IDENTICAL to `winner`'s (the exact same Value*s, or the exact same
+// compile-time constant) is redundant confirmation, not a contradiction --
+// a real, common OpenBLAS shape: kernel/riscv64/scal.c's sscal_k picks
+// between an isfinite-checking and a plain loop body at runtime
+// (`if (dummy2==1) {while(...)...} else {while(...)...}`), two
+// STRUCTURALLY SEPARATE loops (two distinct GEP instructions) that happen
+// to walk the exact identical (n, inc_x) range. Their own GEPs are
+// explained by the SAME extent the winner already proves, and must be
+// excluded from the coverage check too -- otherwise a sound, doubly-
+// confirmed extent would be rejected as if the second loop were an
+// unrelated, unexplained access. Deliberately exact (Value* identity, not
+// "looks similar"): two DIFFERENT loops that happen to also prove SOME
+// length/stride pair must never be conflated with each other unless
+// provably the SAME value -- see noOtherAccesses' own comment on why nothing
+// looser than exact-identity accounting is attempted here.
+void collectAgreeingGeps(const Access &acc, const LoopBound &winner,
+                         SmallPtrSetImpl<const Instruction *> &explained) {
+  explained.insert(winner.gep);
+  for (const LoopBound &lb2 : acc.loopBounds) {
+    if (!lb2.gep || lb2.gep == winner.gep || !lb2.lengthProven ||
+        lb2.length != winner.length)
+      continue;
+    bool sameStride =
+        (lb2.stride && winner.stride && lb2.stride == winner.stride) ||
+        (lb2.constStride && winner.constStride &&
+         *lb2.constStride == *winner.constStride);
+    if (sameStride)
+      explained.insert(lb2.gep);
+  }
+}
+
+// Corroborates a peeled-first-iteration LoopBound candidate (lb.
+// peeledLengthArg set by loopBoundValues: the address IV provably starts
+// at exactly the stride, and the loop's own trip count is exactly
+// peeledLengthArg-1) against an ACTUAL offset-zero access recorded in
+// `acc.staticAccesses` -- PATTERNS.md's "peeled first iteration" family
+// peels `x[0]` out by hand before the loop; loopBoundValues alone cannot
+// see that separate access, only this loop's own shape.
+//
+// Requires, all independently proven, none approximated:
+//   - a StaticAccess entry whose offset is EXACTLY 0 (not x[1], not a
+//     dynamic/unresolved index);
+//   - that access's instruction is dominated by the SAME positivity
+//     guard's continue edge that proves peeledLengthArg > 0 -- i.e. the
+//     access cannot execute unless the argument is already known
+//     positive. Without this, the offset-zero access could execute even
+//     when the argument is non-positive, a path the runtime's own
+//     n<=0-sizes-to-0 rule would then under-cover (the shadow buffer
+//     would be empty while the real function still touched x[0]),
+//     making acceptance unsound;
+//   - that access's instruction DOMINATES the loop's header -- it
+//     executes, unconditionally, on every path that reaches the loop at
+//     all, i.e. strictly before the loop's own walk begins.
+// Returns the corroborating instruction (to be excluded, alongside the
+// loop's own GEP, from noOtherAccesses -- it is now explained) or nullptr
+// if no such access is found, in which case the peeled candidate is
+// simply left unused, exactly like an unconfirmed dominatingArgumentGuard
+// candidate.
+const Instruction *corroboratePeeledPrefix(const LoopBound &lb, const Access &acc,
+                                           const Loop *L, DominatorTree &DT) {
+  if (!lb.peeledLengthArg)
+    return nullptr;
+  BasicBlock *guardContinue = nullptr;
+  if (!dominatorProvesPositive(lb.peeledLengthArg, L, DT, &guardContinue) ||
+      !guardContinue)
+    return nullptr;
+  for (const StaticAccess &sa : acc.staticAccesses) {
+    if (!sa.offset || *sa.offset != 0 || sa.inst == lb.gep)
+      continue;
+    if (DT.dominates(guardContinue, sa.inst->getParent()) &&
+        DT.dominates(sa.inst, L->getHeader()))
+      return sa.inst;
+  }
+  return nullptr;
+}
+
 // Result of array-bound detection, direct or delegated: caller-argument
 // operands, not raw Values -- both detectDirectArrayBound and
 // detectDelegatedArrayBound resolve all the way down to this before
@@ -1128,6 +1630,51 @@ struct ArrayBound {
   ExtentOperand length;
   ExtentOperand stride;
 };
+
+// Shared by detectDirectArrayBound and detectDelegatedArrayBound: given a
+// peeled-eligible LoopBound `lb` (peeledLengthArg set) and the Access it
+// came from, corroborate it (corroboratePeeledPrefix) and, if sound,
+// resolve it to a real ArrayBound -- resolving each raw Value through
+// `resolve`, so the SAME logic serves the function under direct analysis
+// (resolveExtentOperand directly) and a one-hop delegated callee (the
+// mapBack/checkOne composition, mapping through the call site's actual
+// arguments) alike. Rebuilds a fresh DominatorTree/LoopInfo for lb.gep's
+// own function -- lb crosses out of the scope loopBoundValues computed it
+// under, so nothing from that analysis carries over.
+template <typename ResolveFn>
+ArrayBound detectPeeledPrefixBound(const Access &acc, const LoopBound &lb,
+                                   ResolveFn resolve) {
+  if (!lb.peeledLengthArg || !lb.gep)
+    return {};
+  Function *F = const_cast<Function *>(lb.gep->getFunction());
+  if (!F)
+    return {};
+  DominatorTree DT(*F);
+  LoopInfo LI(DT);
+  const Loop *L = LI.getLoopFor(lb.gep->getParent());
+  if (!L)
+    return {};
+
+  const Instruction *peelInst = corroboratePeeledPrefix(lb, acc, L, DT);
+  if (!peelInst)
+    return {};
+  SmallPtrSet<const Instruction *, 4> explained;
+  explained.insert(lb.gep);
+  explained.insert(peelInst);
+  if (!noOtherAccesses(acc, explained))
+    return {};
+
+  ExtentOperand len = resolve(stripIntCasts(lb.peeledLengthArg));
+  if (!len.valid())
+    return {};
+  ExtentOperand stride = lb.peeledStride
+      ? resolve(stripIntCasts(lb.peeledStride))
+      : lb.peeledConstStride ? constantExtentOperand(*lb.peeledConstStride)
+      : ExtentOperand{};
+  if (!stride.valid() || stride.argIndex == len.argIndex)
+    return {};
+  return {len, stride};
+}
 
 // Array-bound detection WITHIN the function currently being analyzed (no
 // delegation) -- e.g. a hand-written loop directly in the function's own
@@ -1157,6 +1704,7 @@ ArrayBound detectDirectArrayBound(const Access &acc, unsigned sretOffset) {
       continue;
     ExtentOperand stride = lb.stride
         ? resolveExtentOperand(stripIntCasts(lb.stride), sretOffset)
+        : lb.constStride ? constantExtentOperand(*lb.constStride)
         : ExtentOperand{};
     // A parameter can never legitimately be its own stride -- len==stride is
     // proof the "length" side mis-resolved (dominatingArgumentGuard's
@@ -1167,10 +1715,33 @@ ArrayBound detectDirectArrayBound(const Access &acc, unsigned sretOffset) {
     // as a length-only fallback either.
     if (stride.valid() && stride.argIndex == len.argIndex)
       continue;
-    if (lb.lengthProven && stride.valid())
-      return {len, stride}; // proven and fully resolved -- stop here
+    if (lb.lengthProven && stride.valid()) {
+      // A proof that covers only this ONE loop's own access is not
+      // automatically sound for the whole pointer -- see noOtherAccesses'
+      // own comment. Do not accept a pairing while some other, unexplained
+      // access through the same pointer exists; fall through to keep
+      // scanning (a LATER loopBound entry, or the peeled-prefix pass
+      // below, might still find something sound). A SEPARATE loop proving
+      // the exact same (length, stride) pair (collectAgreeingGeps) is
+      // redundant confirmation, not an unexplained access.
+      SmallPtrSet<const Instruction *, 4> explained;
+      collectAgreeingGeps(acc, lb, explained);
+      if (noOtherAccesses(acc, explained))
+        return {len, stride}; // proven and fully resolved -- stop here
+      continue;
+    }
     if (!best.length.valid())
       best.length = len; // remember the first length-only match, keep looking
+  }
+  // Peeled-first-iteration candidates: only tried once no ordinary pairing
+  // above was accepted. See detectPeeledPrefixBound/corroboratePeeledPrefix
+  // for the full proof requirements (a dominating offset-zero access,
+  // reached only once the argument is proven positive).
+  for (const LoopBound &lb : acc.loopBounds) {
+    ArrayBound peeled = detectPeeledPrefixBound(
+        acc, lb, [&](const Value *v) { return resolveExtentOperand(v, sretOffset); });
+    if (peeled.length.valid() && peeled.stride.valid())
+      return peeled;
   }
   if (best.length.valid())
     return best;
@@ -1180,6 +1751,43 @@ ArrayBound detectDirectArrayBound(const Access &acc, unsigned sretOffset) {
       return {len, {}};
   }
   return {};
+}
+
+// A wrapper's own StaticAccess entries (after analyzeAccess's pure-address-
+// computation pruning) are real accesses a one-hop delegated proof knows
+// nothing about -- but each one is still sound to accept into the SAME
+// envelope the delegate proves, PROVIDED it touches only offset 0 (always
+// inside ANY [0,(length-1)*stride] envelope) AND is reachable only once
+// `rawLength` -- the SAME wrapper-side value feeding the delegate's own
+// accepted length operand -- is already proven positive by a dominating
+// guard. Without that guard, a zero-length call could take this exact path
+// while still really touching the one element it reads, a case the
+// runtime's own n<=0-sizes-to-0 rule would then under-cover. A real,
+// common OpenBLAS idiom: interface/axpy.c's `if (incx==0 && incy==0) {
+// *y += n*alpha*(*x); return; }` is mutually exclusive with (and, once
+// n>=1 is known, exactly subsumed by) the general AXPYU_K delegation a few
+// lines later. Mirrors corroboratePeeledPrefix's reasoning, generalized
+// from "reaches a loop header" to "reaches an arbitrary instruction" via
+// dominatorProvesPositiveBeforeInst.
+bool wrapperAccountsForOwnAccesses(const Access &acc, const Value *rawLength) {
+  if (acc.staticAccesses.empty())
+    return true;
+  if (!rawLength)
+    return false;
+  const Instruction *anchor = nullptr;
+  for (const StaticAccess &sa : acc.staticAccesses)
+    if (sa.inst) { anchor = sa.inst; break; }
+  if (!anchor)
+    return false;
+  Function *F = const_cast<Function *>(anchor->getFunction());
+  DominatorTree DT(*F);
+  for (const StaticAccess &sa : acc.staticAccesses) {
+    if (!sa.offset || *sa.offset != 0)
+      return false;
+    if (!dominatorProvesPositiveBeforeInst(rawLength, sa.inst, DT))
+      return false;
+  }
+  return true;
 }
 
 // One-hop interprocedural array-bound detection. `acc` is the CALLER-side
@@ -1208,6 +1816,23 @@ ArrayBound detectDelegatedArrayBound(const Access &acc, unsigned callerSretOffse
                                      std::string *calleeNameOut) {
   ArrayBound best;
   std::string bestName;
+  // A one-hop delegated bound only explains what happens INSIDE the
+  // callee it's derived from (calleeAcc below) -- it says nothing about
+  // what the WRAPPER itself does to the same pointer. A bulk-memory
+  // operation, an unbounded C-string library call (strlen, strcpy, ... --
+  // see noOtherAccesses' own comment on Access::stringOp), or a SECOND
+  // unaccounted call on the same pointer, are all invisible to the
+  // callee's own proof and must block acceptance outright, the same way
+  // noOtherAccesses blocks an unexplained access inside the callee --
+  // computed once, not per DelegateCall, since all three depend only on
+  // the wrapper's own Access, the SAME for every candidate callee tried
+  // below. A direct access in the wrapper itself (e.g. `worker(n, x);
+  // return x[n];`) is handled more precisely, per accepted candidate, by
+  // wrapperAccountsForOwnAccesses below -- an offset-0 access dominated by
+  // the SAME positivity guard the delegate's own length is keyed to is
+  // sound to accept; anything else is not.
+  bool wrapperBaseClean = acc.lengths.empty() && !acc.stringOp &&
+                          acc.delegateCalls.size() == 1;
   for (const DelegateCall &dc : acc.delegateCalls) {
     const Function *callee = dc.cb->getCalledFunction();
     if (!callee)
@@ -1236,15 +1861,26 @@ ArrayBound detectDelegatedArrayBound(const Access &acc, unsigned callerSretOffse
     unsigned calleeSretOffset = computeSretOffset(*calleeDef);
     Access calleeAcc = analyzeAccess(calleeDef->getArg(dc.argIdx));
 
+    // Map a Value found INSIDE the callee back to the raw Value the CALLER
+    // passed for it at THIS call site -- the wrapper-side value, before
+    // resolveExtentOperand collapses it to a DWARF argument operand.
+    // Exposed separately from mapBack (below) so
+    // wrapperAccountsForOwnAccesses can reason about the SAME wrapper-side
+    // value a length resolved from, in the wrapper's own IR terms.
+    auto rawAtCallSite = [&](const Value *v) -> const Value * {
+      const Value *s = stripIntCasts(v);
+      int calleeParamIdx = dwarfIndexOfMaybeLoaded(s, calleeSretOffset);
+      if (calleeParamIdx < 0 || (unsigned)calleeParamIdx >= dc.cb->arg_size())
+        return nullptr;
+      return stripIntCasts(dc.cb->getArgOperand(calleeParamIdx));
+    };
     // Map a Value found INSIDE the callee (a length OR a stride -- same
     // mapping either way) back to one of the CALLER's own DWARF argument
     // operands, via this same call site's actual arguments.
     auto mapBack = [&](const Value *v) -> ExtentOperand {
-      const Value *s = stripIntCasts(v);
-      int calleeParamIdx = dwarfIndexOfMaybeLoaded(s, calleeSretOffset);
-      if (calleeParamIdx < 0 || (unsigned)calleeParamIdx >= dc.cb->arg_size())
+      const Value *atCallSite = rawAtCallSite(v);
+      if (!atCallSite)
         return {};
-      const Value *atCallSite = stripIntCasts(dc.cb->getArgOperand(calleeParamIdx));
       // resolveExtentOperand, not a plain index lookup: the CALLER's own
       // value passed into this slot might itself be a local loaded from one
       // of the caller's OWN pointer arguments -- the Fortran-by-reference
@@ -1274,19 +1910,51 @@ ArrayBound detectDelegatedArrayBound(const Access &acc, unsigned callerSretOffse
       ExtentOperand len = checkOne(lb.length);
       if (!len.valid())
         continue;
-      ExtentOperand stride = lb.stride ? checkOne(lb.stride) : ExtentOperand{};
+      ExtentOperand stride = lb.stride ? checkOne(lb.stride)
+          : lb.constStride ? constantExtentOperand(*lb.constStride)
+          : ExtentOperand{};
       // See the identical check in detectDirectArrayBound: a parameter can
       // never legitimately be its own stride, so this pairing is discarded
       // outright rather than kept as a length-only fallback.
       if (stride.valid() && stride.argIndex == len.argIndex)
         continue;
       if (lb.lengthProven && stride.valid()) {
-        if (calleeNameOut) *calleeNameOut = callee->getName().str();
-        return {len, stride}; // proven and fully resolved -- stop here
+        // Same "does this pairing account for EVERYTHING the pointer
+        // touches" requirement as detectDirectArrayBound -- checked in the
+        // CALLEE's own terms (calleeAcc.staticAccesses) for what happens
+        // INSIDE it, wrapperBaseClean (above) for bulk-memory/second-call
+        // hazards in the WRAPPER, and wrapperAccountsForOwnAccesses for any
+        // direct access the WRAPPER itself makes.
+        SmallPtrSet<const Instruction *, 4> explained;
+        collectAgreeingGeps(calleeAcc, lb, explained);
+        if (wrapperBaseClean && noOtherAccesses(calleeAcc, explained) &&
+            wrapperAccountsForOwnAccesses(acc, rawAtCallSite(lb.length))) {
+          if (calleeNameOut) *calleeNameOut = callee->getName().str();
+          return {len, stride}; // proven and fully resolved -- stop here
+        }
+        continue;
       }
       if (!best.length.valid()) {
         best.length = len;
         bestName = callee->getName().str();
+      }
+    }
+    // Peeled-first-iteration candidates inside the callee -- same proof as
+    // detectDirectArrayBound's own pass, resolved back to the CALLER's
+    // terms via this call site's checkOne instead of resolveExtentOperand.
+    // Same wrapperBaseClean + wrapperAccountsForOwnAccesses gating as the
+    // ordinary case above.
+    if (wrapperBaseClean) {
+      for (const LoopBound &lb : calleeAcc.loopBounds) {
+        if (!lb.peeledLengthArg)
+          continue;
+        if (!wrapperAccountsForOwnAccesses(acc, rawAtCallSite(lb.peeledLengthArg)))
+          continue;
+        ArrayBound peeled = detectPeeledPrefixBound(calleeAcc, lb, checkOne);
+        if (peeled.length.valid() && peeled.stride.valid()) {
+          if (calleeNameOut) *calleeNameOut = callee->getName().str();
+          return peeled;
+        }
       }
     }
     // Byte-count evidence (memcpy-family call) inside the callee -- a valid
@@ -2400,6 +3068,9 @@ void inferFunction(const Function &F, FunctionTrees &ft,
           bound = detectDelegatedArrayBound(acc, sretOffset, calleeIndex,
                                             &delegateName);
         auto describe = [&](const ExtentOperand &op) {
+          if (op.source == ExtentSource::Constant)
+            return std::string("a compile-time constant (") +
+                std::to_string(op.constValue) + ")";
           return "arg" + std::to_string(op.argIndex) +
               (op.source == ExtentSource::PointeeI32 ? " (via pointer)" : "");
         };
@@ -2418,16 +3089,15 @@ void inferFunction(const Function &F, FunctionTrees &ft,
           node->strideOperand = bound.stride;
           node->constSize = elem;
           ft.warnings.push_back("arg" + std::to_string(p) +
-              ": BLAS-style strided vector (length=" + describe(bound.length) +
+              ": strided vector (length=" + describe(bound.length) +
               ", stride=" + describe(bound.stride) +
               (delegateName.empty() ? ", found via loop analysis)"
                                     : ", found via kernel delegation to `" +
                                           delegateName + "`)") +
               " — the whole contiguous envelope [0, (length-1)*stride] is "
-              "copied in/out, computed at dispatch time from the real "
-              "call's argument values (a negative stride at runtime aborts "
-              "the whole grate process — see LIND_SIZE_STRIDE_VECTOR in "
-              "lind_marshal.h)");
+              "copied in/out, evaluated at dispatch time (an argument-"
+              "sourced operand is read from the real call; a constant one "
+              "is fixed) — see LIND_SIZE_STRIDE_VECTOR in lind_marshal.h");
         } else if (bound.length.valid()) {
           // Array-shaped, but no distinct stride operand resolved. The
           // runtime has no "N contiguous elements" primitive separate from

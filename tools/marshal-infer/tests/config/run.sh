@@ -379,6 +379,43 @@ check "dynamic extent: genuine scalar out-param unaffected" \
     "$(dynext_decision write_scalar_out)" "marshal"
 
 echo ""
+echo "=== all-access correctness blocker: no --config ==="
+# A proof that covers only ONE access pattern through a pointer is not
+# automatically sound for the WHOLE pointer -- see all_access_coverage.c's
+# own comment and noOtherAccesses in Infer.cpp
+# (plan-openblas-max-family-inference.md, Section 1).
+cp "$SCRIPT_DIR/all_access_coverage.c" "$WORK/all_access_coverage.c"
+( cd "$WORK" && "$LIND_COMPILE" --emit-llvm all_access_coverage.c -- -O1 -fno-unroll-loops ) >/dev/null 2>&1
+json_aac="$WORK/aac.marshal.json"
+"$MARSHAL_INFER" --json -o "$json_aac" "$WORK/all_access_coverage.bc" 2>/dev/null
+
+aac_decision() {
+    pyjq "$json_aac" "([x for x in f['functions'] if x['name']=='$1'] or [{'decision':'MISSING'}])[0]['decision']"
+}
+check "all-access: clean loop, nothing else -> marshal" \
+    "$(aac_decision clean_loop)" "marshal"
+check "all-access: loop + unresolved extra access -> force_local" \
+    "$(aac_decision loop_plus_unresolved_extra)" "force_local"
+check "all-access: loop + resolved-but-unexplained extra access -> force_local" \
+    "$(aac_decision loop_plus_resolved_extra)" "force_local"
+check "all-access: loop + unresolved pointer escape -> force_local" \
+    "$(aac_decision loop_with_escape)" "force_local"
+check "all-access: loop + memcpy reading past the loop's own extent -> force_local" \
+    "$(aac_decision loop_plus_memcpy_extra)" "force_local"
+check "all-access: delegated wrapper with its own extra access -> force_local" \
+    "$(aac_decision wrapper_extra_access)" "force_local"
+check "all-access: delegated wrapper with its own memcpy -> force_local" \
+    "$(aac_decision wrapper_with_memcpy)" "force_local"
+check "all-access: wrapper with two delegate calls on the same pointer -> force_local" \
+    "$(aac_decision wrapper_two_calls)" "force_local"
+check "all-access: wrapper delegating to exactly one clean worker -> marshal" \
+    "$(aac_decision wrapper_clean)" "marshal"
+check "all-access: loop + unbounded strlen scan -> force_local" \
+    "$(aac_decision loop_plus_strlen)" "force_local"
+check "all-access: delegated wrapper with its own unbounded strlen scan -> force_local" \
+    "$(aac_decision wrapper_plus_strlen)" "force_local"
+
+echo ""
 echo "=== contract application + provenance ==="
 cat > "$WORK/contract.json" <<EOF
 {"config_version": 1, "contracts": {"interleaved_walk": {"2": {

@@ -4,6 +4,6 @@
 
   "coverage": {
     "enabled": true,
-    "min_marshal_count": 42
+    "min_marshal_count": 66
   }
 }

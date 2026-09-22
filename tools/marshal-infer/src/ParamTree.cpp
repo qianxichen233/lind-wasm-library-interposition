@@ -49,6 +49,7 @@ const char *extentSourceName(ExtentSource s) {
   switch (s) {
   case ExtentSource::Value:      return "value";
   case ExtentSource::PointeeI32: return "pointee_i32";
+  case ExtentSource::Constant:   return "constant";
   }
   return "value";
 }

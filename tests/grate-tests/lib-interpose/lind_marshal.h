@@ -115,34 +115,44 @@ enum lind_size_kind {
     LIND_SIZE_PTR_ARRAY         = 5,  // NULL-terminated array of pointers (argv); `element` describes each
     // Strided vector: bytes = (1 + (n-1)*stride) * const_size, where n and
     // stride are each evaluated per their own lind_extent_operand (a direct
-    // argument value or a value loaded through a pointer argument -- see
-    // that struct's doc), and const_size is the element size. n<=0 sizes to
-    // 0 (an empty vector, not an error); a negative stride is rejected
-    // (fail closed) rather than mishandled -- see _lind_compute_size's doc
-    // for both. Plain n*const_size (LIND_SIZE_FROM_ARG) undercounts any
-    // call whose stride isn't 1: only every stride'th element is itself
-    // touched, but the elements in between are still part of the buffer
-    // the real function may read or write.
+    // argument value, a value loaded through a pointer argument, or a
+    // compile-time constant baked into the spec itself -- see that struct's
+    // doc), and const_size is the element size. n<=0 sizes to 0 (an empty
+    // vector, not an error); a negative stride is rejected (fail closed)
+    // rather than mishandled -- see _lind_compute_size's doc for both.
+    // Plain n*const_size (LIND_SIZE_FROM_ARG) undercounts any call whose
+    // stride isn't 1: only every stride'th element is itself touched, but
+    // the elements in between are still part of the buffer the real
+    // function may read or write. A plain contiguous walk (stride==1, the
+    // common case for an ordinary `x[i]` loop with no separate increment
+    // argument at all) still goes through this same kind, with its stride
+    // operand sourced as LIND_EXTENT_CONSTANT rather than read from an
+    // argument.
     LIND_SIZE_STRIDE_VECTOR     = 6,
 };
 
 // One scalar input to a size computation (currently: LIND_SIZE_STRIDE_VECTOR's
-// n and stride): either the argument's own value, or -- for calling
-// conventions that pass scalars by reference (e.g. Fortran's, where a
-// length or stride argument is a pointer to the value, not the value
-// itself) -- an i32 loaded through the pointer at that argument via the
-// checked cross-cage copy path. `source` is intentionally its own
-// dimension, independent of arg_index, so new load shapes (a different
-// width, or a different byte layout) extend this enum without touching
-// the spec field that names which argument the value comes from.
+// n and stride): the argument's own value, an i32 loaded through the
+// pointer at that argument via the checked cross-cage copy path (for
+// calling conventions that pass scalars by reference, e.g. Fortran's,
+// where a length or stride argument is a pointer to the value, not the
+// value itself), or a value baked into the spec at generation time with no
+// argument behind it at all (a genuine compile-time-constant stride, e.g.
+// an ordinary `x[i]` loop with no separate increment parameter). `source`
+// is intentionally its own dimension, independent of arg_index, so a new
+// load shape (a different width, or a different byte layout) extends this
+// enum without touching the spec field that names which argument the
+// value comes from.
 enum lind_extent_source {
     LIND_EXTENT_VALUE       = 0,  // raw_args[arg_index] is the value
     LIND_EXTENT_POINTEE_I32 = 1,  // raw_args[arg_index] is a pointer to it
+    LIND_EXTENT_CONSTANT    = 2,  // const_value IS the value; arg_index unused
 };
 
 struct lind_extent_operand {
-    uint32_t                 arg_index;
+    uint32_t                 arg_index;   // meaningful for VALUE/POINTEE_I32 only
     enum lind_extent_source  source;
+    uint32_t                 const_value; // meaningful for CONSTANT only
 };
 
 enum lind_return_kind {
@@ -558,19 +568,25 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
 // must not turn into an out-of-bounds read of this array -- fail closed.
 #define LIND_RAW_ARGS_MAX 6
 
-// Evaluates one lind_extent_operand: either the argument's own value, or an
-// i32 loaded through a pointer argument via the checked cross-cage copy
-// path (see lind_extent_operand's doc for why a by-reference source
-// exists). The pointee case validates the argument index, rejects a NULL
-// pointer, and reads through _lind_copy_or_abort exactly like any other
-// pointer-typed argument -- provenance and range checking come from that
-// existing mechanism, not from anything new here.
+// Evaluates one lind_extent_operand: the argument's own value, an i32
+// loaded through a pointer argument via the checked cross-cage copy path
+// (see lind_extent_operand's doc for why a by-reference source exists), or
+// a value baked into the spec itself with no argument lookup at all. The
+// pointee case validates the argument index, rejects a NULL pointer, and
+// reads through _lind_copy_or_abort exactly like any other pointer-typed
+// argument -- provenance and range checking come from that existing
+// mechanism, not from anything new here. The constant case never touches
+// raw_args, since it has no argument to read: checked and range-limited
+// at generation time (gen_grate.py), not here.
 static inline int32_t _lind_eval_extent_operand(
     const struct lind_extent_operand *op,
     const uint64_t *raw_args,
     uint64_t source_cage, uint64_t grate_cage,
     const char *reason)
 {
+    if (op->source == LIND_EXTENT_CONSTANT)
+        return (int32_t)op->const_value;
+
     if (op->arg_index >= LIND_RAW_ARGS_MAX)
         _lind_marshal_abort(reason);
     uint64_t raw = raw_args[op->arg_index];

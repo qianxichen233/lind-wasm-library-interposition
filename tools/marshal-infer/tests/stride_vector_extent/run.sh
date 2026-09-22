@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Regression tests for StrideVector extent-operand inference (issue #26
-# review): value-vs-pointee provenance, canonical-relationship proof for
-# length/stride, the escape-based fail-closed policy, and cross-module
-# callee resolution (direct-body use, no internal-name aliasing, ambiguity
-# detection). Each fixture is compiled via the real toolchain entry points
-# (`lind_compile --emit-llvm` / `--emit-marshal` -- see CLAUDE.md) and its
-# resulting JSON is checked against the expected decision, extent-operand
-# shape, and/or warning text. The last section runs a real "marshal"-decision
-# record through gen_grate.py itself, asserting the generated C source, not
-# a hand-built LIND_SIZE_STRIDE_VECTOR initializer.
+# review): value-vs-pointee-vs-constant provenance, canonical-relationship
+# proof for length/stride, the escape-based fail-closed policy, and
+# cross-module callee resolution (direct-body use, no internal-name
+# aliasing, ambiguity detection). Each fixture is compiled via the real
+# toolchain entry points (`lind_compile --emit-llvm` / `--emit-marshal` --
+# see CLAUDE.md) and its resulting JSON is checked against the expected
+# decision, extent-operand shape, and/or warning text. Later sections run a
+# real "marshal"-decision record through gen_grate.py itself, asserting the
+# generated C source, not a hand-built LIND_SIZE_STRIDE_VECTOR initializer.
 #
 # Usage: tools/marshal-infer/tests/stride_vector_extent/run.sh
 set -uo pipefail
@@ -192,6 +192,134 @@ json="$(infer_one noncanonical_scale)" && {
 }
 
 echo ""
+echo "=== constant-sourced stride: no caller argument behind the operand ==="
+# See constant_stride.c's own top comment for the full rationale (including
+# why sum_pointerwalk_cmp force_locals for an unrelated, pre-existing
+# reason). $2/$3: expected size_operand/stride_operand const_value ("" to
+# skip if not constant-sourced).
+json="$(infer_one constant_stride)" && {
+    cs_check() {
+        local fn="$1" wantDecision="$2" wantStrideConst="${3:-}"
+        local decision
+        decision="$(pyjq "$json" "([x for x in f['functions'] if x['name']=='$fn'] or [{'decision':'MISSING'}])[0]['decision']")"
+        check "constant stride: $fn decision" "$decision" "$wantDecision"
+        if [[ -n "$wantStrideConst" ]]; then
+            local strideOp
+            strideOp="$(pyjq "$json" "__import__('json').dumps(next((a.get('stride_operand') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None))")"
+            check "constant stride: $fn stride_operand" "$strideOp" \
+                "{\"arg_index\": -1, \"source\": \"constant\", \"const_value\": $wantStrideConst}"
+        fi
+    }
+    cs_check sum_indexed               marshal      1
+    cs_check sum_pointerwalk           marshal      1
+    cs_check sum_pointerwalk_cmp       force_local
+    cs_check sum_every_other           marshal      2
+    cs_check sum_fortran_len           marshal      1
+    cs_check sum_skip_first_indexed    force_local
+    cs_check sum_skip_first_pointerwalk force_local
+    check "constant stride: no stride_vector emitted for either skip_first variant" \
+        "$(pyjq "$json" "any(a.get('size_kind')=='stride_vector' for x in f['functions'] if 'skip_first' in x['name'] for a in x.get('args', []))")" \
+        "False"
+}
+
+echo ""
+echo "=== peeled-first-iteration recovery (max/min family) ==="
+# See peeled_prefix.c's own top comment for the full rationale. $2:
+# expected decision. $3/$4: expected size_operand/stride_operand arg_index
+# ("" to skip the shape check for a force_local case).
+json="$(infer_one peeled_prefix)" && {
+    pp_check() {
+        local fn="$1" wantDecision="$2" wantSizeIdx="${3:-}" wantStrideIdx="${4:-}"
+        local decision
+        decision="$(pyjq "$json" "([x for x in f['functions'] if x['name']=='$fn'] or [{'decision':'MISSING'}])[0]['decision']")"
+        check "peeled: $fn decision" "$decision" "$wantDecision"
+        if [[ -n "$wantSizeIdx" ]]; then
+            local sizeOp strideOp conf
+            sizeOp="$(pyjq "$json" "__import__('json').dumps(next((a.get('size_operand') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None))")"
+            check "peeled: $fn size_operand.arg_index" \
+                "$(echo "$sizeOp" | python3 -c "import json,sys; print(json.load(sys.stdin)['arg_index'])")" \
+                "$wantSizeIdx"
+            strideOp="$(pyjq "$json" "__import__('json').dumps(next((a.get('stride_operand') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None))")"
+            check "peeled: $fn stride_operand.arg_index" \
+                "$(echo "$strideOp" | python3 -c "import json,sys; print(json.load(sys.stdin)['arg_index'])")" \
+                "$wantStrideIdx"
+            conf="$(pyjq "$json" "next((a.get('confidence') for x in f['functions'] if x['name']=='$fn' for a in x.get('args',[]) if a.get('size_kind')=='stride_vector'), None)")"
+            check "peeled: $fn confidence" "$conf" "proven"
+        fi
+    }
+    pp_check peeled_max                    marshal 0 2
+    pp_check peeled_min                    marshal 0 2
+    pp_check peeled_max_fortran            marshal 0 2
+    pp_check peeled_max_wrapper            marshal 0 2
+    pp_check neg_missing_peel              force_local
+    pp_check neg_peel_wrong_offset         force_local
+    pp_check neg_peel_wrong_start          force_local
+    pp_check neg_peel_inclusive_bound      force_local
+    pp_check neg_peel_wrong_pointer        force_local
+    pp_check neg_peel_wrong_stride_var     force_local
+    pp_check neg_peel_extra_access         force_local
+    pp_check neg_peel_conditional          force_local
+    pp_check neg_peel_unresolvable_stride  force_local
+    pp_check neg_peel_escapes              force_local
+    pp_check neg_peel_no_guard             force_local
+}
+
+echo ""
+echo "=== malformed constant-operand metadata: gen_grate.py must reject, not repair ==="
+python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/tools/marshal-gen')
+from gen_grate import _valid_extent_operand, EXTENT_CONST_VALUE_MAX
+
+cases = [
+    ('missing const_value',        {'source': 'constant'}),
+    ('const_value zero',           {'source': 'constant', 'const_value': 0}),
+    ('const_value negative',       {'source': 'constant', 'const_value': -1}),
+    ('const_value non-integer',    {'source': 'constant', 'const_value': 1.5}),
+    ('const_value bool',           {'source': 'constant', 'const_value': True}),
+    ('const_value too large',      {'source': 'constant', 'const_value': EXTENT_CONST_VALUE_MAX + 1}),
+    ('arg_index alongside constant', {'source': 'constant', 'const_value': 1, 'arg_index': 0}),
+]
+bad = [desc for desc, o in cases if _valid_extent_operand(o, nargs=4)]
+if bad:
+    print('FAIL: accepted malformed operand(s): ' + ', '.join(bad))
+    sys.exit(1)
+good = {'source': 'constant', 'const_value': 1}
+if not _valid_extent_operand(good, nargs=4):
+    print('FAIL: rejected a well-formed constant operand')
+    sys.exit(1)
+print('ok')
+" && { echo "  ok    gen_grate.py: rejects every malformed constant operand, accepts a well-formed one"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  gen_grate.py: malformed constant-operand validation"; FAIL=$((FAIL+1)); }
+
+# arg_spec_body's own operand() builder is the SECOND, defense-in-depth gate
+# (see its comment) -- confirm it independently raises, not just
+# _valid_extent_operand (a caller could reach arg_spec_body directly without
+# going through is_marshalable() first).
+python3 -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/tools/marshal-gen')
+from gen_grate import Emitter
+
+bad_fn = {
+    'name': 'bad', 'decision': 'marshal',
+    'args': [{'kind': 'ptr', 'dir': 'in', 'size_kind': 'stride_vector',
+              'size_operand': {'arg_index': 0, 'source': 'value'},
+              'stride_operand': {'source': 'constant'},  # missing const_value
+              'const_size': 8}],
+    'ret': {'kind': 'void'},
+}
+e = Emitter()
+try:
+    e.emit_function_spec(bad_fn)
+    print('FAIL: arg_spec_body accepted a missing const_value')
+    sys.exit(1)
+except ValueError as e:
+    print('ok')
+" && { echo "  ok    gen_grate.py: arg_spec_body raises ValueError on malformed constant operand"; PASS=$((PASS+1)); } \
+  || { echo "  FAIL  gen_grate.py: arg_spec_body did not raise on malformed constant operand"; FAIL=$((FAIL+1)); }
+
+echo ""
 echo "=== genuine single-scalar out-param: unaffected by the escape gate ==="
 json="$(infer_one scalar_out)" && {
     check "decision" "$(pyjq "$json" "f['functions'][0]['decision']")" "marshal"
@@ -216,6 +344,22 @@ print(body)
         "2"
     check "generated spec declares stride_operand" \
         "$(echo "$generated" | grep -c '.stride_operand = { .arg_index = 3, .source = LIND_EXTENT_VALUE }')" \
+        "1"
+}
+
+json_cs="$(infer_one constant_stride)" && {
+    generated_cs="$(python3 -c "
+import json, sys
+sys.path.insert(0, '$REPO_ROOT/tools/marshal-gen')
+from gen_grate import Emitter
+f = json.load(open(sys.argv[1]))
+fn = [x for x in f['functions'] if x['name']=='sum_pointerwalk'][0]
+e = Emitter()
+name, body = e.emit_function_spec(fn)
+print(body)
+" "$json_cs")"
+    check "generated spec declares constant-sourced stride_operand" \
+        "$(echo "$generated_cs" | grep -c '.stride_operand = { .source = LIND_EXTENT_CONSTANT, .const_value = 1 }')" \
         "1"
 }
 

@@ -191,10 +191,15 @@ static void jsonNode(raw_ostream &os, const TreeNode *n, unsigned ind,
       // value or points to it (see ExtentOperand/ExtentSource in
       // ParamTree.h) -- collapsing that into a single index is exactly the
       // bug this shape exists to avoid (a Fortran-by-reference scalar's raw
-      // slot holds a pointer, not the number itself).
+      // slot holds a pointer, not the number itself). A Constant-sourced
+      // operand has no argument at all (arg_index is always -1, meaningless
+      // -- remapArg passes it through unchanged); "const_value" is what a
+      // reader/consumer should use instead.
       auto operand = [&](const char *key, const ExtentOperand &op) {
         os << ",\"" << key << "\":{\"arg_index\":" << remapArg(op.argIndex)
            << ",\"source\":"; jsonStr(os, extentSourceName(op.source));
+        if (op.source == ExtentSource::Constant)
+          os << ",\"const_value\":" << op.constValue;
         os << "}";
       };
       operand("size_operand", n->sizeOperand);

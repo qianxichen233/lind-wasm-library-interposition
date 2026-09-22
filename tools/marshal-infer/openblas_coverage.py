@@ -49,8 +49,10 @@ from gen_grate import is_marshalable, unmarshalable_reason, LIND_RAW_ARGS_MAX  #
 _SLOT_WARNING_RE = re.compile(r"needs (\d+) raw ABI slots")
 
 # GENERATED_FLOOR is a REGRESSION floor pinned to what generation already
-# achieves today (40), not a target padded down "for safety margin" -- any
-# drop below it would let a silent generated-handler regression slip back
+# achieves today (64, since the peeled-first-iteration proof recovered the
+# max/min family and the all-access-correctness-blocker fix -- see
+# PATTERNS.md), not a target padded down "for safety margin" -- any drop
+# below it would let a silent generated-handler regression slip back
 # through unnoticed. GENERATED_TARGET records the actual goal instead:
 # roughly 80 of the 89 functions the transport can carry at all (see
 # "transport accepted" above). Closing that gap is inference-side work
@@ -58,7 +60,7 @@ _SLOT_WARNING_RE = re.compile(r"needs (\d+) raw ABI slots")
 # analysis-friendlier compile profile for the library -- see PATTERNS.md --
 # never a guess at unproven compiler output); this script can only report
 # it, not close it, so it's a NOTE below, not a failure.
-GENERATED_FLOOR = 40
+GENERATED_FLOOR = 64
 GENERATED_TARGET = 80
 
 # Symbols this project's OpenBLAS interposition work is required to cover --

@@ -33,13 +33,18 @@ SIZE_KIND = {
     "stride_vector": "LIND_SIZE_STRIDE_VECTOR",
 }
 # StrideVector extent operands: whether a raw wasm argument slot IS the
-# value or points to it (see ParamTree.h's ExtentSource / lind_marshal.h's
-# lind_extent_source). Required because classic Fortran BLAS passes every
-# scalar by reference (`int *N`), unlike CBLAS's by-value `int n` -- the two
-# cannot share one representation without losing this distinction.
+# value, points to it, or the operand is a compile-time constant with no
+# argument behind it at all (see ParamTree.h's ExtentSource / lind_marshal.h's
+# lind_extent_source). The by-value/by-reference distinction is required
+# because classic Fortran BLAS passes every scalar by reference (`int *N`),
+# unlike CBLAS's by-value `int n` -- the two cannot share one representation
+# without losing this distinction. "constant" covers an ordinary contiguous
+# walk (stride==1) or a fixed compile-time interleave, proven directly from
+# the loop's own IR with no caller argument involved.
 EXTENT_SOURCE = {
     "value": "LIND_EXTENT_VALUE",
     "pointee_i32": "LIND_EXTENT_POINTEE_I32",
+    "constant": "LIND_EXTENT_CONSTANT",
 }
 RET_KIND = {
     "void": "LIND_RET_VOID",
@@ -167,19 +172,45 @@ FD_FUNCS = {
 }
 
 
+# _lind_eval_extent_operand casts a CONSTANT operand's value to int32_t
+# (lind_marshal.h); a const_value above this would silently become negative
+# on that cast, which the runtime's own negative-stride check would then
+# (correctly, but confusingly -- the config never asked for a negative
+# stride) reject at dispatch time instead of here at generation time.
+EXTENT_CONST_VALUE_MAX = 0x7FFFFFFF
+
+
 def _valid_extent_operand(o, nargs):
     """True iff `o` is a well-formed StrideVector size_operand/stride_operand:
-    a dict with an in-range integer arg_index and a known source. Malformed
-    metadata here (missing, wrong-typed, out-of-range, or an unrecognized
-    source string) must never be silently repaired into a valid-looking but
-    wrong handler -- see EXTENT_SOURCE's own comment on why source can't be
-    guessed."""
+    either a dict with an in-range integer arg_index and source "value"/
+    "pointee_i32" and no const_value, or one with source "constant" and a
+    positive, in-range const_value and no MEANINGFUL arg_index -- the two
+    shapes are mutually exclusive, not a fallback chain. marshal-infer's own
+    JSON always includes an "arg_index" key (its usual -1 "not applicable"
+    sentinel for a constant operand -- see ParamTree.h's ExtentOperand), so
+    -1 is tolerated there; any OTHER value alongside source=="constant" is a
+    self-contradictory spec (which one does the runtime honor?), not a
+    harmless redundancy, and rejected the same as a const_value present on
+    a non-constant operand. Malformed metadata here (missing, wrong-typed,
+    out-of-range, an unrecognized source string, or a field present on the
+    shape it doesn't belong to) must never be silently repaired into a
+    valid-looking but wrong handler -- see EXTENT_SOURCE's own comment on
+    why source can't be guessed."""
     if not isinstance(o, dict):
         return False
-    idx = o.get("arg_index")
-    if not isinstance(idx, int) or isinstance(idx, bool) or not (0 <= idx < nargs):
+    src = o.get("source")
+    if src not in EXTENT_SOURCE:
         return False
-    return o.get("source") in EXTENT_SOURCE
+    if src == "constant":
+        if o.get("arg_index", -1) != -1:
+            return False
+        v = o.get("const_value")
+        return (isinstance(v, int) and not isinstance(v, bool)
+                and 0 < v <= EXTENT_CONST_VALUE_MAX)
+    if "const_value" in o:
+        return False
+    idx = o.get("arg_index")
+    return isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < nargs
 
 
 def unmarshalable_reason(f, warn=False):
@@ -319,12 +350,24 @@ class Emitter:
             def operand(o, label):
                 if not isinstance(o, dict):
                     raise ValueError(f"stride_vector {label} missing/malformed: {o!r}")
-                idx = o.get("arg_index")
-                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
-                    raise ValueError(f"stride_vector {label} has invalid arg_index: {idx!r}")
                 src = o.get("source")
                 if src not in EXTENT_SOURCE:
                     raise ValueError(f"stride_vector {label} has unknown source: {src!r}")
+                if src == "constant":
+                    if o.get("arg_index", -1) != -1:
+                        raise ValueError(f"stride_vector {label} has a real arg_index "
+                                          f"alongside source=constant -- self-contradictory: {o!r}")
+                    v = o.get("const_value")
+                    if (not isinstance(v, int) or isinstance(v, bool)
+                            or not (0 < v <= EXTENT_CONST_VALUE_MAX)):
+                        raise ValueError(f"stride_vector {label} has invalid const_value: {v!r}")
+                    return f'{{ .source = {EXTENT_SOURCE[src]}, .const_value = {v} }}'
+                if "const_value" in o:
+                    raise ValueError(f"stride_vector {label} has const_value but "
+                                      f"source={src!r}, not constant -- self-contradictory: {o!r}")
+                idx = o.get("arg_index")
+                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+                    raise ValueError(f"stride_vector {label} has invalid arg_index: {idx!r}")
                 return f'{{ .arg_index = {idx}, .source = {EXTENT_SOURCE[src]} }}'
             const_size = a.get("const_size")
             if not isinstance(const_size, int) or isinstance(const_size, bool) or const_size <= 0:
