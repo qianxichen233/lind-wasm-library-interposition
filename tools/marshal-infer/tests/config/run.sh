@@ -223,9 +223,8 @@ echo ""
 echo "=== unrollable loop with no separate counter: no heuristic left to recover it ==="
 # walk_heuristic.c's real -O2 build unrolls this loop, defeating the exact
 # trip-count/stride proofs -- there is no longer a relaxed-policy fallback
-# to recover it (see PATTERNS.md's "signed counter unrolled at -O2" entry:
-# the supported answer is analyzing the library at a lower optimization
-# level, not guessing at the unrolled shape). Correctly, unconditionally
+# to recover it. The supported answer is analyzing the library at a lower
+# optimization level, not guessing at the unrolled shape. Correctly, unconditionally
 # force_local, no --config involved at all.
 cp "$SCRIPT_DIR/walk_heuristic.c" "$WORK/walk_heuristic.c"
 ( cd "$WORK" && "$LIND_COMPILE" --emit-llvm walk_heuristic.c -- -O2 ) >/dev/null 2>&1
@@ -300,8 +299,7 @@ matrix_check matrix_fortran_le_fwd           force_local
 
 echo ""
 echo "=== factored stride trip count: unconditional exact proof, no --config ==="
-# See factored_bound_pos.c/factored_bound_neg.c's own comments and
-# PATTERNS.md's "fused index/counter with a rescaled bound" entry. No
+# See factored_bound_pos.c/factored_bound_neg.c's own comments. No
 # --config anywhere in this section: detectFactoredStrideTripCount is
 # unconditionally available, part of the same always-on exact-proof
 # pipeline as ScalarEvolution's own trip-count analysis.

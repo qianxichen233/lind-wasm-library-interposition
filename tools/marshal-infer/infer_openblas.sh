@@ -100,8 +100,6 @@ BCDIR="${WORK}/bc"; mkdir -p "${BCDIR}"
 # like runtime-unroll-with-remainder rewrite a loop's exit test into a
 # form (an opaque equality check against a compiler-computed, sign-masked
 # bound) that is NOT the loop's original source-level condition at all.
-# See PATTERNS.md's "signed counter unrolled at -O2" entry for a concrete
-# case this specifically avoids.
 #
 # Every other flag (COMMON_OPT/CFLAGS aside) still mirrors
 # compile_openblas.sh's static (LIND_DYLINK=0, the default) build: any

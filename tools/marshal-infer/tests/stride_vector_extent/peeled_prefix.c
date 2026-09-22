@@ -1,6 +1,5 @@
-// Peeled-first-iteration StrideVector recovery (PATTERNS.md's "peeled
-// first iteration" entry; see local-notes/active/plan-openblas-max-family-
-// inference.md). OpenBLAS's isamax_k and 27 siblings peel the first
+// Peeled-first-iteration StrideVector recovery. OpenBLAS's isamax_k and
+// 27 siblings peel the first
 // element out of the loop by hand:
 //
 //   if (n <= 0 || inc_x <= 0) return(max);

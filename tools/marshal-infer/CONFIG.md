@@ -176,8 +176,7 @@ unrolled. What changes is how EASY that fact is for static analysis to
 prove — LLVM's runtime-unroll-with-remainder transform rewrites a loop's
 exit test into an opaque equality check against a compiler-computed,
 sign-masked bound that is no longer the loop's original source-level
-condition at all (see `PATTERNS.md`'s "signed counter unrolled at `-O2`"
-entry). Analyzing the unrolled form means proving facts about an
+condition at all. Analyzing the unrolled form means proving facts about an
 artifact of the optimizer; analyzing the un-unrolled form means proving
 facts about the loop the source actually wrote.
 
@@ -260,8 +259,7 @@ research/arg-marshalling/).
 ## The factored-bound proof
 
 Some loops use a SINGLE variable as both the array address and the loop's
-own exit counter, stepping by the stride rather than by 1 (see
-`PATTERNS.md`'s "fused index/counter with a rescaled bound" entry, e.g.
+own exit counter, stepping by the stride rather than by 1 (e.g.
 `kernel/riscv64/asum.c`'s `sasum_k`). To still run exactly `length`
 iterations with a step of `stride`, the source has to pre-scale its own
 exit bound to `stride * length` — which is exactly why the ordinary exact
@@ -333,7 +331,7 @@ strict at the time). `kernel/arm/sum.c`'s `ssum_`/`dsum_` and
 `kernel/riscv64/nrm2.c` have the identical rescaling but each add a
 further complication (a SIMD-fast-path control-flow merge; a
 possibly-negative stride compared via `abs()`) this proof correctly
-declines rather than reach for — see `PATTERNS.md` for both.
+declines rather than reach for.
 
 ## The single-element fallback requires full local visibility
 
@@ -384,27 +382,16 @@ guard-derived candidate is ever promoted to a real pairing on its own).
 Confirmed correct with a dedicated synthetic test
 (`tests/config/compound_guard.c`).
 
-Of the 203-42=161 remaining `force_local` functions, 114 are blocked by
-the raw-ABI-slot cap (`LIND_RAW_ARGS_MAX`, untouchable by any config or
-analysis choice) — an absolute floor. 203-114-1(variadic) = 88 is the
-practical ceiling for source-shape analysis against OpenBLAS's current
-binary, not 203. Two families sit in that remaining gap, both real
-candidates for a `contracts` entry (above) rather than a new inference
-recognizer: the peeled-prefix max/min family (`isamax_k` and 27 other
-exported symbols in the same kernel family — `PATTERNS.md`'s "peeled
-first iteration" entry) handles its first element
-before the loop starts, so the address induction variable's provable
-start is nonzero even though the true touched region does start at
-offset 0; and OpenBLAS's `ssum_`/`dsum_` family (`kernel/arm/sum.c`,
-OpenBLAS's shared fallback for targets with no dedicated plain-sum
-kernel) reassigns `n *= inc_x` and branches on a SIMD fast path before
-its final scalar tail loop, so the tail loop's own address induction
-variable is a phi merged from two different control-flow paths and
-ScalarEvolution can't prove its start is the constant 0 the zero-start
-proof requires. Neither is solvable by widening a compiler-output pattern
-match (see "Historical note" below for why that's the wrong tool); both
-have a real, source-verifiable `(length, stride)` relationship a
-`contracts` entry could assert directly.
+The current OpenBLAS run infers 66 of 203 exports as marshalable; 64
+produce generated handlers. Another 114 exports exceed the fixed raw-ABI
+slot cap (`LIND_RAW_ARGS_MAX`) and cannot be recovered by an inference
+setting. The peeled-prefix max/min family, including `isamax_k` and its
+siblings, is now covered by an exact proof. OpenBLAS's `ssum_`/`dsum_`
+family (`kernel/arm/sum.c`) remains outside that proof: it rescales `n`
+and merges a SIMD fast path with the scalar tail, leaving ScalarEvolution
+unable to prove the tail's starting offset. This is a candidate for a
+reviewed contract or a more general access-range proof, not a guess at
+compiler-generated loop shapes.
 
 ## Historical note: the removed relaxed-heuristic layer
 
@@ -428,8 +415,8 @@ OpenBLAS at a lower, non-unrolling optimization level instead (see "Why
 analyze at a different optimization level" above), every loop shape the
 heuristics used to paper over went back to being provable directly — the
 relaxed-policy count these heuristics used to reach against the real
-`-O2` build (26/203) is now exceeded by the strict, unconditional
-baseline alone (42/203), with zero guessing. Removing
+`-O2` build (26/203) is now exceeded by strict, unconditional
+inference (66/203), with zero guessing. Removing
 `analysis.policy`/`analysis.heuristics` from the config schema and every
 heuristic-specific code path in Infer.cpp took real, load-bearing
 complexity out of the tool for zero remaining benefit to any
@@ -469,16 +456,12 @@ nothing but a human noticing the number looked different.
 ## See also
 
 - `profiles/openblas.json` — currently just a coverage floor
-  (`min_marshal_count: 42`) to catch any future regression; no other field
+  (`min_marshal_count: 66`) to catch future regressions; no other field
   is needed against OpenBLAS's real binary once `infer_openblas.sh`
-  analyzes it at `-O1` (see above) -- 42/203 marshal, every decision an
-  exact proof.
+  analyzes it at `-O1` (see above).
 - `infer_openblas.sh` — the analysis-specific `-O1`/no-unroll/no-vectorize
   compile profile, and the `COMMON_OPT` gotcha for actually making it
   stick against OpenBLAS's own Makefile.
-- `PATTERNS.md` — real functions that stressed this analysis (solved and
-  still-open), across every part of the tool, not just this file's own
-  config mechanisms.
 - `tests/config/` — regression tests for schema validation (including
   present-but-wrong-typed fields), the unrollable-loop-with-no-recovery-
   path safety case, compound-guard disambiguation, the inclusive-bound

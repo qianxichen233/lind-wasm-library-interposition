@@ -4,8 +4,7 @@
 // kernels) -- this defeats both ScalarEvolution's exact trip-count proof
 // and the address induction variable's exact step proof at once. Compiled
 // at -O2 (not the test suite's usual -O1) specifically to trigger this
-// transform reliably. There is no longer any recovery path for this shape
-// (see PATTERNS.md's "signed counter unrolled at -O2" entry): the
+// transform reliably. There is no recovery path for this shape; the
 // supported answer is analyzing the library at a lower optimization level
 // instead, which this fixture is not meant to demonstrate -- it always
 // force_locals, confirming the tool degrades safely rather than guessing.

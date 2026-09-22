@@ -2,7 +2,7 @@
 // proof that a loop's exit bound of the form `stride * length` really
 // does mean length elements walked with that stride, for a loop whose
 // single index variable serves as both the array address and the exit
-// counter (see PATTERNS.md's "fused index/counter" entry). Each function
+// counter. Each function
 // here violates exactly one of the proof's required conditions and must
 // force_local -- the pointer is indexed by an offset that isn't provably
 // zero, so the dynamic-extent fail-closed check applies whenever no exact

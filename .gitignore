@@ -41,6 +41,7 @@ tests/grate-tests/lib-interpose/full-libm/generated/
 /tests/grate-tests/lib-interpose/*.md
 /tools/marshal-infer/README.md
 /tools/marshal-infer/example/README.md
+/tools/marshal-infer/PATTERNS.md
 /.codex/
 /AGENTS.md
 

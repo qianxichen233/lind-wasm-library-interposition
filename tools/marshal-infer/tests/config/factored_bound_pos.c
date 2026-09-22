@@ -1,8 +1,7 @@
 // Positive cases for detectFactoredStrideTripCount (Infer.cpp): every
 // function here must marshal unconditionally (no --config, no policy
 // opt-in) with confidence "proven" -- see factored_bound_neg.c for the
-// adversarial counterparts, and PATTERNS.md's "fused index/counter"
-// entry for the real OpenBLAS shape this recovers.
+// adversarial counterparts and the real OpenBLAS shape this recovers.
 
 void pos_signed_value(int n, int stride, double *x) {
   if (n <= 0 || stride <= 0) return;

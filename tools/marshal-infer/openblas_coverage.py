@@ -49,16 +49,15 @@ from gen_grate import is_marshalable, unmarshalable_reason, LIND_RAW_ARGS_MAX  #
 _SLOT_WARNING_RE = re.compile(r"needs (\d+) raw ABI slots")
 
 # GENERATED_FLOOR is a REGRESSION floor pinned to what generation already
-# achieves today (64, since the peeled-first-iteration proof recovered the
-# max/min family and the all-access-correctness-blocker fix -- see
-# PATTERNS.md), not a target padded down "for safety margin" -- any drop
-# below it would let a silent generated-handler regression slip back
+# achieves today (64, after peeled-first-iteration recovery and the
+# all-access correctness fix), not a target padded down "for safety
+# margin" -- any drop below it would let a silent generated-handler regression slip back
 # through unnoticed. GENERATED_TARGET records the actual goal instead:
 # roughly 80 of the 89 functions the transport can carry at all (see
 # "transport accepted" above). Closing that gap is inference-side work
 # (recognizing more of OpenBLAS's real loop shapes as sound proofs, or an
-# analysis-friendlier compile profile for the library -- see PATTERNS.md --
-# never a guess at unproven compiler output); this script can only report
+# analysis-friendlier compile profile for the library, never a guess at
+# unproven compiler output); this script can only report
 # it, not close it, so it's a NOTE below, not a failure.
 GENERATED_FLOOR = 64
 GENERATED_TARGET = 80
@@ -175,7 +174,7 @@ def main():
               f"target reached ({transport_accepted} transport-eligible total) "
               f"-- not a failure; closing this gap is inference-side work "
               f"(more contracts, or recognizing more of OpenBLAS's real loop "
-              f"shapes as sound proofs -- see PATTERNS.md), tracked "
+              f"shapes as sound proofs), tracked "
               f"separately.")
 
     wide = discovered - transport_accepted

@@ -406,8 +406,8 @@ struct LoopBound {
   // computed under).
   const GetElementPtrInst *gep = nullptr;
 
-  // Peeled-first-iteration candidate (PATTERNS.md's "peeled first
-  // iteration" entry; OpenBLAS's isamax_k and 27 siblings). Populated ONLY
+  // Peeled-first-iteration candidate (OpenBLAS's isamax_k and 27 siblings).
+  // Populated ONLY
   // when the address induction variable provably starts at EXACTLY the
   // stride recorded here instead of 0 -- kept in wholly SEPARATE fields
   // from `stride`/`constStride` above, never merged into them: a "starts
@@ -620,8 +620,8 @@ std::optional<uint64_t> unwrapConstantByteStride(const SCEV *S, uint64_t elemSiz
 
 // Peels a trip-count SCEV down to a bare argument when it's EXACTLY
 // `argument - 1` -- the shape SE.getTripCountFromExitCount produces for a
-// loop whose counter starts at the constant 1 instead of 0 (PATTERNS.md's
-// "peeled first iteration" family: `i=1; while(i<n)` runs n-1 times, the
+// loop whose counter starts at the constant 1 instead of 0 (`i=1;
+// while(i<n)` runs n-1 times, the
 // first element having been handled by hand before the loop). Unlike
 // unwrapArgumentSCEV (which requires the value to reduce to a BARE
 // argument, rejecting any Add outright), this recognizes that one
@@ -913,8 +913,8 @@ bool dominatorProvesPositiveBeforeInst(const Value *target, const Instruction *i
 // The shape this proves: a loop whose SINGLE index variable does double
 // duty as both the array address and the loop's own exit-test counter,
 // stepping by `provenStride` each iteration instead of by 1 (the common
-// BLAS idiom `n *= inc_x; while (i < n) { ...x[i]...; i += inc_x; }` --
-// see PATTERNS.md). To keep running exactly N iterations with a step of
+// BLAS idiom `n *= inc_x; while (i < n) { ...x[i]...; i += inc_x; }`).
+// To keep running exactly N iterations with a step of
 // `provenStride` rather than 1, the source has to pre-scale its own exit
 // bound to `provenStride * N`, which is exactly why the exact backedge-
 // taken-count proof above fails: the compiled bound is a genuine `mul`,
@@ -1144,7 +1144,7 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
             result.stride = strideArg;
             result.constStride = strideConstVal;
           } else {
-            // Peeled-first-iteration candidate (PATTERNS.md): the address
+            // Peeled-first-iteration candidate: the address
             // IV starts at EXACTLY the stride instead of 0 -- e.g.
             // `ix = inc_x;` before the loop, seeded by a peeled `x[0]`
             // access elsewhere. Recorded in wholly SEPARATE fields, never
@@ -1175,7 +1175,7 @@ LoopBound loopBoundValues(const GetElementPtrInst *gep) {
     }
     if (!addressAR) {
       // `*p; p++`: clang's OTHER lowering of the identical source-level
-      // fixed-stride walk (see PATTERNS.md) -- no array-index syntax at
+      // fixed-stride walk -- no array-index syntax at
       // all, so the GEP's own index is just a fixed per-iteration element
       // offset (typically `1`) and the recurrence instead lives on the
       // GEP's POINTER operand (a phi recurring on this same GEP around the
@@ -1578,8 +1578,8 @@ void collectAgreeingGeps(const Access &acc, const LoopBound &winner,
 // peeledLengthArg set by loopBoundValues: the address IV provably starts
 // at exactly the stride, and the loop's own trip count is exactly
 // peeledLengthArg-1) against an ACTUAL offset-zero access recorded in
-// `acc.staticAccesses` -- PATTERNS.md's "peeled first iteration" family
-// peels `x[0]` out by hand before the loop; loopBoundValues alone cannot
+// `acc.staticAccesses` -- this family peels `x[0]` out by hand before
+// the loop; loopBoundValues alone cannot
 // see that separate access, only this loop's own shape.
 //
 // Requires, all independently proven, none approximated:

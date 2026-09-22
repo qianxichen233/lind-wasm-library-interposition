@@ -2,10 +2,10 @@
 // step with no caller argument behind it at all (ExtentSource::Constant),
 // distinct from the argument-derived "value"/"pointee_i32" sources every
 // other fixture in this directory exercises. See CONFIG.md's "Confidence
-// model" and PATTERNS.md for how this composes with the rest of the
+// model" for how this composes with the rest of the
 // StrideVector proof; this file only covers the constant-stride path
 // itself, deliberately kept separate from the peeled-first-iteration
-// family's zero-start problem (PATTERNS.md) -- constant-stride support
+// family's zero-start problem -- constant-stride support
 // alone must never make a nonzero-start loop marshalable (see
 // skip_first_indexed/skip_first_pointerwalk below).
 //
@@ -95,7 +95,7 @@ double sum_fortran_len(int *N, double *X) {
 }
 
 // Nonzero-start, indexed form: the SAME peeled-first-element shape as
-// PATTERNS.md's max/min family (OpenBLAS's isamax_k and 27 siblings), with
+// the max/min family (OpenBLAS's isamax_k and 27 siblings), with
 // an ordinary constant unit stride standing in for their argument-derived
 // inc_x -- and, unlike this file's OTHER fixtures, this one HAS a
 // dominating x[0] access with the address IV starting exactly at the
