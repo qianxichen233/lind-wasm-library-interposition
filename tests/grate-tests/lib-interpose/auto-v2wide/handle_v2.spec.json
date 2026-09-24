@@ -1,0 +1,38 @@
+{
+  "module": "handle_v2",
+  "function_count": 4,
+  "functions": [
+    {
+      "name": "toy_ctx_create_v2",
+      "decision": "marshal",
+      "ret": {"kind": "handle", "handle_class": "ctx"},
+      "args": [
+        {"kind": "scalar", "type": "int", "size": 4}
+      ]
+    },
+    {
+      "name": "toy_ctx_get_val_v2",
+      "decision": "marshal",
+      "ret": {"kind": "scalar", "type": "int", "size": 4},
+      "args": [
+        {"kind": "handle", "handle_class": "ctx"}
+      ]
+    },
+    {
+      "name": "toy_ctx_close_v2",
+      "decision": "marshal",
+      "ret": {"kind": "void"},
+      "args": [
+        {"kind": "handle", "handle_class": "ctx"}
+      ]
+    },
+    {
+      "name": "toy_other_create_v2",
+      "decision": "marshal",
+      "ret": {"kind": "handle", "handle_class": "other"},
+      "args": [
+        {"kind": "scalar", "type": "int", "size": 4}
+      ]
+    }
+  ]
+}

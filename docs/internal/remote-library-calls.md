@@ -10,7 +10,7 @@ time and replaces it with an RPC wrapper.
 
 This mechanism is scoped to **inter-process and inter-machine** use. For
 **inter-cage** library interposition (redirecting calls to another cage in the same
-Wasmtime process), see the separate inter-cage interposition design.
+Wasmtime process), see [Library-Call Interposition Transport](library-interposition-transport.md).
 
 ---
 

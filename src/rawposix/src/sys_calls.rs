@@ -177,6 +177,13 @@ pub extern "C" fn fork_syscall(
             UNUSED_ARG,
             UNUSED_ID,
         );
+
+        // Copy the V2 (variable-width) library-call registration table too --
+        // without this, a child cage's own instance_dylink re-link (see
+        // wasmtime_lind_multi_process::fork_call) would find no V2
+        // registration for anything the parent registered, silently losing
+        // library interposition in the child after fork.
+        threei::copy_lib_handler_table_v2_to_cage(parent_cageid, child_cageid);
     }
 
     // Delegate execution back to binary runtime (currently only support Wasmtime,
@@ -431,6 +438,16 @@ pub extern "C" fn exit_group_syscall(
 
         cage::signal::signal::epoch_kill_all(cageid, tid as i32);
         threei::handler_table::_rm_grate_from_handler(cageid);
+        // Drop this cage's own V2 (variable-width) library-call
+        // registrations -- a dead cage's registration entries would
+        // otherwise linger indefinitely (nothing else ever reads or writes
+        // them again once the cage has exited).
+        threei::rm_cage_from_lib_handler_table_v2(cageid);
+        // Release every V2 registration id this cage held a reference to
+        // (its own table entries and any portal it installed), reclaiming
+        // the interned registration itself once no other live cage still
+        // references it -- see lib_handler_table_v2.rs's V2RefState doc.
+        threei::release_v2_registration_refs(cageid);
     }
 
     // Use the cage's authoritative recorded exit status so that whichever

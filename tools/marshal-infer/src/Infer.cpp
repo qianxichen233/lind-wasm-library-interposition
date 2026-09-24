@@ -2658,39 +2658,51 @@ void lowerAbiReturn(const Function &F, FunctionTrees &ft, bool trueSret,
         "synthetic leading pointer argument, not a return value");
 }
 
-// The interposition runtime's call-site transport is fixed-arity: the portal
-// (pass_fptr_to_wt) captures exactly LIND_RAW_ARGS_MAX=6 raw wasm-level
-// argument/cage-id pairs (tests/grate-tests/lib-interpose/lind_marshal.h),
-// and lind_marshal_dispatch aborts the whole grate process if a spec claims
-// more than that -- see the file's `if (spec->nargs > LIND_RAW_ARGS_MAX)
+// The V1 interposition transport is fixed-arity: the portal (pass_fptr_to_wt)
+// captures exactly LIND_RAW_ARGS_MAX=6 raw wasm-level argument/cage-id pairs
+// (tests/grate-tests/lib-interpose/lind_marshal.h), and V1's
+// lind_marshal_dispatch aborts the whole grate process if a spec claims more
+// than that -- see the file's `if (spec->nargs > LIND_RAW_ARGS_MAX)
 // _lind_marshal_abort(...)` guard. THIS is the single authoritative source of
 // the "6" below; keep it in sync if that constant ever changes.
+//
+// A wider function is NOT unmarshalable, though -- the variable-width V2
+// transport (local-notes/active/plan-variable-width-library-calls.md, Gates
+// 2-5) carries any argument count: gen_v2_adapter.py generates a real,
+// correctly-typed adapter and V1's own pointer/handle/copy-back safety logic
+// was refactored (Gate 4) into shared, nargs-parameterized primitives both
+// transports call, so a wide function's semantics are exactly as sound (or
+// unsound) as a narrow one's. This function therefore only ANNOTATES the
+// width now, rather than rejecting on it: gen_grate.py's OWN independent
+// width gate (unmarshalable_reason's max_args, defaulting to
+// LIND_RAW_ARGS_MAX) is what keeps V1 generation from picking up a function
+// this wide -- only gen_v2_adapter.py's max_args=None path does.
 //
 // A function's true raw-slot count is NOT its DWARF/C-level argument count --
 // it's post-ABI-lowering: the synthetic sret/fp128-return pointer (if any)
 // counts as one slot, and any argument with abiSlots>1 (fp128, see above)
-// counts as N slots, not one. Undercounting here is exactly the bug this
-// check exists to prevent: without it, marshal-infer marks a >6-slot function
-// "marshal", gen_grate.py happily registers a handler for it, and the FIRST
-// real call to it aborts the entire grate process at runtime -- taking down
-// every other function sharing that grate, not just the wide one.
+// counts as N slots, not one. Undercounting here would mean a function V1
+// genuinely cannot carry goes unlabeled, gen_grate.py's own default-max_args
+// check never seeing a reason to exclude it, and the FIRST real V1 call to
+// it aborting the entire grate process -- taking down every other function
+// sharing that grate, not just the wide one.
 constexpr unsigned kMaxRawArgSlots = 6;
 
-void enforceRawArgSlotCap(FunctionTrees &ft) {
+void annotateWideRawArgSlots(FunctionTrees &ft) {
   unsigned slots = ft.retSretArg ? 1 : 0;
   for (const auto &p : ft.params)
     slots += std::max<uint32_t>(1, p->abiSlots);
   if (slots <= kMaxRawArgSlots)
     return;
-  ft.forceLocal = true;
   ft.warnings.push_back(
       "function needs " + std::to_string(slots) + " raw ABI slots" +
       (ft.retSretArg ? " (including a synthetic sret/fp128-return pointer)"
                      : "") +
-      " but the interposition runtime's transport is fixed at " +
+      ", exceeding the V1 transport's fixed " +
       std::to_string(kMaxRawArgSlots) +
-      " (LIND_RAW_ARGS_MAX) — force_local (a wider spec would abort the "
-      "whole grate process on the first real call, not just fail this one)");
+      "-slot capacity (LIND_RAW_ARGS_MAX) — requires the variable-width V2 "
+      "transport (plan-variable-width-library-calls.md); gen_grate.py's own "
+      "width gate keeps V1 generation from picking this up");
 }
 
 // Config.h's ContractExtentOperand/dir strings are validated at load time
@@ -3283,13 +3295,15 @@ void inferFunction(const Function &F, FunctionTrees &ft,
     }
   }
 
-  // Final, unconditional gate: regardless of how every individual argument/
-  // return classified, a function whose total raw ABI slot count exceeds the
-  // runtime's fixed transport width can never be safely marshalled. Runs last
-  // (not folded into the per-arg loop above) because it needs the FINAL
-  // abiSlots/retSretArg state, which per-arg classification only finishes
-  // determining by the time this function returns.
-  enforceRawArgSlotCap(ft);
+  // Final pass: regardless of how every individual argument/return
+  // classified, a function whose total raw ABI slot count exceeds V1's fixed
+  // transport width still needs that width recorded so gen_grate.py (V1-only)
+  // can exclude it while gen_v2_adapter.py (variable-width) still picks it
+  // up -- see annotateWideRawArgSlots's own comment. Runs last (not folded
+  // into the per-arg loop above) because it needs the FINAL abiSlots/
+  // retSretArg state, which per-arg classification only finishes determining
+  // by the time this function returns.
+  annotateWideRawArgSlots(ft);
 }
 
 } // namespace marshal

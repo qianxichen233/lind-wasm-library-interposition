@@ -313,6 +313,216 @@ fn lib3i_unsupported_signature_reason(func_ty: &FuncType) -> Option<String> {
     None
 }
 
+// The V2 (variable-width) portal has no raw-argument-slot cap -- that is
+// its entire purpose -- but still carries only i32/i64/f32/f64 scalars and
+// at most one result, same as V1, since neither transport has a channel for
+// a v128 lane or an opaque reference. Mirrors
+// `lib3i_unsupported_signature_reason` minus the slot-count check.
+fn lib3i_v2_unsupported_signature_reason(func_ty: &FuncType) -> Option<String> {
+    for (i, p) in func_ty.params().enumerate() {
+        if !matches!(p, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64) {
+            return Some(format!(
+                "param {i} has type {p}, which the V2 transport cannot carry \
+                 (only i32/i64/f32/f64 scalars are supported)"
+            ));
+        }
+    }
+    if func_ty.results().len() > threei::V2_MAX_RESULTS {
+        return Some(format!(
+            "{} results, exceeding the V2 transport's {}-result capacity",
+            func_ty.results().len(),
+            threei::V2_MAX_RESULTS
+        ));
+    }
+    for (i, r) in func_ty.results().enumerate() {
+        if !matches!(r, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64) {
+            return Some(format!(
+                "result {i} has type {r}, which the V2 transport cannot carry \
+                 (only i32/i64/f32/f64 scalars are supported)"
+            ));
+        }
+    }
+    None
+}
+
+/// Resolves the calling cage's own "__errno_location" export and calls it,
+/// returning the wasm32 address of its errno cell, or `None` if no such
+/// export exists anywhere in the caller's current Store or the call itself
+/// fails.
+///
+/// Resolved FRESH from `caller`'s live Store on every call -- scanning
+/// every instance currently registered in the Store, the same instance set
+/// `all_memories()` already draws from -- rather than captured once at
+/// portal-install time and reused by the long-lived portal closure.
+/// `__errno_location` typically lives on libc.so's own dylink'd instance,
+/// not necessarily the calling instance, so a plain `Caller::get_export`
+/// (which only sees the calling instance's own exports) can't find it
+/// either way; the real reason for resolving fresh is lifecycle safety: a
+/// `Func` handle is tied to the specific Store it was resolved against, and
+/// is invalid if the portal closure that captured it is later replayed
+/// against a DIFFERENT Store -- e.g. fork's own re-linking of a child
+/// cage's freshly created Store. Capturing `errno_location_func: Func` once
+/// at portal-install time is exactly what caused this transport's V2 portal
+/// to crash under concurrent/forked calls before this function existed;
+/// resolving fresh here avoids that lifecycle hazard entirely, for both
+/// portals.
+fn caller_errno_addr<T>(caller: &mut Caller<'_, T>) -> Option<usize> {
+    let instances: Vec<Instance> = {
+        let mut ctx = caller.as_context_mut();
+        ctx.0.all_instances().collect()
+    };
+    let errno_loc = instances.into_iter().find_map(|instance| {
+        match instance.get_export(&mut *caller, "__errno_location") {
+            Some(Extern::Func(f)) => Some(f),
+            _ => None,
+        }
+    })?;
+    let typed = errno_loc.typed::<(), i32>(&*caller).ok()?;
+    let addr = typed.call(&mut *caller, ()).ok()?;
+    Some(addr as u32 as usize)
+}
+
+/// Reads one little-endian i32 from a caller's calling-instance memory at a
+/// wasm32 address, or `None` if there is no memory export or the read is
+/// out of bounds. Handles both unshared and `-pthread`-shared memory
+/// exports -- a `-pthread` caller exports memory as shared rather than
+/// unshared; the public `Memory` handle is tied to a specific store+
+/// instance index and can't be constructed from a bare `SharedMemory`, so
+/// this writes through its raw VM definition instead (bounds-checked by
+/// hand).
+fn caller_read_i32<T>(caller: &mut Caller<'_, T>, addr: usize) -> Option<i32> {
+    let mem = {
+        let mut it = caller.as_context_mut().0.all_memories();
+        let m = it.next();
+        drop(it);
+        m
+    };
+    match mem {
+        Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
+            let mut buf = [0u8; 4];
+            mem.read(&*caller, addr, &mut buf).ok()?;
+            Some(i32::from_le_bytes(buf))
+        }
+        Some(crate::runtime::vm::ExportMemory::Shared(vm_shared, _)) => {
+            let def = unsafe { vm_shared.vmmemory_ptr().as_ref() };
+            let len = def
+                .current_length
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if addr + 4 > len {
+                return None;
+            }
+            let mut buf = [0u8; 4];
+            unsafe {
+                core::ptr::copy_nonoverlapping(def.base.as_ptr().add(addr), buf.as_mut_ptr(), 4);
+            }
+            Some(i32::from_le_bytes(buf))
+        }
+        None => None,
+    }
+}
+
+/// Writes one little-endian i32 into a caller's calling-instance memory at a
+/// wasm32 address. Best-effort (silently does nothing if there is no memory
+/// export or the write is out of bounds), matching `caller_read_i32`'s own
+/// error handling.
+fn caller_write_i32<T>(caller: &mut Caller<'_, T>, addr: usize, value: i32) {
+    let mem = {
+        let mut it = caller.as_context_mut().0.all_memories();
+        let m = it.next();
+        drop(it);
+        m
+    };
+    match mem {
+        Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
+            let _ = mem.write(&mut *caller, addr, &value.to_le_bytes());
+        }
+        Some(crate::runtime::vm::ExportMemory::Shared(vm_shared, _)) => {
+            let def = unsafe { vm_shared.vmmemory_ptr().as_ref() };
+            let len = def
+                .current_length
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if addr + 4 <= len {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        value.to_le_bytes().as_ptr(),
+                        def.base.as_ptr().add(addr),
+                        4,
+                    );
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+/// Seeds the grate's errno (`threei::set_next_grate_errno_seed`) with this
+/// cage's own current errno value, before dispatching an interposed call.
+/// The grate's errno is a separate value that persists across calls
+/// independently of this cage's own resets (e.g. a test's `errno = 0;`
+/// right before the call) -- without seeding, a stale value left by an
+/// earlier, unrelated interposed call would leak into every later call
+/// that doesn't itself touch errno. Best-effort: a cage without
+/// `__errno_location` just leaves the seed unset. Shared by both the V1 and
+/// V2 portals below.
+fn seed_grate_errno_from_caller<T>(caller: &mut Caller<'_, T>) {
+    let seed = caller_errno_addr(caller).and_then(|addr| caller_read_i32(caller, addr));
+    threei::set_next_grate_errno_seed(seed);
+}
+
+/// Relays the grate's post-call errno (`threei::take_last_grate_errno`, set
+/// by the grate worker that just ran -- see that function's own doc) into
+/// this cage's own errno slot. errno is ambient, per-cage state that
+/// dispatch's own arg/return marshalling never sees: the real call just ran
+/// inside the grate's own separate address space, so its errno write is
+/// otherwise invisible to this (caller's) cage. Called unconditionally
+/// after dispatch, regardless of outcome. Best-effort: a callee without
+/// `__errno_location`, or a cage whose libc doesn't export it, just skips
+/// this. Shared by both the V1 and V2 portals below.
+fn relay_grate_errno_to_caller<T>(caller: &mut Caller<'_, T>) {
+    if let Some(errno_val) = threei::take_last_grate_errno() {
+        if let Some(addr) = caller_errno_addr(caller) {
+            caller_write_i32(caller, addr, errno_val);
+        }
+    }
+}
+
+fn v2_value_type_from_wasmtime(ty: &ValType) -> Option<threei::V2ValueType> {
+    match ty {
+        ValType::I32 => Some(threei::V2ValueType::I32),
+        ValType::I64 => Some(threei::V2ValueType::I64),
+        ValType::F32 => Some(threei::V2ValueType::F32),
+        ValType::F64 => Some(threei::V2ValueType::F64),
+        _ => None,
+    }
+}
+
+/// The LOGICAL `V2Signature` a caller's own imported function type
+/// describes -- no leading `(source_cage, grate_cage)` params here (those
+/// are adapter-internal, added only on the grate side; see
+/// `V2_ADAPTER_LEADING_PARAMS`). A `V2Registration`'s own `signature` is
+/// always in this same logical shape, so the two are directly comparable.
+/// Panics if a param/result type is not representable in the V2
+/// vocabulary; callers must check `lib3i_v2_unsupported_signature_reason`
+/// first.
+fn v2_signature_from_func_ty(func_ty: &FuncType) -> threei::V2Signature {
+    threei::V2Signature {
+        params: func_ty
+            .params()
+            .map(|p| {
+                v2_value_type_from_wasmtime(&p)
+                    .expect("validated by lib3i_v2_unsupported_signature_reason")
+            })
+            .collect(),
+        results: func_ty
+            .results()
+            .map(|r| {
+                v2_value_type_from_wasmtime(&r)
+                    .expect("validated by lib3i_v2_unsupported_signature_reason")
+            })
+            .collect(),
+    }
+}
+
 impl<T> Linker<T> {
     /// Creates a new [`Linker`].
     ///
@@ -1166,6 +1376,182 @@ impl<T> Linker<T> {
 
             let export = match export {
                 Extern::Func(original_func) => {
+                    // V2 (variable-width) library-level 3i: checked BEFORE the V1
+                    // fixed six-slot path below, so a symbol registered through
+                    // register_lib_handler_v2 always gets the V2 portal even if a
+                    // stale V1 registration also exists for it. Captures
+                    // (grate_cage, handler_id, signature_id) at link time -- never
+                    // a raw grate-linear-memory function/context pointer, see
+                    // V2Registration's own doc -- and calls dispatch_lib_call_v2.
+                    if let Some(cid) = cage_id {
+                        if let Some((handler_id, registration)) =
+                            threei::get_lib_handler_v2(cid, module_name, &name)
+                        {
+                            let func_ty = original_func.ty(&store);
+                            if let Some(reason) = lib3i_v2_unsupported_signature_reason(&func_ty) {
+                                let symbol = format!("{module_name}.{name}");
+                                let signature = lib3i_format_signature(&func_ty);
+                                let portal =
+                                    Func::new(&mut store, func_ty.clone(), move |_, _, _| {
+                                        bail!(
+                                            "lib-3i V2 portal: {symbol} {signature} cannot be \
+                                             transported: {reason}"
+                                        );
+                                    });
+                                self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
+                                continue;
+                            }
+
+                            // Identity validation, before a V2Request is ever built for
+                            // this symbol: the APP's own imported signature (func_ty) must
+                            // structurally match what was actually registered. Without
+                            // this, a stale or wrong registration would only surface later,
+                            // per call, as a wasmtime-level arity/type error deep inside
+                            // call_v2_adapter -- reported as a generic Trapped outcome
+                            // instead of a clear, one-time, install-time diagnostic. This
+                            // is a genuinely new class of check V1 never needed (V1's portal
+                            // has one uniform fixed shape for every symbol; V2's per-symbol
+                            // signatures make a caller/registration mismatch possible).
+                            let caller_sig = v2_signature_from_func_ty(&func_ty);
+                            if caller_sig != registration.signature {
+                                let symbol = format!("{module_name}.{name}");
+                                let expected_sig = registration.signature.clone();
+                                let portal =
+                                    Func::new(&mut store, func_ty.clone(), move |_, _, _| {
+                                        bail!(
+                                            "lib-3i V2 portal: {symbol} cannot be transported: \
+                                             imported signature {caller_sig:?} does not match \
+                                             registered signature {expected_sig:?}"
+                                        );
+                                    });
+                                self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
+                                continue;
+                            }
+
+                            let grate_cage = registration.grate_cage;
+                            let signature_id = registration.signature.id();
+                            let expected_results: Vec<threei::V2ValueType> = func_ty
+                                .results()
+                                .map(|r| {
+                                    v2_value_type_from_wasmtime(&r).expect(
+                                        "validated by lib3i_v2_unsupported_signature_reason",
+                                    )
+                                })
+                                .collect();
+                            let result_types: Vec<ValType> = func_ty.results().collect();
+                            let symbol_for_portal = format!("{module_name}.{name}");
+
+                            // This cage now holds a live reference to `handler_id`: a
+                            // portal capturing it is about to be installed into this
+                            // cage's own instance, and that closure's captured id is
+                            // invisible to (and outlives) the (lib, symbol) -> id table
+                            // entry it was looked up from -- re-registering the same
+                            // (lib, symbol) later never touches an already-installed
+                            // portal (see `V2Registration`'s own doc). Released as a
+                            // unit, alongside this cage's table entries, at cage exit
+                            // (`release_v2_registration_refs`) -- see
+                            // `lib_handler_table_v2.rs`'s module doc.
+                            threei::add_v2_registration_ref(handler_id, cid);
+
+                            let portal = Func::new(
+                                &mut store,
+                                func_ty.clone(),
+                                move |mut caller, params, results| {
+                                    let args: Vec<threei::V2Arg> = params
+                                        .iter()
+                                        .map(|v| {
+                                            let value = match v {
+                                                Val::I32(x) => threei::V2Value::i32(*x),
+                                                Val::I64(x) => threei::V2Value::i64(*x),
+                                                Val::F32(b) => threei::V2Value::f32_bits(*b),
+                                                Val::F64(b) => threei::V2Value::f64_bits(*b),
+                                                // unreachable: signature already
+                                                // validated to be all scalars above
+                                                _ => threei::V2Value::i32(0),
+                                            };
+                                            threei::V2Arg { value, cageid: cid }
+                                        })
+                                        .collect();
+
+                                    let req = threei::V2Request {
+                                        abi_version: threei::V2_ABI_VERSION,
+                                        handler_id,
+                                        caller_cage: cid,
+                                        signature_id,
+                                        args,
+                                        expected_results: expected_results.clone(),
+                                    };
+
+                                    seed_grate_errno_from_caller(&mut caller);
+                                    let outcome = threei::dispatch_lib_call_v2(grate_cage, req);
+                                    relay_grate_errno_to_caller(&mut caller);
+
+                                    match outcome {
+                                        threei::V2Outcome::Ok(values) => {
+                                            for (slot, v) in results.iter_mut().zip(values.iter()) {
+                                                *slot = match v.ty {
+                                                    threei::V2ValueType::I32 => {
+                                                        Val::I32(v.bits as i32)
+                                                    }
+                                                    threei::V2ValueType::I64 => {
+                                                        Val::I64(v.bits as i64)
+                                                    }
+                                                    threei::V2ValueType::F32 => {
+                                                        Val::F32(v.bits as u32)
+                                                    }
+                                                    threei::V2ValueType::F64 => Val::F64(v.bits),
+                                                };
+                                            }
+                                            Ok(())
+                                        }
+                                        // Rejected (never reached the real handler) and
+                                        // Trapped (the handler ran and did not return
+                                        // normally) are both reported the same way at
+                                        // this boundary: if there is a result slot to
+                                        // carry a sentinel through, matching V1's own
+                                        // GRATE_ERR convention (a non-fatal, checkable
+                                        // return value) lets the caller distinguish and
+                                        // handle failure without crashing; a genuinely
+                                        // void call has no such slot, so this is a real
+                                        // wasm trap instead -- there is no other channel.
+                                        threei::V2Outcome::Rejected(reason)
+                                        | threei::V2Outcome::Trapped(reason) => {
+                                            lind_log!(
+                                                DYLINK,
+                                                "lib-3i V2 portal: {} rejected/trapped: {}",
+                                                symbol_for_portal,
+                                                reason
+                                            );
+                                            if results.is_empty() {
+                                                bail!(
+                                                    "lib-3i V2 portal: {symbol_for_portal} \
+                                                     rejected: {reason}"
+                                                );
+                                            }
+                                            const V2_GRATE_ERR: i64 = -0x1FFF_0003;
+                                            for (slot, ty) in
+                                                results.iter_mut().zip(result_types.iter())
+                                            {
+                                                *slot = match ty {
+                                                    ValType::I32 => Val::I32(V2_GRATE_ERR as i32),
+                                                    ValType::I64 => Val::I64(V2_GRATE_ERR),
+                                                    ValType::F32 => Val::F32(V2_GRATE_ERR as u32),
+                                                    ValType::F64 => Val::F64(V2_GRATE_ERR as u64),
+                                                    _ => {
+                                                        unreachable!("validated to be scalar above")
+                                                    }
+                                                };
+                                            }
+                                            Ok(())
+                                        }
+                                    }
+                                },
+                            );
+                            self.insert(key, Definition::new(store.0, Extern::Func(portal)))?;
+                            continue;
+                        }
+                    }
+
                     // Library-level 3i: if a handler has been registered for this
                     // (cage_id, module_name, symbol), install a portal that captures
                     // (handler_cage_id, fn_ptr) at link time and calls dispatch_lib_call.
@@ -1196,24 +1582,6 @@ impl<T> Linker<T> {
 
                             let name_for_got = name.clone();
                             let func_ty_for_portal = func_ty.clone();
-                            // Resolved once here (like handler_cage_id/fn_ptr above)
-                            // rather than via Caller::get_export inside the portal:
-                            // __errno_location lives on libc.so's own dylink'd
-                            // instance, not on whichever instance happens to call
-                            // through this portal, so Caller::get_export (which only
-                            // sees the *calling* instance's own exports) can't find
-                            // it. This cage's "env" namespace is shared by every
-                            // dylink'd library, so the linker's own lookup does.
-                            let errno_location_func = self
-                                .get(&mut store, "env", "__errno_location")
-                                .ok()
-                                .and_then(|e| {
-                                    if let Extern::Func(f) = e {
-                                        Some(f)
-                                    } else {
-                                        None
-                                    }
-                                });
                             let portal = Func::new(
                                 &mut store,
                                 func_ty,
@@ -1231,69 +1599,7 @@ impl<T> Linker<T> {
                                         };
                                     }
 
-                                    // Seed the grate's errno with this cage's own
-                                    // current value before dispatching. The grate's
-                                    // errno is a separate value that persists across
-                                    // calls independently of this cage's own resets
-                                    // (e.g. a test's `errno = 0;` right before the
-                                    // call) -- without seeding, a stale value left by
-                                    // an earlier, unrelated interposed call would leak
-                                    // into every later call that doesn't itself touch
-                                    // errno. See threei::set_next_grate_errno_seed's
-                                    // doc. Best-effort, same as the post-call relay
-                                    // below.
-                                    if let Some(errno_loc) = errno_location_func {
-                                        if let Ok(typed) = errno_loc.typed::<(), i32>(&caller) {
-                                            if let Ok(addr) = typed.call(&mut caller, ()) {
-                                                let addr = addr as u32 as usize;
-                                                let mem = {
-                                                    let mut it =
-                                                        caller.as_context_mut().0.all_memories();
-                                                    let m = it.next();
-                                                    drop(it);
-                                                    m
-                                                };
-                                                let seed = match mem {
-                                                    Some(
-                                                        crate::runtime::vm::ExportMemory::Unshared(
-                                                            mem,
-                                                        ),
-                                                    ) => {
-                                                        let mut buf = [0u8; 4];
-                                                        mem.read(&caller, addr, &mut buf)
-                                                            .ok()
-                                                            .map(|_| i32::from_le_bytes(buf))
-                                                    }
-                                                    Some(
-                                                        crate::runtime::vm::ExportMemory::Shared(
-                                                            vm_shared,
-                                                            _,
-                                                        ),
-                                                    ) => {
-                                                        let def = unsafe {
-                                                            vm_shared.vmmemory_ptr().as_ref()
-                                                        };
-                                                        let len = def.current_length.load(
-                                                            core::sync::atomic::Ordering::Relaxed,
-                                                        );
-                                                        (addr + 4 <= len).then(|| {
-                                                            let mut buf = [0u8; 4];
-                                                            unsafe {
-                                                                core::ptr::copy_nonoverlapping(
-                                                                    def.base.as_ptr().add(addr),
-                                                                    buf.as_mut_ptr(),
-                                                                    4,
-                                                                );
-                                                            }
-                                                            i32::from_le_bytes(buf)
-                                                        })
-                                                    }
-                                                    None => None,
-                                                };
-                                                threei::set_next_grate_errno_seed(seed);
-                                            }
-                                        }
-                                    }
+                                    seed_grate_errno_from_caller(&mut caller);
 
                                     let ret = threei::dispatch_lib_call(
                                         handler_cage_id,
@@ -1312,78 +1618,7 @@ impl<T> Linker<T> {
                                         cid,
                                     );
 
-                                    // errno is ambient, per-cage TLS state that
-                                    // dispatch_lib_call's arg/return marshalling never
-                                    // sees -- the real call just ran inside the grate's
-                                    // own address space, so its errno write is invisible
-                                    // to this (caller's) cage. Relay the grate's
-                                    // post-call errno (captured by the grate worker,
-                                    // see threei::take_last_grate_errno's doc) into this
-                                    // cage's own errno slot, via the errno_location_func
-                                    // resolved above. Best-effort: a callee without
-                                    // __errno_location, or a cage whose libc doesn't
-                                    // export it, just skips this.
-                                    if let Some(errno_val) = threei::take_last_grate_errno() {
-                                        if let Some(errno_loc) = errno_location_func {
-                                            if let Ok(typed) = errno_loc.typed::<(), i32>(&caller) {
-                                                if let Ok(addr) = typed.call(&mut caller, ()) {
-                                                    // addr is a wasm32 pointer; zero-extend through u32
-                                                    // first, since `i32 as usize` sign-extends and a high
-                                                    // address (top bit set) would otherwise become a
-                                                    // bogus, huge 64-bit offset (see the identical fix in
-                                                    // lind-3i's run()).
-                                                    let addr = addr as u32 as usize;
-                                                    // dylink modules import (not export)
-                                                    // memory, so get_export("memory") is
-                                                    // always None here -- use
-                                                    // all_memories() on the StoreOpaque
-                                                    // directly, matching the remote-lib
-                                                    // wrapper's memory lookup above.
-                                                    let mem = {
-                                                        let mut it = caller
-                                                            .as_context_mut()
-                                                            .0
-                                                            .all_memories();
-                                                        let m = it.next();
-                                                        drop(it);
-                                                        m
-                                                    };
-                                                    match mem {
-                                                        Some(crate::runtime::vm::ExportMemory::Unshared(mem)) => {
-                                                            let _ = mem.write(
-                                                                &mut caller,
-                                                                addr,
-                                                                &errno_val.to_le_bytes(),
-                                                            );
-                                                        }
-                                                        // A `-pthread` caller exports memory as
-                                                        // shared rather than unshared; the public
-                                                        // `Memory` handle is tied to a specific
-                                                        // store+instance index and can't be
-                                                        // constructed from a bare SharedMemory, so
-                                                        // write through its raw VM definition
-                                                        // instead (bounds-checked by hand).
-                                                        Some(crate::runtime::vm::ExportMemory::Shared(vm_shared, _)) => {
-                                                            let def = unsafe { vm_shared.vmmemory_ptr().as_ref() };
-                                                            let len = def.current_length.load(
-                                                                core::sync::atomic::Ordering::Relaxed,
-                                                            );
-                                                            if addr + 4 <= len {
-                                                                unsafe {
-                                                                    core::ptr::copy_nonoverlapping(
-                                                                        errno_val.to_le_bytes().as_ptr(),
-                                                                        def.base.as_ptr().add(addr),
-                                                                        4,
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                        None => {}
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    relay_grate_errno_to_caller(&mut caller);
 
                                     // ret now carries the callee's real return value at
                                     // full 64-bit width (see threei::dispatch_lib_call /

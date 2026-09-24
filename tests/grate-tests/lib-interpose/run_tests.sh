@@ -81,6 +81,32 @@ fi
 cp "$SCRIPT_DIR/auto-openblas-daxpy/libblastoy.so" "$LINDFS/lib/libblastoy.so"
 echo ""
 
+# auto-openblas-v2wide/libdaxpby_v2_stub.c is the preloaded fixture library
+# for the auto-openblas-v2wide-real test below (its own comment explains why
+# a stub is still needed even though the REAL cblas_daxpby is what actually
+# answers the interposed call).
+echo "Building shared fixture: libdaxpby_v2_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-openblas-v2wide/libdaxpby_v2_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-openblas-v2wide/libdaxpby_v2_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-openblas-v2wide/libdaxpby_v2_stub.so" "$LINDFS/lib/libdaxpby_v2_stub.so"
+echo ""
+
+# auto-openblas-v2wide/libdaxpby_fortran_v2_stub.c: same role, for the
+# classic Fortran-BLAS daxpby_ form's all-pointer signature.
+echo "Building shared fixture: libdaxpby_fortran_v2_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-openblas-v2wide/libdaxpby_fortran_v2_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-openblas-v2wide/libdaxpby_fortran_v2_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-openblas-v2wide/libdaxpby_fortran_v2_stub.so" "$LINDFS/lib/libdaxpby_fortran_v2_stub.so"
+echo ""
+
 # auto-conststride/libconststride.c is the preloaded fixture library for the
 # auto-conststride test below (constant-sourced StrideVector extent
 # operands -- an ordinary contiguous `x[i]` walk with no increment
@@ -93,6 +119,71 @@ if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-conststride/libconststr
     exit 2
 fi
 cp "$SCRIPT_DIR/auto-conststride/libconststride.so" "$LINDFS/lib/libconststride.so"
+echo ""
+
+# auto-v2wide/libtoy_wide_stub.c is the preloaded fixture library for the
+# auto-v2wide tests below. register_lib_handler cannot fabricate a symbol
+# out of nothing, only intercept a real one -- this body must never
+# actually run once interposed (see fail-registration's identical
+# convention); it exists purely to satisfy the dynamic linker.
+echo "Building shared fixture: libtoy_wide_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-v2wide/libtoy_wide_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-v2wide/libtoy_wide_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-v2wide/libtoy_wide_stub.so" "$LINDFS/lib/libtoy_wide_stub.so"
+echo ""
+
+# auto-v2wide/libtoy_wide_real_stub.c: same role as libtoy_wide_stub.so, but
+# matching toy_wide_marshal's REAL direct 9-argument signature (v2wide_cage.c/
+# libtoy_wide_stub.c instead pack those into one struct pointer, for
+# v2wide_shim_grate.c's V1-shim workaround -- see that grate's own doc for
+# why the shim exists at all).
+echo "Building shared fixture: libtoy_wide_real_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-v2wide/libtoy_wide_real_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-v2wide/libtoy_wide_real_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-v2wide/libtoy_wide_real_stub.so" "$LINDFS/lib/libtoy_wide_real_stub.so"
+echo ""
+
+# auto-v2wide/libtoy_handle_v2_stub.c: preloaded fallback for the V2 handle
+# round-trip proof -- same fail-closed-stub role as
+# libtoy_wide_real_stub.so above.
+echo "Building shared fixture: libtoy_handle_v2_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-v2wide/libtoy_handle_v2_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-v2wide/libtoy_handle_v2_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-v2wide/libtoy_handle_v2_stub.so" "$LINDFS/lib/libtoy_handle_v2_stub.so"
+echo ""
+
+# auto-v2wide/v2wide_adapters.c is generated fresh here with
+# tools/marshal-gen/gen_v2_adapter.py from the checked-in
+# auto-v2wide/v2wide.spec.json) -- same "compiled fresh from source each
+# run" reasoning as every other fixture above, one level up: this is what
+# proves the generator's CURRENT output builds and behaves correctly, not a
+# frozen snapshot that could silently go stale under it.
+echo "Generating auto-v2wide/v2wide_adapters.c from v2wide.spec.json"
+if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_v2_adapter.py" \
+        "$SCRIPT_DIR/auto-v2wide/v2wide.spec.json" \
+        --lib-name libtoy_wide --manifest-version 2 \
+        --out "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c" \
+        > /tmp/lib-interpose-gen-v2wide.log 2>&1; then
+    echo "FATAL: gen_v2_adapter.py failed to generate the v2wide adapter:" >&2
+    cat /tmp/lib-interpose-gen-v2wide.log >&2
+    exit 1
+fi
+if ! grep -q "__lind_v2_adapter_toy_wide_marshal" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c"; then
+    echo "FATAL: generated v2wide adapter is missing __lind_v2_adapter_toy_wide_marshal" >&2
+    exit 1
+fi
 echo ""
 
 PASS=0
@@ -348,6 +439,55 @@ else
     echo ""
 fi
 
+# Pre-flight for the real-library wide-call proof: needs the same live
+# openblas.marshal.json as auto-openblas-daxpy
+# above, PLUS a real, already-built wasm32 libopenblas.a (produced by
+# lind-wasm-apps/openblas/compile_openblas.sh, the same archive
+# infer_openblas.sh itself analyzes) to link the REAL implementation into
+# the grate -- not a hand-written stand-in the way libblastoy.c is for V1.
+# Both are gitignored/external, so this skips (not fails) when either is
+# absent, same posture as the OPENBLAS_JSON check above.
+APPS_ROOT="${LIND_WASM_APPS_ROOT:-$(cd "$REPO_ROOT/.." && pwd)/lind-wasm-apps}"
+OPENBLAS_A="$APPS_ROOT/openblas/libopenblas.a"
+OPENBLAS_V2_GEN_OK="no"
+if [[ "$OPENBLAS_DAXPY_GEN_OK" == "yes" && -f "$OPENBLAS_A" ]]; then
+    # Regenerated straight from the LIVE openblas.marshal.json every run,
+    # same "nothing here trusts a locally-built artifact" reasoning as
+    # openblas_daxpy_auto_grate.c above -- this proves TODAY's inference
+    # output (specifically, Infer.cpp's annotateWideRawArgSlots no longer
+    # force_localing cblas_daxpby purely for its 7-raw-ABI-slot width) is
+    # what gen_v2_adapter.py actually consumes, not a frozen snapshot.
+    # Both the CBLAS (by-value, LIND_EXTENT_VALUE) and classic Fortran-BLAS
+    # (by-reference, LIND_EXTENT_POINTEE_I32) forms of daxpby land in ONE
+    # generated file -- proving both StrideVector extent-source conventions
+    # survive the real V2 path, not just one of them.
+    echo "Generating auto-openblas-v2wide/daxpby_v2_adapter.c from $(basename "$OPENBLAS_JSON")"
+    if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_v2_adapter.py" "$OPENBLAS_JSON" \
+            --lib-name openblas --only cblas_daxpby,daxpby_ --manifest-version 1 \
+            --out "$SCRIPT_DIR/auto-openblas-v2wide/daxpby_v2_adapter.c" \
+            > /tmp/lib-interpose-gen-openblas-v2.log 2>&1; then
+        echo "FATAL: gen_v2_adapter.py failed to generate the daxpby V2 adapters:" >&2
+        cat /tmp/lib-interpose-gen-openblas-v2.log >&2
+        exit 1
+    fi
+    gen_v2_missing=()
+    for sym in __lind_v2_adapter_cblas_daxpby __lind_v2_adapter_daxpby_; do
+        grep -q "$sym" "$SCRIPT_DIR/auto-openblas-v2wide/daxpby_v2_adapter.c" || gen_v2_missing+=("$sym")
+    done
+    if [[ ${#gen_v2_missing[@]} -gt 0 ]]; then
+        echo "FATAL: generated V2 adapter is missing: ${gen_v2_missing[*]}" >&2
+        exit 1
+    fi
+    OPENBLAS_V2_GEN_OK="yes"
+    echo ""
+else
+    echo "Skipping auto-openblas-v2wide-real generation:" \
+         "needs both $OPENBLAS_JSON and $OPENBLAS_A" \
+         "(run tools/marshal-infer/infer_openblas.sh and" \
+         "lind-wasm-apps/openblas/compile_openblas.sh first)"
+    echo ""
+fi
+
 # Regenerates straight from a fresh inference run over libconststride.c
 # every run -- same "nothing here trusts a locally-built artifact"
 # reasoning as auto-openblas-daxpy above, one level up: this proves TODAY's
@@ -378,6 +518,52 @@ fi
 if ! grep -q 'LIND_EXTENT_CONSTANT' "$SCRIPT_DIR/auto-conststride/conststride_auto_grate.c"; then
     echo "FATAL: generated grate's toy_vec_scale handler does not use a" \
          "constant-sourced extent operand -- inference regressed" >&2
+    exit 1
+fi
+echo ""
+
+# V2 sibling of the generation above, from the SAME freshly-generated
+# libconststride.marshal.json: gen_v2_adapter.py --emit-grate is the
+# self-contained-grate generator all new library-interposition work should
+# use (issue #22); V1's gen_grate.py above stays available for
+# existing/legacy usage, unchanged.
+echo "Generating auto-conststride/conststride_v2_grate.c from libconststride.marshal.json"
+if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_v2_adapter.py" \
+        "$SCRIPT_DIR/auto-conststride/libconststride.marshal.json" \
+        --lib-name libconststride --emit-grate --manifest-version 1 \
+        --out "$SCRIPT_DIR/auto-conststride/conststride_v2_grate.c" \
+        > /tmp/lib-interpose-gen-conststride-v2.log 2>&1; then
+    echo "FATAL: gen_v2_adapter.py --emit-grate failed to generate toy_vec_scale:" >&2
+    cat /tmp/lib-interpose-gen-conststride-v2.log >&2
+    exit 1
+fi
+if ! grep -q '__lind_v2_adapter_toy_vec_scale' "$SCRIPT_DIR/auto-conststride/conststride_v2_grate.c"; then
+    echo "FATAL: generated V2 grate is missing __lind_v2_adapter_toy_vec_scale" >&2
+    exit 1
+fi
+if ! grep -q 'register_lib_handler_v2' "$SCRIPT_DIR/auto-conststride/conststride_v2_grate.c"; then
+    echo "FATAL: generated V2 grate does not register through register_lib_handler_v2" >&2
+    exit 1
+fi
+echo ""
+
+# Self-contained V2 grate for the handle round-trip proof, generated the
+# same way from a hand-written spec (this is a
+# synthetic fixture, like auto-v2wide/v2wide.spec.json, not real inferred
+# code): LIND_RET_HANDLE/LIND_ARG_HANDLE through the fully generated V2
+# pipeline, not a hand-written grate.
+echo "Generating auto-v2wide/handle_v2_grate.c from handle_v2.spec.json"
+if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_v2_adapter.py" \
+        "$SCRIPT_DIR/auto-v2wide/handle_v2.spec.json" \
+        --lib-name handle_v2 --emit-grate --manifest-version 1 \
+        --out "$SCRIPT_DIR/auto-v2wide/handle_v2_grate.c" \
+        > /tmp/lib-interpose-gen-handle-v2.log 2>&1; then
+    echo "FATAL: gen_v2_adapter.py --emit-grate failed to generate handle_v2:" >&2
+    cat /tmp/lib-interpose-gen-handle-v2.log >&2
+    exit 1
+fi
+if ! grep -q '__lind_v2_adapter_toy_ctx_create_v2' "$SCRIPT_DIR/auto-v2wide/handle_v2_grate.c"; then
+    echo "FATAL: generated handle_v2 grate is missing __lind_v2_adapter_toy_ctx_create_v2" >&2
     exit 1
 fi
 echo ""
@@ -901,14 +1087,26 @@ run_test "fail-registration" \
     --
 
 # --------------------------------------------------------------------------
-# auto-openblas-daxpy: cblas_daxpy/daxpy_ handlers generated by gen_grate.py
-# straight from the live openblas.marshal.json (issue #26/#27 follow-up,
-# items 6-7) -- proves a REAL, contract-backed StrideVector inference record
-# is actually usable through generation (gen_grate.py) and execution (a real
-# compiled-and-run grate), not just through the hand-written specs
-# fail-closed/stridevec_grate.c uses to isolate the evaluator. Multiple
-# elements and non-unit strides on both arrays (see daxpy_cage.c). Strict-safe:
-# the cage calls only cblas_daxpy/daxpy_ from libblastoy.
+# auto-openblas-daxpy: cblas_daxpy/daxpy_ V1 handlers generated by
+# gen_grate.py straight from the live openblas.marshal.json (issue #26/#27
+# follow-up, items 6-7) -- proves a REAL, contract-backed StrideVector
+# inference record is actually usable through V1 generation (gen_grate.py)
+# and a real compiled-and-run grate's DISPATCH/marshalling machinery, not
+# just through the hand-written specs fail-closed/stridevec_grate.c uses to
+# isolate the evaluator. Multiple elements and non-unit strides on both
+# arrays (see daxpy_cage.c). Strict-safe: the cage calls only
+# cblas_daxpy/daxpy_ from libblastoy.
+#
+# NOT a real-OpenBLAS-execution proof: libblastoy.c is a hand-written
+# stand-in sharing OpenBLAS's real exported symbol names and raw wasm32 ABI
+# shapes, not the real statically-linked libopenblas.a -- see that file's
+# own comment for why (V1's --compile-grate/--fpcast-emu path predates a
+# proven real-archive link; the toy keeps this test's numeric expectations
+# hand-derivable). The REAL libopenblas.a, real cblas_daxpby/daxpby_
+# implementation, and a same-cage numeric baseline are what
+# auto-openblas-v2wide-real / auto-openblas-v2wide-fortran-real below prove
+# instead -- those are the only two OpenBLAS symbols
+# currently exercised against the real archive.
 # --------------------------------------------------------------------------
 if [[ "$OPENBLAS_DAXPY_GEN_OK" == "yes" ]]; then
     GRATE_EXTRA=("$SCRIPT_DIR/auto-openblas-daxpy/libblastoy.c")
@@ -924,6 +1122,321 @@ if [[ "$OPENBLAS_DAXPY_GEN_OK" == "yes" ]]; then
 else
     DECLARED_TESTS+=("auto-openblas-daxpy")
     skip_test "auto-openblas-daxpy" "$OPENBLAS_JSON not found (run tools/marshal-infer/infer_openblas.sh first)"
+fi
+
+# --------------------------------------------------------------------------
+# auto-openblas-v2wide-real / auto-openblas-v2wide-fortran-real: a REAL,
+# wide (7-raw-ABI-slot) OpenBLAS
+# daxpby, statically linked from the REAL libopenblas.a, interposed through
+# the REAL V2 production path (register_lib_handler_v2 +
+# Linker::instance_dylink's own V2 portal check + wasmtime_lind_3i's
+# worker-pool integration -- the same machinery auto-v2wide-real-* proved
+# against a hand-written toy function, now exercised against a real,
+# previously-inaccessible OpenBLAS export). Both the CBLAS by-value form
+# (cblas_daxpby, LIND_EXTENT_VALUE) and the classic Fortran-BLAS
+# by-reference form (daxpby_, LIND_EXTENT_POINTEE_I32) are proven -- the two
+# StrideVector extent-source conventions this project supports, not just
+# one of them.
+#
+# Neither uses run_test: the proof here is that the interposed run's
+# numeric output agrees BIT-FOR-BIT (%a hex-float) with a same-cage
+# baseline -- a plain, non-interposed program statically linking the SAME
+# libopenblas.a and calling the real function directly -- which needs
+# comparing two separate runs' output against each other, not a fixed
+# expected-value list.
+#
+# run_openblas_v2wide_proof <test_name> <baseline_src> <grate_src> <cage_src>
+#     <stub_so_name> <tag> <expect_registered_line> <stub_fail_marker>
+# `tag` is the common "[Baseline|<tag>]"/"[Cage|<tag>]" prefix both the
+# baseline and cage source files print their y[] values with.
+# run_v2_handle_trap_test <name> <mode> <evidence...>
+# A bespoke check (not run_test) for a handle_v2_real_cage.c mode that must
+# TRAP the whole process rather than return a soft GRATE_ERR sentinel --
+# lind_marshal.h's own LIND_ARG_HANDLE check traps on an untranslatable
+# token instead of returning a checkable value (see that file's "a nonzero
+# token that fails to translate traps" comment), so run_test's own "exit 0,
+# check printed lines" convention cannot express this case: a NONZERO exit
+# here is the expected, correct outcome. Compiles/stages/runs the same way
+# run_test does; only the pass/fail decision differs.
+run_v2_handle_trap_test() {
+    local name="$1" mode="$2"; shift 2
+    local evidence=("$@")
+
+    DECLARED_TESTS+=("$name")
+
+    if ! compile_src "$SCRIPT_DIR/auto-v2wide/handle_v2_real_cage.c"; then
+        fail_test "$name" build "COMPILE_STEP_FAILED (cage)
+$(cat /tmp/lib-interpose-compile.log)"
+        return
+    fi
+    GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_handle_impl.c")
+    if ! compile_grate "$SCRIPT_DIR/auto-v2wide/handle_v2_grate.c" "${GRATE_EXTRA[@]}"; then
+        fail_test "$name" build "COMPILE_STEP_FAILED (grate)
+$(cat /tmp/lib-interpose-compile.log)"
+        return
+    fi
+
+    cp "$SCRIPT_DIR/auto-v2wide/handle_v2_grate.cwasm" "$GRATES_DIR/"
+    cp "$SCRIPT_DIR/auto-v2wide/handle_v2_real_cage.cwasm" "$LINDFS/"
+
+    local output exit_code
+    output=$(cd "$LINDFS" && timeout 30 "$LIND_RUN" \
+        --preload "env=/lib/libtoy_handle_v2_stub.so:interposed" \
+        "grates/handle_v2_grate.cwasm" "handle_v2_real_cage.cwasm" "$mode" 2>&1)
+    exit_code=$?
+
+    rm -f "$GRATES_DIR/handle_v2_grate.cwasm" "$LINDFS/handle_v2_real_cage.cwasm"
+
+    local missing=() m line
+    if [[ ${#evidence[@]} -gt 0 ]] && ! m="$(match_ordered_lines "$output" "${evidence[@]}")"; then
+        while IFS= read -r line; do missing+=("$line"); done <<<"$m"
+    fi
+    if ! m="$(find_forbidden_lines "$output" \
+            "[Cage|handle-v2] FAIL: wrong-class token was not rejected" \
+            "[Cage|handle-v2] FAIL: stale token was not rejected" \
+            "[libtoy_handle_v2_stub] FAIL: real (uninterposed) toy_ctx_get_val_v2 ran")"; then
+        while IFS= read -r line; do missing+=("[forbidden, but present] $line"); done <<<"$m"
+    fi
+
+    if [[ "$exit_code" -eq 0 ]]; then
+        fail_test "$name" semantic "expected a nonzero (trapped) exit code, got 0
+--- actual output ---
+$output"
+    elif [[ ${#missing[@]} -gt 0 ]]; then
+        fail_test "$name" "$(category_for "$output" "$exit_code")" \
+            "validation failed:
+$(printf '  - %s\n' "${missing[@]}")
+--- actual output ---
+$output"
+    else
+        pass_test "$name"
+    fi
+}
+
+run_openblas_v2wide_proof() {
+    local test_name="$1" baseline_src="$2" grate_src="$3" cage_src="$4"
+    local stub_so="$5" tag="$6" expect_registered="$7" stub_fail_marker="$8"
+    local baseline_cwasm grate_cwasm cage_cwasm
+
+    if ! "$LIND_COMPILE" -s "$SCRIPT_DIR/$baseline_src" -- "$OPENBLAS_A" \
+            > /tmp/lib-interpose-compile.log 2>&1; then
+        fail_test "$test_name" build "COMPILE_STEP_FAILED (baseline)
+$(cat /tmp/lib-interpose-compile.log)"
+        return
+    fi
+    baseline_cwasm="$(basename "${baseline_src%.c}").cwasm"
+    cp "$SCRIPT_DIR/$(dirname "$baseline_src")/$baseline_cwasm" "$LINDFS/$baseline_cwasm"
+    local baseline_output baseline_exit
+    baseline_output=$(cd "$LINDFS" && timeout 30 "$LIND_RUN" "$baseline_cwasm" 2>&1)
+    baseline_exit=$?
+    rm -f "$LINDFS/$baseline_cwasm"
+
+    if ! compile_grate "$SCRIPT_DIR/$grate_src" \
+            "$SCRIPT_DIR/auto-openblas-v2wide/daxpby_v2_adapter.c" "$OPENBLAS_A"; then
+        fail_test "$test_name" build "COMPILE_STEP_FAILED (grate)
+$(cat /tmp/lib-interpose-compile.log)"
+        return
+    fi
+    if ! compile_src "$SCRIPT_DIR/$cage_src"; then
+        fail_test "$test_name" build "COMPILE_STEP_FAILED (cage)
+$(cat /tmp/lib-interpose-compile.log)"
+        return
+    fi
+
+    grate_cwasm="$(basename "${grate_src%.c}").cwasm"
+    cage_cwasm="$(basename "${cage_src%.c}").cwasm"
+    cp "$SCRIPT_DIR/$(dirname "$grate_src")/$grate_cwasm" "$GRATES_DIR/"
+    cp "$SCRIPT_DIR/$(dirname "$cage_src")/$cage_cwasm" "$LINDFS/"
+    local interposed_output interposed_exit
+    interposed_output=$(cd "$LINDFS" && timeout 30 "$LIND_RUN" \
+        --preload "env=/lib/$stub_so:interposed" \
+        "grates/$grate_cwasm" "/$cage_cwasm" 2>&1)
+    interposed_exit=$?
+    rm -f "$GRATES_DIR/$grate_cwasm" "$LINDFS/$cage_cwasm"
+
+    local v2wide_missing=() m line
+    if ! m="$(match_ordered_lines "$interposed_output" \
+            "$expect_registered" \
+            "[Grate|$tag] app exited 0")"; then
+        while IFS= read -r line; do v2wide_missing+=("$line"); done <<<"$m"
+    fi
+    # A silent interposition bypass would fall through to the stub's own
+    # body instead of the real, statically-linked implementation --
+    # forbidding its marker line rules that out (see each stub's own
+    # comment).
+    if ! m="$(find_forbidden_lines "$interposed_output" \
+            "$stub_fail_marker")"; then
+        while IFS= read -r line; do v2wide_missing+=("[forbidden, but present] $line"); done <<<"$m"
+    fi
+
+    local baseline_y interposed_y
+    baseline_y="$(grep -E "^\[Baseline\|$tag\] y\[" <<<"$baseline_output" | sed -E 's/^\[[^]]+\] //')"
+    interposed_y="$(grep -E "^\[Cage\|$tag\] y\[" <<<"$interposed_output" | sed -E 's/^\[[^]]+\] //')"
+
+    if [[ "$baseline_exit" -ne 0 || -z "$baseline_y" ]]; then
+        fail_test "$test_name" "$(category_for "$baseline_output" "$baseline_exit")" \
+            "same-cage baseline failed to produce output:
+--- baseline output ---
+$baseline_output"
+    elif [[ "$interposed_exit" -ne 0 || ${#v2wide_missing[@]} -gt 0 ]]; then
+        fail_test "$test_name" "$(category_for "$interposed_output" "$interposed_exit")" \
+            "validation failed:
+$(printf '  - %s\n' "${v2wide_missing[@]}")
+--- actual output ---
+$interposed_output"
+    elif [[ "$baseline_y" != "$interposed_y" ]]; then
+        fail_test "$test_name" assertion \
+            "same-cage baseline and V2-interposed run disagree:
+--- baseline (uninterposed, direct call) ---
+$baseline_y
+--- interposed (real V2 production path) ---
+$interposed_y"
+    else
+        pass_test "$test_name"
+    fi
+}
+
+DECLARED_TESTS+=("auto-openblas-v2wide")
+if [[ "$OPENBLAS_V2_GEN_OK" == "yes" ]]; then
+    run_openblas_v2wide_proof "auto-openblas-v2wide-real" \
+        "auto-openblas-v2wide/daxpby_baseline.c" \
+        "auto-openblas-v2wide/daxpby_v2_real_grate.c" \
+        "auto-openblas-v2wide/daxpby_v2_real_cage.c" \
+        "libdaxpby_v2_stub.so" "daxpby-v2" \
+        "[Grate|daxpby-v2] registered 1/1 handlers" \
+        "[libdaxpby_v2_stub] FAIL: real (uninterposed) implementation ran"
+
+    run_openblas_v2wide_proof "auto-openblas-v2wide-fortran-real" \
+        "auto-openblas-v2wide/daxpby_fortran_baseline.c" \
+        "auto-openblas-v2wide/daxpby_fortran_v2_real_grate.c" \
+        "auto-openblas-v2wide/daxpby_fortran_v2_real_cage.c" \
+        "libdaxpby_fortran_v2_stub.so" "daxpby-fortran-v2" \
+        "[Grate|daxpby-fortran-v2] registered 1/1 handlers" \
+        "[libdaxpby_fortran_v2_stub] FAIL: real (uninterposed) implementation ran"
+else
+    skip_test "auto-openblas-v2wide-real" \
+        "needs both $OPENBLAS_JSON and $OPENBLAS_A (run tools/marshal-infer/infer_openblas.sh and lind-wasm-apps/openblas/compile_openblas.sh first)"
+    skip_test "auto-openblas-v2wide-fortran-real" \
+        "needs both $OPENBLAS_JSON and $OPENBLAS_A (run tools/marshal-infer/infer_openblas.sh and lind-wasm-apps/openblas/compile_openblas.sh first)"
+fi
+
+# --------------------------------------------------------------------------
+# auto-v2wide-abi: V2 generator/inference coverage for two ABI shapes that
+# previously had no real-toolchain V2 proof
+# before now: a hidden sret return and a byval aggregate argument.
+# combine_impl.c's combine_sret_byval takes a 32-byte struct BY VALUE
+# (clang lowers this to a `byval` pointer argument) and returns a 12-byte
+# struct BY VALUE (lowered to a hidden leading `sret` pointer argument),
+# plus 5 plain ints -- 7 raw ABI slots total, V2-only by construction, the
+# same shape class as auto-openblas-v2wide's daxpby but exercising two ABI
+# lowering shapes the scalar-only WAT resolution tests do not cover
+# (those covered scalar-only signatures). Inference and generation both run
+# fresh from REAL `lind_compile --emit-marshal` + gen_v2_adapter.py output
+# every run, not a hand-authored JSON spec -- see combine_impl.c's own
+# comment. combine_v2_real_grate.c's hand-typed signature descriptor
+# ("1:iiiiiii:") is independently derived from the real lowered type and
+# cross-checked against the generated adapter's own signature; a mismatch
+# would make V2AdapterCache::resolve's SignatureMismatch check
+# reject this registration at first-call resolution instead of letting it
+# dispatch, so this test's own success IS the proof the two agree.
+echo "Generating auto-v2wide-abi/combine_impl.marshal.json (real inference)"
+if ! "$LIND_COMPILE" --emit-marshal "$SCRIPT_DIR/auto-v2wide-abi/combine_impl.c" \
+        > /tmp/lib-interpose-gen-combine-infer.log 2>&1; then
+    echo "FATAL: lind_compile --emit-marshal failed on auto-v2wide-abi/combine_impl.c:" >&2
+    cat /tmp/lib-interpose-gen-combine-infer.log >&2
+    exit 1
+fi
+echo "Generating auto-v2wide-abi/combine_v2_adapter.c from combine_impl.marshal.json"
+if ! python3 "$REPO_ROOT/tools/marshal-gen/gen_v2_adapter.py" \
+        "$SCRIPT_DIR/auto-v2wide-abi/combine_impl.marshal.json" \
+        --lib-name combine --only combine_sret_byval --manifest-version 1 \
+        --out "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_adapter.c" \
+        > /tmp/lib-interpose-gen-combine-v2.log 2>&1; then
+    echo "FATAL: gen_v2_adapter.py failed to generate the combine_sret_byval V2 adapter:" >&2
+    cat /tmp/lib-interpose-gen-combine-v2.log >&2
+    exit 1
+fi
+if ! grep -q "__lind_v2_adapter_combine_sret_byval" "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_adapter.c"; then
+    echo "FATAL: generated V2 adapter is missing __lind_v2_adapter_combine_sret_byval" >&2
+    exit 1
+fi
+echo ""
+echo "Building shared fixture: libcombine_v2_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/auto-v2wide-abi/libcombine_v2_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build auto-v2wide-abi/libcombine_v2_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/auto-v2wide-abi/libcombine_v2_stub.so" "$LINDFS/lib/libcombine_v2_stub.so"
+echo ""
+
+DECLARED_TESTS+=("auto-v2wide-abi")
+combine_v2_name="auto-v2wide-abi-real"
+if ! "$LIND_COMPILE" -s "$SCRIPT_DIR/auto-v2wide-abi/combine_baseline.c" -- \
+        "$SCRIPT_DIR/auto-v2wide-abi/combine_impl.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    fail_test "$combine_v2_name" build "COMPILE_STEP_FAILED (baseline)
+$(cat /tmp/lib-interpose-compile.log)"
+else
+    cp "$SCRIPT_DIR/auto-v2wide-abi/combine_baseline.cwasm" "$LINDFS/combine_baseline.cwasm"
+    combine_baseline_output=$(cd "$LINDFS" && timeout 30 "$LIND_RUN" combine_baseline.cwasm 2>&1)
+    combine_baseline_exit=$?
+    rm -f "$LINDFS/combine_baseline.cwasm"
+
+    if ! compile_grate "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_real_grate.c" \
+            "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_adapter.c" \
+            "$SCRIPT_DIR/auto-v2wide-abi/combine_impl.c"; then
+        fail_test "$combine_v2_name" build "COMPILE_STEP_FAILED (grate)
+$(cat /tmp/lib-interpose-compile.log)"
+    elif ! compile_src "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_real_cage.c"; then
+        fail_test "$combine_v2_name" build "COMPILE_STEP_FAILED (cage)
+$(cat /tmp/lib-interpose-compile.log)"
+    else
+        cp "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_real_grate.cwasm" "$GRATES_DIR/"
+        cp "$SCRIPT_DIR/auto-v2wide-abi/combine_v2_real_cage.cwasm" "$LINDFS/"
+        combine_interposed_output=$(cd "$LINDFS" && timeout 30 "$LIND_RUN" \
+            --preload "env=/lib/libcombine_v2_stub.so:interposed" \
+            "grates/combine_v2_real_grate.cwasm" "/combine_v2_real_cage.cwasm" 2>&1)
+        combine_interposed_exit=$?
+        rm -f "$GRATES_DIR/combine_v2_real_grate.cwasm" "$LINDFS/combine_v2_real_cage.cwasm"
+
+        combine_v2_missing=()
+        if ! m="$(match_ordered_lines "$combine_interposed_output" \
+                "[Grate|combine-v2] registered 1/1 handlers" \
+                "[Grate|combine-v2] app exited 0")"; then
+            while IFS= read -r line; do combine_v2_missing+=("$line"); done <<<"$m"
+        fi
+        if ! m="$(find_forbidden_lines "$combine_interposed_output" \
+                "[libcombine_v2_stub] FAIL: real (uninterposed) implementation ran")"; then
+            while IFS= read -r line; do combine_v2_missing+=("[forbidden, but present] $line"); done <<<"$m"
+        fi
+
+        combine_baseline_r="$(grep -E '^\[Baseline\|combine-v2\] r\.' <<<"$combine_baseline_output" | sed -E 's/^\[[^]]+\] //')"
+        combine_interposed_r="$(grep -E '^\[Cage\|combine-v2\] r\.' <<<"$combine_interposed_output" | sed -E 's/^\[[^]]+\] //')"
+
+        if [[ "$combine_baseline_exit" -ne 0 || -z "$combine_baseline_r" ]]; then
+            fail_test "$combine_v2_name" "$(category_for "$combine_baseline_output" "$combine_baseline_exit")" \
+                "same-cage baseline failed to produce output:
+--- baseline output ---
+$combine_baseline_output"
+        elif [[ "$combine_interposed_exit" -ne 0 || ${#combine_v2_missing[@]} -gt 0 ]]; then
+            fail_test "$combine_v2_name" "$(category_for "$combine_interposed_output" "$combine_interposed_exit")" \
+                "validation failed:
+$(printf '  - %s\n' "${combine_v2_missing[@]}")
+--- actual output ---
+$combine_interposed_output"
+        elif [[ "$combine_baseline_r" != "$combine_interposed_r" ]]; then
+            fail_test "$combine_v2_name" assertion \
+                "same-cage baseline and V2-interposed run disagree:
+--- baseline (uninterposed, direct call) ---
+$combine_baseline_r
+--- interposed (real V2 production path) ---
+$combine_interposed_r"
+        else
+            pass_test "$combine_v2_name"
+        fi
+    fi
 fi
 
 # --------------------------------------------------------------------------
@@ -945,6 +1458,197 @@ run_test "auto-conststride" \
     -- "[libconststride-grate] registered 1/1 handlers" \
        "[Cage|conststride] PASS: toy_vec_scale" \
     -- "[libconststride] toy_vec_scale handler ran n=5"
+
+# --------------------------------------------------------------------------
+# auto-conststride-v2: the SAME toy_vec_scale marshal record, generated by
+# gen_v2_adapter.py --emit-grate instead of gen_grate.py -- proving the V2
+# self-contained-grate generator is a drop-in replacement
+# for gen_grate.py's V1 GRATE_TEMPLATE even for a function that already fits
+# V1's six-slot transport, not just the wide functions V1 could never carry.
+# Registers through register_lib_handler_v2/the real V2 production path
+# (Linker::instance_dylink's V2 portal, GrateWorker::run_v2), no V1
+# transport involved anywhere. Strict-safe: the cage calls only
+# toy_vec_scale from libconststride.
+# --------------------------------------------------------------------------
+GRATE_EXTRA=("$SCRIPT_DIR/auto-conststride/libconststride.c")
+run_test "auto-conststride-v2" \
+    "auto-conststride/conststride_cage.c" \
+    "auto-conststride/conststride_v2_grate.c" \
+    "env=/lib/libconststride.so" "yes" \
+    "/conststride_cage.cwasm" \
+    -- "[libconststride-v2-grate] registered 1/1 handlers" \
+       "[Cage|conststride] PASS: toy_vec_scale" \
+    -- "[libconststride] toy_vec_scale handler ran n=5"
+
+# --------------------------------------------------------------------------
+# auto-v2wide: exercises tools/marshal-gen/gen_v2_adapter.py's generated
+# variable-width adapter for a 9-logical-argument function (three past V1's
+# fixed six-slot dispatch limit) end to end: scalar, pointer IN, pointer
+# INOUT, a handle, pointer OUT, and a pointer-alias return, all marshalled
+# by the same shared prepare/finish/translate-return primitives V1's own
+# dispatch uses. v2wide_shim_grate.c's own outer V1 transport is a single
+# struct-pointer argument -- a way to get a real, cross-cage-addressable
+# second cage talking to the generated adapter without a full V2 syscall/
+# portal/worker path; the six-slot limit that shim itself has is not what
+# is under test. Strict-safe: the cage calls only toy_wide_marshal from
+# libtoy_wide_stub.
+#
+# Acceptance modes assert the generated adapter's real handler genuinely
+# ran (evidence a genuine dispatch happened, not a lucky coincidence);
+# rejection modes forbid it -- a caller-visible rejection alone does not
+# prove the real handler never executed.
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+for mode_desc in \
+    "basic:pass" \
+    "wrongoutptr:pass"
+do
+    mode="${mode_desc%%:*}"
+    run_test "auto-v2wide-$mode" \
+        "auto-v2wide/v2wide_cage.c" \
+        "auto-v2wide/v2wide_shim_grate.c" \
+        "env=/lib/libtoy_wide_stub.so" "yes" \
+        "/v2wide_cage.cwasm" "$mode" \
+        -- "[Grate|v2wide] registered 1/1 handlers" "[Cage|v2wide] PASS: $mode" \
+        -- "[Grate|v2wide] toy_wide_shim ran" "[Grate|v2wide-real] toy_wide_marshal handler ran"
+done
+
+for mode in narrow badtoken; do
+    GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+    run_test "auto-v2wide-$mode" \
+        "auto-v2wide/v2wide_cage.c" \
+        "auto-v2wide/v2wide_shim_grate.c" \
+        "env=/lib/libtoy_wide_stub.so" "yes" \
+        "/v2wide_cage.cwasm" "$mode" \
+        -- "[Grate|v2wide] registered 1/1 handlers" "[Cage|v2wide] PASS: $mode" \
+        -- "[Grate|v2wide] toy_wide_shim ran" \
+        -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
+done
+
+# --------------------------------------------------------------------------
+# auto-v2wide-real-*: the SAME generated adapter, exercised through the
+# real V2 (variable-width) production path instead of v2wide_shim_grate.c's
+# V1-shim workaround -- register_lib_handler_v2,
+# Linker::instance_dylink's own V2 portal check, and wasmtime_lind_3i's
+# worker-pool integration (GrateWorker::run_v2/GrateHandler::submit_v2),
+# with no V1 transport involved anywhere. v2wide_real_cage.c calls
+# toy_wide_marshal directly with its real 9-argument signature -- no six-slot
+# limit anywhere in this path at all, unlike the shim's own outer transport.
+# Strict-safe: the cage calls only toy_wide_marshal from libtoy_wide_real_stub.
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+for mode_desc in \
+    "basic:pass" \
+    "sequence:pass" \
+    "fork:pass" \
+    "concurrent:pass"
+do
+    mode="${mode_desc%%:*}"
+    run_test "auto-v2wide-real-$mode" \
+        "auto-v2wide/v2wide_real_cage.c" \
+        "auto-v2wide/v2wide_real_grate.c" \
+        "env=/lib/libtoy_wide_real_stub.so" "yes" \
+        "/v2wide_real_cage.cwasm" "$mode" \
+        -- "[Grate|v2wide-real] registered 1/1 handlers" "[Cage|v2wide-real] PASS: $mode" \
+        -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
+done
+
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+run_test "auto-v2wide-real-narrow" \
+    "auto-v2wide/v2wide_real_cage.c" \
+    "auto-v2wide/v2wide_real_grate.c" \
+    "env=/lib/libtoy_wide_real_stub.so" "yes" \
+    "/v2wide_real_cage.cwasm" "narrow" \
+    -- "[Grate|v2wide-real] registered 1/1 handlers" "[Cage|v2wide-real] PASS: narrow" \
+    -- \
+    -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
+
+# --------------------------------------------------------------------------
+# auto-v2wide-real-stale: v2wide_stale_grate.c registers toy_wide_marshal
+# against a grate cage that has ALREADY exited and been reaped before the
+# app cage attempting the call even starts, proving a grate exit followed
+# by a stale call is rejected cleanly by dispatch_lib_call_v2's existing
+# cage-liveness check
+# instead of hanging or crashing. The real handler must never run: a
+# rejection that wrongly let the call through would still print the same
+# GRATE_ERR sentinel by coincidence if something else went wrong, so
+# forbidding the "handler ran" marker is required here too, same reasoning
+# as auto-v2wide-real-narrow.
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+run_test "auto-v2wide-real-stale" \
+    "auto-v2wide/v2wide_real_cage.c" \
+    "auto-v2wide/v2wide_stale_grate.c" \
+    "env=/lib/libtoy_wide_real_stub.so" "yes" \
+    "/v2wide_real_cage.cwasm" "stale" \
+    -- "[Grate|v2wide-real] registered 1/1 handlers" "[Cage|v2wide-real] PASS: stale" \
+    -- \
+    -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
+
+# --------------------------------------------------------------------------
+# auto-v2wide-handle-*: LIND_RET_HANDLE/LIND_ARG_HANDLE through a FULLY
+# GENERATED V2 grate (gen_v2_adapter.py --emit-grate), not a hand-written
+# handler. Covers successful handle round-trip plus wrong-class/stale-token
+# rejection. Strict-safe: the cage calls
+# only handle_v2's own symbols, all covered by libtoy_handle_v2_stub.
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_handle_impl.c")
+run_test "auto-v2wide-handle-roundtrip" \
+    "auto-v2wide/handle_v2_real_cage.c" \
+    "auto-v2wide/handle_v2_grate.c" \
+    "env=/lib/libtoy_handle_v2_stub.so" "yes" \
+    "/handle_v2_real_cage.cwasm" "roundtrip" \
+    -- "[Cage|handle-v2] PASS: roundtrip, val=42" \
+    -- "[Grate|handle-v2] toy_ctx_create_v2 ran val=42" \
+       "[Grate|handle-v2] toy_ctx_get_val_v2 ran val=42" \
+       "[Grate|handle-v2] toy_ctx_close_v2 ran"
+
+run_v2_handle_trap_test "auto-v2wide-handle-wrongclass" "wrongclass" \
+    "[Grate|handle-v2] toy_ctx_create_v2 ran val=42" \
+    "[Grate|handle-v2] toy_ctx_get_val_v2 ran val=42" \
+    "[Grate|handle-v2] toy_other_create_v2 ran val=7" \
+    "[Cage|handle-v2] about to access wrong-class token"
+
+run_v2_handle_trap_test "auto-v2wide-handle-stale" "stale" \
+    "[Grate|handle-v2] toy_ctx_create_v2 ran val=42" \
+    "[Grate|handle-v2] toy_ctx_get_val_v2 ran val=42" \
+    "[Grate|handle-v2] toy_ctx_close_v2 ran" \
+    "[Cage|handle-v2] about to access stale token"
+
+# --------------------------------------------------------------------------
+# auto-v2wide-real-errno: toy_set_errno's real handler runs inside the
+# GRATE's own address space -- proving the V2 portal's errno seed/relay
+# (linker.rs's seed_grate_errno_from_caller/relay_grate_errno_to_caller,
+# SHARED with the V1 portal, not a separate implementation) carries that
+# write back into the CALLING cage's own errno slot. Uses
+# v2wide_errno_grate.c, the only grate that registers toy_set_errno
+# (isolated from v2wide_real_grate.c so this doesn't perturb its own
+# "registered 1/1 handlers" tests).
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+run_test "auto-v2wide-real-errno" \
+    "auto-v2wide/v2wide_real_cage.c" \
+    "auto-v2wide/v2wide_errno_grate.c" \
+    "env=/lib/libtoy_wide_real_stub.so" "yes" \
+    "/v2wide_real_cage.cwasm" "errno" \
+    -- "[Grate|v2wide-errno] registered 1/1 handlers" "[Cage|v2wide-real] PASS: errno" \
+    -- "[Grate|v2wide-real] toy_set_errno ran val=4242"
+
+# --------------------------------------------------------------------------
+# auto-v2wide-real-exec: a V2 registration survives exec(). The cage makes
+# one successful call, execs a fresh copy of itself (same cage id, new
+# program image), and makes the SAME call again post-exec -- proving
+# Linker::instance_dylink's V2 portal check for the NEW image still finds
+# the registration recorded under this cage's id before the original exec
+# into this program (lib_handler_table_v2 is keyed by cage id, which exec
+# does not change).
+GRATE_EXTRA=("$SCRIPT_DIR/auto-v2wide/toy_impl.c" "$SCRIPT_DIR/auto-v2wide/v2wide_adapters.c")
+run_test "auto-v2wide-real-exec" \
+    "auto-v2wide/v2wide_real_cage.c" \
+    "auto-v2wide/v2wide_real_grate.c" \
+    "env=/lib/libtoy_wide_real_stub.so" "yes" \
+    "/v2wide_real_cage.cwasm" "exec" \
+    -- "[Grate|v2wide-real] registered 1/1 handlers" \
+       "[Cage|v2wide-real] about to exec self" \
+       "[Cage|v2wide-real] PASS: exec" \
+    -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
+
+DECLARED_TESTS+=("auto-v2wide")
 
 # --------------------------------------------------------------------------
 # Completeness check: every directory with a *_grate.c must be declared

@@ -56,4 +56,11 @@ int register_lib_handler(uint64_t target_cage,
     uint64_t handler_cage,
     uint64_t handler_fn);
 
+int register_lib_handler_v2(uint64_t target_cage,
+    const char *lib_name,
+    const char *symbol_name,
+    uint64_t handler_cage,
+    const char *adapter_export,
+    const char *signature_desc);
+
 #endif // _LIND_SYSCALL_H
