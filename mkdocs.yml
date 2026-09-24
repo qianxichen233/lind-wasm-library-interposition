@@ -19,6 +19,7 @@ nav:
     - libc: internal/libc.md
     - Wasmtime: internal/wasmtime.md
     - Threei: internal/3i.md
+    - Library-Call Transport: internal/library-interposition-transport.md
     - Grates: internal/grates.md
     - Clamping: internal/clamping.md
     - RawPOSIX: internal/rawposix.md

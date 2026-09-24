@@ -8,12 +8,19 @@ wide for the transport at the time it was filed). Reports, for any
   discovered        -- functions marshal-infer examined at all
   inferred          -- functions marshal-infer assigned a decision to (should
                         equal discovered; a mismatch would itself be a bug)
-  transport accepted -- functions whose raw ABI slot count fits the
-                        interposition transport's LIND_RAW_ARGS_MAX (whether
-                        or not they end up "marshal" for some OTHER reason)
-  generated         -- functions gen_grate.py would actually emit a handler
-                        for (marshal-decision AND is_marshalable())
-  exercised         -- functions covered by a passing focused test today
+  V1 transport accepted -- functions whose raw ABI slot count fits V1's fixed
+                        LIND_RAW_ARGS_MAX (whether or not they end up
+                        "marshal" for some OTHER reason)
+  generated (V1)    -- functions gen_grate.py would actually emit a V1
+                        handler for (marshal-decision AND is_marshalable())
+  generated (V2)    -- marshal-decision functions wider than V1's cap that
+                        gen_v2_adapter.py can still generate as variable-width
+                        adapters; marshal-infer records width as transport
+                        metadata rather than treating it as a semantic failure
+  exercised (V1/V2) -- functions with a REAL passing end-to-end grate test
+                        today, reported separately per transport (see
+                        EXERCISED_V1_SYMBOLS/EXERCISED_V2_SYMBOLS below, so
+                        generated coverage is never confused with execution)
 
 "args" in the JSON is already one entry per raw wasm-level ABI slot (sret and
 multi-slot params are pre-flattened by marshal-infer -- see Infer.cpp's
@@ -72,6 +79,29 @@ REQUIRED_SYMBOLS = (
     "cblas_sscal", "cblas_dscal", "sscal_", "dscal_",
 )
 
+# Symbols with a REAL, passing, end-to-end focused test TODAY (not derivable
+# from the JSON itself -- "exercised" means a real compiled-and-run grate
+# proved the generated/adapted handler correct, which requires an actual C
+# test fixture, not just a sound marshal-infer decision). Kept as an explicit
+# list, not a count, so this can
+# never silently drift from what tests/grate-tests/lib-interpose/run_tests.sh
+# actually runs.
+#
+# V1's own exercise (auto-openblas-daxpy) is against libblastoy.c, a
+# hand-written stand-in sharing OpenBLAS's real exported symbol names/wasm32
+# ABI shapes, NOT the real statically-linked libopenblas.a -- see that
+# fixture's own comment for why. It proves V1 generation + dispatch/
+# marshalling machinery, not real OpenBLAS numerical behavior. Only
+# cblas_daxpby/daxpby_ (V2, auto-openblas-v2wide-real / -fortran-real) are
+# exercised against the REAL archive, with a same-cage numeric baseline --
+# do not conflate the two when reporting "real OpenBLAS execution".
+EXERCISED_V1_SYMBOLS = (
+    "cblas_daxpy", "daxpy_",  # auto-openblas-daxpy (toy-backed, NOT the real archive)
+)
+EXERCISED_V2_SYMBOLS = (
+    "cblas_daxpby", "daxpby_",  # auto-openblas-v2wide-real / -fortran-real (REAL libopenblas.a)
+)
+
 # Function-level confidence is its least-trusted marshalled argument. Only
 # StrideVector arguments currently carry a per-argument "confidence" field
 # (see CONFIG.md's "Confidence model") -- every other marshalled shape
@@ -81,11 +111,13 @@ CONFIDENCE_ORDER = ("proven", "configured")
 
 
 def exceeds_slot_cap(f):
-    """True iff this function needs more raw ABI slots than the transport
+    """True iff this function needs more raw ABI slots than V1's transport
     allows. force_local functions carry no "args" (inference clears it, since
     gen_grate.py never needs a per-arg spec for one), so the slot count for
-    those has to come from enforceRawArgSlotCap's own warning text instead of
-    len(args)."""
+    those has to come from annotateWideRawArgSlots' own warning text instead
+    of len(args). A "marshal"-decision function CAN be this wide now (V1
+    stays capped; V2 has no cap -- see unmarshalable_reason's max_args), so
+    this is purely a WIDTH question, independent of decision."""
     if "args" in f:
         return len(f["args"]) > LIND_RAW_ARGS_MAX
     for w in f.get("warnings", []):
@@ -114,35 +146,74 @@ def main():
     inferred = sum(1 for f in fns if f.get("decision") is not None)
     transport_accepted = sum(1 for f in fns if not exceeds_slot_cap(f))
     marshal_decision = [f for f in fns if f.get("decision") == "marshal"]
-    generated = [f for f in marshal_decision if is_marshalable(f)]
+    # Each function's V1/V2 eligibility, computed once (unmarshalable_reason
+    # prints on rejection when warn=True; is_marshalable passes warn=True, so
+    # calling it more than once per function would print duplicate lines).
+    # V2 (variable-width) eligibility is checked only for V1-ineligible
+    # functions -- a V1-eligible one is already counted as generated and
+    # gen_v2_adapter.py has no reason to duplicate it.
+    classified = [(f, is_marshalable(f)) for f in marshal_decision]
+    generated = [f for f, v1_ok in classified if v1_ok]
+    v1_ineligible = [(f, unmarshalable_reason(f, max_args=None))
+                      for f, v1_ok in classified if not v1_ok]
+    v2_generated = [f for f, v2_reason in v1_ineligible if v2_reason is None]
     dropped = [(f["name"], unmarshalable_reason(f))
-               for f in marshal_decision if not is_marshalable(f)]
+               for f, v2_reason in v1_ineligible if v2_reason is not None]
 
     print(f"Interposition coverage ({path.name}):")
-    print(f"  discovered:         {discovered}")
-    print(f"  inferred:           {inferred}")
-    print(f"  transport accepted: {transport_accepted} "
+    print(f"  discovered:            {discovered}")
+    print(f"  inferred:              {inferred}")
+    print(f"  V1 transport accepted: {transport_accepted} "
           f"(raw ABI slots <= {LIND_RAW_ARGS_MAX})")
-    print(f"  marshal decisions:  {len(marshal_decision)}")
-    print(f"  generated handlers: {len(generated)} (decision=marshal AND is_marshalable()) "
+    print(f"  marshal decisions:     {len(marshal_decision)}")
+    print(f"  generated handlers (V1): {len(generated)} (decision=marshal AND is_marshalable()) "
           f"-- regression floor {GENERATED_FLOOR}, target ~{GENERATED_TARGET}")
-    print(f"  exercised:          0 (no grate-generation/test pipeline exists "
-          f"yet for {path.name}'s FULL surface -- tests/grate-tests/lib-interpose/"
-          f"auto-openblas-daxpy exercises cblas_daxpy/daxpy_ specifically; "
-          f"generating and running a grate for the rest is future work)")
+    print(f"  generated handlers (V2): {len(v2_generated)} (marshal, wider than V1's "
+          f"{LIND_RAW_ARGS_MAX}-slot cap, still gen_v2_adapter.py-eligible)")
+    # V1/V2 eligibility is mutually exclusive by construction (v2_generated
+    # is drawn only from the V1-ineligible subset), so len(V1)+len(V2)
+    # already IS the unique count -- stated explicitly anyway so a future
+    # change that makes the two sets overlap can't silently under/over-count
+    # here without this line visibly needing a real union instead of a sum.
+    combined_generated = generated + v2_generated
+    print(f"  generated handlers (combined, unique): {len(combined_generated)}")
+    exercised_v1 = [s for s in EXERCISED_V1_SYMBOLS if by_name.get(s, {}).get("decision") == "marshal"]
+    exercised_v2 = [s for s in EXERCISED_V2_SYMBOLS if by_name.get(s, {}).get("decision") == "marshal"]
+    print(f"  exercised (V1, toy-backed libblastoy.c, NOT the real archive): "
+          f"{len(exercised_v1)}/{len(EXERCISED_V1_SYMBOLS)} "
+          f"({', '.join(exercised_v1) or 'none'} -- tests/grate-tests/lib-interpose/"
+          f"auto-openblas-daxpy)")
+    print(f"  exercised (V2, REAL libopenblas.a, same-cage baseline-verified): "
+          f"{len(exercised_v2)}/{len(EXERCISED_V2_SYMBOLS)} "
+          f"({', '.join(exercised_v2) or 'none'} -- tests/grate-tests/lib-interpose/"
+          f"auto-openblas-v2wide-real, -fortran-real)")
+    print(f"  (exercised = a real compiled-and-run grate test passes for that exact "
+          f"symbol TODAY, not merely a sound marshal-infer decision; the remaining "
+          f"{len(combined_generated) - len(exercised_v1) - len(exercised_v2)} "
+          f"generated-but-unexercised handlers are inferred/generated correctly but have "
+          f"no dedicated end-to-end test yet)")
+
+    if v2_generated:
+        print(f"\n{len(v2_generated)} marshal-decision record(s) exceed V1's "
+              f"{LIND_RAW_ARGS_MAX}-slot cap but ARE gen_v2_adapter.py-eligible "
+              f"(expected: V2 is the variable-width transport):")
+        for f in sorted(v2_generated, key=lambda f: f["name"]):
+            print(f"  - {f['name']} ({len(f['args'])} raw ABI slots)")
 
     if dropped:
-        print(f"\n{len(dropped)} marshal-decision record(s) produced NO generated handler:")
+        print(f"\n{len(dropped)} marshal-decision record(s) produced NO generated "
+              f"handler under EITHER transport:")
         for dname, reason in sorted(dropped):
             print(f"  - {dname}: {reason}")
 
     by_conf = {c: [] for c in CONFIDENCE_ORDER}
-    for f in generated:
+    for f in combined_generated:
         by_conf[function_confidence(f)].append(f["name"])
-    print("\nGenerated handlers by confidence (function-level = least-trusted marshalled argument):")
+    print("\nGenerated handlers by confidence (V1+V2 combined; function-level = "
+          "least-trusted marshalled argument):")
     for c in CONFIDENCE_ORDER:
         print(f"  {c:10s}: {len(by_conf[c])}")
-    print(f"  {'combined':10s}: {len(generated)}")
+    print(f"  {'total':10s}: {len(combined_generated)}")
 
     ok = True
 
@@ -178,9 +249,12 @@ def main():
               f"separately.")
 
     wide = discovered - transport_accepted
-    print(f"\n{wide} of {discovered} functions exceed the "
-          f"{LIND_RAW_ARGS_MAX}-slot transport capacity and are correctly "
-          f"rejected (force_local) rather than marshalled.")
+    wide_marshal = sum(1 for f in fns if f.get("decision") == "marshal" and exceeds_slot_cap(f))
+    wide_force_local = wide - wide_marshal
+    print(f"\n{wide} of {discovered} functions exceed V1's {LIND_RAW_ARGS_MAX}-slot "
+          f"transport capacity: {wide_marshal} are marshal-eligible for the V2 "
+          f"transport, {wide_force_local} remain force_local for other (semantic) "
+          f"reasons.")
 
     print(f"\n{'PASS' if ok else 'FAIL'}: OpenBLAS coverage/required-symbol gate")
     return 0 if ok else 1

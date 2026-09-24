@@ -228,6 +228,27 @@ pub fn submit_grate_request(grate_id: u64, req: GrateRequest) -> anyhow::Result<
     handler.submit(req)
 }
 
+/// V2 (variable-width) counterpart to `submit_grate_request`: resolves the
+/// same global grate-id registry `submit_grate_request` uses (the V1/V2
+/// worker pools are the SAME pool for a grate, not two separate ones -- see
+/// `GrateWorker`'s own `instance`/`v2_adapter_cache` fields), then forwards
+/// into the handler's `submit_v2`.
+pub fn submit_grate_request_v2(
+    grate_id: u64,
+    registration: &threei::V2Registration,
+    caller_cage: u64,
+    args: &[wasmtime::Val],
+) -> anyhow::Result<wasmtime_lind_3i::v2_adapter::V2CallOutcome> {
+    let handler = match get_grate_handler(grate_id) {
+        Ok(handler) => handler,
+        Err(e) => {
+            panic!("[lind-boot] get_grate_handler failed: {:?}", e);
+        }
+    };
+
+    handler.submit_v2(registration, caller_cage, args)
+}
+
 /// Remove the registered grate handler for `grate_id` from the global table.
 ///
 /// This function detaches the handler from the global registry and returns the

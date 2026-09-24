@@ -70,6 +70,8 @@
 //! a given (cage_id, tid), because execution must resume in the same continuation. For grate calls, by
 //! contrast, lind-3i only needs to obtain some available worker for the target grate, because correctness
 //! depends on entering a compatible grate instance, not on resuming a previously suspended continuation.
+pub mod v2_adapter;
+
 use anyhow::Context;
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -80,7 +82,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use sysdefs::constants::lind_platform_const;
 use sysdefs::constants::lind_platform_const::*;
 use wasmtime::error::Context as WasmtimeContext;
-use wasmtime::{Engine, Extern, Global, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{Engine, Extern, Global, Instance, Linker, Module, Store, TypedFunc, Val};
 
 type PassFptrTyped = TypedFunc<
     (
@@ -236,6 +238,19 @@ struct GrateWorker<T: 'static> {
     /// This store holds the execution state for this worker and isolates its
     /// runtime context from other concurrently executing workers.
     store: Store<T>,
+
+    /// The grate module instantiated into this worker's own `store`. Needed
+    /// (not just the specific exports V1 resolves once below) so a V2 call
+    /// can resolve an arbitrary generated adapter export by name at
+    /// dispatch time -- see `v2_adapter_cache`.
+    instance: Instance,
+
+    /// Per-worker cache of resolved V2 (variable-width) adapters, keyed by
+    /// export name. A fresh `Instance` needs its own cache (a resolved
+    /// `Func` handle is tied to the `Store`/`Instance` it came from), so
+    /// this lives on the worker, not the handler -- see
+    /// `v2_adapter::V2AdapterCache`.
+    v2_adapter_cache: v2_adapter::V2AdapterCache,
 
     /// Typed handle to the grate entry export, if present.
     ///
@@ -541,12 +556,166 @@ impl<T: 'static> GrateHandler<T> {
     /// and then dispatches the request according to the handler’s configured
     /// concurrency mode.
     pub fn submit(&self, req: GrateRequest) -> anyhow::Result<i64> {
+        let _reentrancy_guard = ReentrancyGuard::enter(self.grate_id)?;
         let _active_guard = ActiveCallGuard::new(self)?;
 
         match self.concurrency_mode {
             ConcurrencyMode::Serialized => self.submit_serialized(req),
             ConcurrencyMode::Parallel => self.submit_parallel(req),
         }
+    }
+
+    /// V2 counterpart to `submit_serialized`: acquires the serialization
+    /// lock BEFORE leasing a worker, same ordering as the V1 path -- taking
+    /// a worker only after the serial gate keeps "at most one call enters
+    /// the grate at a time" true for the worker-acquisition step itself,
+    /// not just the call inside it.
+    fn submit_v2_serialized(
+        &self,
+        registration: &threei::V2Registration,
+        source_cage: u64,
+        args: &[Val],
+    ) -> v2_adapter::V2CallOutcome {
+        let _serial_guard = self.serial_executor.enter();
+        let worker = self.take_worker_blocking();
+        let mut lease = WorkerLease::new(self, worker);
+        lease.worker_mut().run_v2(registration, source_cage, args)
+    }
+
+    /// V2 counterpart to `submit_parallel`.
+    fn submit_v2_parallel(
+        &self,
+        registration: &threei::V2Registration,
+        source_cage: u64,
+        args: &[Val],
+    ) -> v2_adapter::V2CallOutcome {
+        let worker = self.take_worker_blocking();
+        let mut lease = WorkerLease::new(self, worker);
+        lease.worker_mut().run_v2(registration, source_cage, args)
+    }
+
+    /// Submit a V2 (variable-width) grate request to this handler.
+    ///
+    /// Reuses the exact same admission (`ActiveCallGuard`), worker leasing
+    /// (`WorkerLease`, which returns the worker to the pool even if the
+    /// adapter call traps or this function returns early), and
+    /// concurrency-mode dispatch as `submit` -- a V2 call runs through the
+    /// same pool and the same lifecycle guarantees, not a parallel,
+    /// independently-maintained path. No request may use another call's
+    /// `Store`, scratch frame, or cage identity: each leased worker owns its
+    /// own `Store`/`Instance`, and a lease is never shared or reused
+    /// concurrently by construction.
+    pub fn submit_v2(
+        &self,
+        registration: &threei::V2Registration,
+        source_cage: u64,
+        args: &[Val],
+    ) -> anyhow::Result<v2_adapter::V2CallOutcome> {
+        let _reentrancy_guard = ReentrancyGuard::enter(self.grate_id)?;
+        let _active_guard = ActiveCallGuard::new(self)?;
+
+        Ok(match self.concurrency_mode {
+            ConcurrencyMode::Serialized => {
+                self.submit_v2_serialized(registration, source_cage, args)
+            }
+            ConcurrencyMode::Parallel => self.submit_v2_parallel(registration, source_cage, args),
+        })
+    }
+}
+
+std::thread_local! {
+    /// Grate ids this OS thread is CURRENTLY executing a call into,
+    /// innermost call included. Used only to detect self-reentrancy (a
+    /// grate call that, before returning, causes another call back into a
+    /// grate already active on this same thread) -- never consulted across
+    /// threads, since a different thread's calls into the same grate are
+    /// legitimate concurrent use of the worker pool, not reentrancy.
+    static ACTIVE_GRATES_ON_THREAD: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII guard against self-reentrant grate calls.
+///
+/// Both `submit`'s serialized path (`SerialExecutor::enter`, a plain
+/// `Mutex<()>` -- not reentrant) and its worker-pool path
+/// (`take_worker_blocking`, which blocks until a worker is returned) deadlock
+/// if the SAME OS thread calls back into the SAME grate before its
+/// outermost call has returned: a `Serialized` handler's mutex is already
+/// held by this thread, and a fully-leased `Parallel` handler's only free
+/// worker can never appear, because the call that would return it is the
+/// one blocked waiting. This guard turns that deadlock into an immediate,
+/// diagnosable rejection instead.
+struct ReentrancyGuard {
+    grate_id: u64,
+}
+
+impl ReentrancyGuard {
+    fn enter(grate_id: u64) -> anyhow::Result<Self> {
+        let already_active = ACTIVE_GRATES_ON_THREAD.with(|set| !set.borrow_mut().insert(grate_id));
+        if already_active {
+            anyhow::bail!(
+                "reentrant grate call detected: this thread is already executing a call into \
+                 grate {grate_id} -- a self-reentrant V2 call would deadlock on the serialized \
+                 gate or an exhausted worker pool instead of ever returning"
+            );
+        }
+        Ok(Self { grate_id })
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        ACTIVE_GRATES_ON_THREAD.with(|set| {
+            set.borrow_mut().remove(&self.grate_id);
+        });
+    }
+}
+
+#[cfg(test)]
+mod reentrancy_guard_tests {
+    use super::ReentrancyGuard;
+
+    #[test]
+    fn same_grate_on_one_thread_is_rejected() {
+        let _outer = ReentrancyGuard::enter(42).expect("first entry must succeed");
+        match ReentrancyGuard::enter(42) {
+            Err(e) => assert!(e.to_string().contains("reentrant grate call")),
+            Ok(_) => panic!("nested entry into the SAME grate id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn different_grates_nest_fine() {
+        let _outer = ReentrancyGuard::enter(1).unwrap();
+        let inner = ReentrancyGuard::enter(2);
+        assert!(
+            inner.is_ok(),
+            "a nested call into a DIFFERENT grate must not be rejected"
+        );
+    }
+
+    #[test]
+    fn reentry_after_drop_succeeds() {
+        {
+            let _g = ReentrancyGuard::enter(7).unwrap();
+        }
+        // The first guard's Drop must have released grate 7; entering it
+        // again (e.g. a later, unrelated call on this same thread) must
+        // succeed, not be permanently poisoned by the earlier call.
+        assert!(ReentrancyGuard::enter(7).is_ok());
+    }
+
+    #[test]
+    fn independent_on_different_threads() {
+        // A DIFFERENT thread calling into the same grate id concurrently is
+        // legitimate worker-pool concurrency, not reentrancy -- the
+        // thread-local set must never leak across threads.
+        let _outer = ReentrancyGuard::enter(99).unwrap();
+        let handle = std::thread::spawn(|| ReentrancyGuard::enter(99).is_ok());
+        assert!(
+            handle.join().unwrap(),
+            "a different thread must not be blocked by this one"
+        );
     }
 }
 
@@ -627,43 +796,7 @@ impl<T: 'static> GrateWorker<T> {
         }
 
         self.reset_worker_stack();
-
-        // Reset before the call so a grate lacking __errno_location (or a
-        // failed resolve below) never leaks a stale value from a previous
-        // call into this one's dispatch_lib_call.
-        threei::set_last_grate_errno(None);
-
-        // Seed this worker's own errno with the caller's pre-call value (see
-        // threei::take_next_grate_errno_seed's doc) before invoking the real
-        // function. Without this, the grate's errno -- a separate value that
-        // outlives any single call -- would carry over whatever an earlier,
-        // unrelated dispatch happened to leave it at, leaking into every
-        // later call that doesn't itself touch errno.
-        if let Some(seed) = threei::take_next_grate_errno_seed() {
-            if let (Some(errno_func), Some(mem)) =
-                (self.errno_location_func.as_ref(), self.memory.as_ref())
-            {
-                if let Ok(addr) = errno_func.call(&mut self.store, ()) {
-                    let addr = addr as u32 as usize;
-                    match mem {
-                        Extern::Memory(m) => {
-                            let _ = m.write(&mut self.store, addr, &seed.to_le_bytes());
-                        }
-                        Extern::SharedMemory(sm) => {
-                            let data = sm.data();
-                            if addr + 4 <= data.len() {
-                                for (i, b) in seed.to_le_bytes().into_iter().enumerate() {
-                                    unsafe {
-                                        *data[addr + i].get() = b;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+        self.seed_errno_before_call();
 
         let func = self.pass_fptr_func.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no pass_fptr_func found in worker {}", self.worker_id)
@@ -703,10 +836,56 @@ impl<T: 'static> GrateWorker<T> {
             self.worker_id, ret
         );
 
-        // Relay this worker's own errno (as set by whatever the grate just
-        // ran, inside its own address space) out to the caller-side portal
-        // via the thread-local in `threei`. Best-effort: a grate without
-        // __errno_location or without linear memory just leaves this unset.
+        self.relay_errno_after_call();
+
+        Ok(ret)
+    }
+
+    /// Reset before a call so a grate lacking `__errno_location` (or a
+    /// failed resolve here) never leaks a stale value from a previous call
+    /// into this one's dispatch, then seed this worker's own errno with the
+    /// caller's pre-call value (see `threei::take_next_grate_errno_seed`'s
+    /// doc). Without seeding, the grate's errno -- a separate value that
+    /// outlives any single call -- would carry over whatever an earlier,
+    /// unrelated dispatch happened to leave it at, leaking into every later
+    /// call that doesn't itself touch errno. Shared by V1's `run` and V2's
+    /// `run_v2` -- both dispatch into this same worker's grate instance.
+    fn seed_errno_before_call(&mut self) {
+        threei::set_last_grate_errno(None);
+
+        if let Some(seed) = threei::take_next_grate_errno_seed() {
+            if let (Some(errno_func), Some(mem)) =
+                (self.errno_location_func.as_ref(), self.memory.as_ref())
+            {
+                if let Ok(addr) = errno_func.call(&mut self.store, ()) {
+                    let addr = addr as u32 as usize;
+                    match mem {
+                        Extern::Memory(m) => {
+                            let _ = m.write(&mut self.store, addr, &seed.to_le_bytes());
+                        }
+                        Extern::SharedMemory(sm) => {
+                            let data = sm.data();
+                            if addr + 4 <= data.len() {
+                                for (i, b) in seed.to_le_bytes().into_iter().enumerate() {
+                                    unsafe {
+                                        *data[addr + i].get() = b;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Relay this worker's own errno (as set by whatever the grate just ran,
+    /// inside its own address space) out to the caller-side portal via the
+    /// thread-local in `threei`. Best-effort: a grate without
+    /// `__errno_location` or without linear memory just leaves this unset.
+    /// Shared by V1's `run` and V2's `run_v2`.
+    fn relay_errno_after_call(&mut self) {
         if let (Some(errno_func), Some(mem)) =
             (self.errno_location_func.as_ref(), self.memory.as_ref())
         {
@@ -744,8 +923,50 @@ impl<T: 'static> GrateWorker<T> {
                 }
             }
         }
+    }
 
-        Ok(ret)
+    /// Run one V2 (variable-width) grate request inside this worker: resolve
+    /// (and cache) the registered adapter export, then call it with dynamic
+    /// argument/result vectors -- no process-global mutable argument buffer,
+    /// no fixed six-slot tuple. Mirrors `run`'s stack-reset/errno-seed/
+    /// errno-relay structure exactly; the only difference is the shape of
+    /// the call itself.
+    fn run_v2(
+        &mut self,
+        registration: &threei::V2Registration,
+        source_cage: u64,
+        args: &[Val],
+    ) -> v2_adapter::V2CallOutcome {
+        self.reset_worker_stack();
+        self.seed_errno_before_call();
+
+        let adapter =
+            match self
+                .v2_adapter_cache
+                .resolve(&mut self.store, &self.instance, registration)
+            {
+                Ok(a) => a,
+                Err(rejection) => {
+                    return v2_adapter::V2CallOutcome::Rejected(rejection.to_string());
+                }
+            };
+        let outcome = match v2_adapter::call_v2_adapter(
+            &mut self.store,
+            adapter,
+            source_cage,
+            registration.grate_cage,
+            args,
+        ) {
+            Ok(results) => v2_adapter::V2CallOutcome::Ok(results),
+            Err(e) => v2_adapter::V2CallOutcome::Trapped(format!(
+                "V2 adapter trapped in worker {}: {e:#}",
+                self.worker_id
+            )),
+        };
+
+        self.relay_errno_after_call();
+
+        outcome
     }
 }
 
@@ -822,6 +1043,8 @@ where
     Ok(GrateWorker {
         worker_id,
         store,
+        instance,
+        v2_adapter_cache: v2_adapter::V2AdapterCache::new(),
         pass_fptr_func,
         stack_pointer,
         errno_location_func,

@@ -22,3 +22,7 @@ lind-logging = ["sysdefs/lind-logging"]
 
 [dev-dependencies]
 serial_test = "3"
+# cage::Cage's own fields are built against dashmap 5.x (see src/cage/Cargo.toml),
+# distinct from this crate's own dashmap 6.x -- aliased so tests constructing a
+# real Cage literal (see tests/v2_transport_tests.rs) use the matching type.
+dashmap5 = { package = "dashmap", version = "5.1" }

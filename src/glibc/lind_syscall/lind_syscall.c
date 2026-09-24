@@ -170,6 +170,41 @@ int register_lib_handler(uint64_t target_cage,
     );
 }
 
+// 3i function call to register a V2 (variable-width) library-level handler
+// for a symbol in target_cage -- the counterpart to register_lib_handler
+// for a symbol whose real argument count exceeds the ordinary transport's
+// six-raw-slot capacity.
+// target_cage: the cage whose library calls are being intercepted
+// lib_name: name of the library (e.g., "libtoy_wide.so")
+// symbol_name: name of the function symbol (e.g., "toy_wide_marshal")
+// handler_cage: cage ID of the grate that will handle the call
+// adapter_export: exported wasm function name of the generated V2 adapter
+//                 (see tools/marshal-gen/gen_v2_adapter.py)
+// signature_desc: compact "<manifest_version>:<params>:<results>" descriptor
+//                 of the adapter's real lowered signature (type chars:
+//                 i=i32, l=i64, f=f32, d=f64), e.g. "2:iid:d"
+int register_lib_handler_v2(uint64_t target_cage,
+    const char *lib_name,
+    const char *symbol_name,
+    uint64_t handler_cage,
+    const char *adapter_export,
+    const char *signature_desc)
+{
+    return make_threei_call(
+        REGISTER_LIB_HANDLER_V2_SYSCALL,
+        NOTUSED,
+        (uint64_t)getpid(), // self_cageid
+        (uint64_t)getpid(), // target_cageid
+        target_cage, NOTUSED,
+        (uint64_t)TRANSLATE_GUEST_POINTER_TO_HOST(lib_name), NOTUSED,
+        (uint64_t)TRANSLATE_GUEST_POINTER_TO_HOST(symbol_name), NOTUSED,
+        handler_cage, NOTUSED,
+        (uint64_t)TRANSLATE_GUEST_POINTER_TO_HOST(adapter_export), NOTUSED,
+        (uint64_t)TRANSLATE_GUEST_POINTER_TO_HOST(signature_desc), NOTUSED,
+        TRANSLATE_ERRNO_OFF
+    );
+}
+
 // 3i function call to copy data between cages
 // thiscage: the cage id of the caller cage
 // targetcage: the cage id of the target cage

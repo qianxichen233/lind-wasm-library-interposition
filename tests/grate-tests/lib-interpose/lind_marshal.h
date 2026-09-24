@@ -551,6 +551,7 @@ struct _lind_shadow {
 static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
                             uint64_t source_cage, uint64_t grate_cage,
                             const uint64_t *raw_args_or_sibling_shadow,
+                            uint32_t nargs,
                             int in_struct_context,
                             struct _lind_ptr_field_track **out_ptr_fields,
                             uint32_t *out_n_ptr_fields);
@@ -561,11 +562,19 @@ static void _lind_post_struct(const struct _lind_shadow *s,
 static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *elem,
                                   uint64_t source_cage, uint64_t grate_cage);
 
-// Every current caller passes a fixed 6-element raw_args array (the
-// lind_handler6_t convention: LIND_DEFINE_MARSHAL_HANDLER's `_raw[6]`,
-// lind_marshal_dispatch's own handler_args[16] slice). size_arg_index comes
-// from the spec, not the calling cage, but a misconfigured or corrupt spec
-// must not turn into an out-of-bounds read of this array -- fail closed.
+// The V1 fixed-arity dispatch transport (lind_marshal_dispatch,
+// LIND_DEFINE_MARSHAL_HANDLER's `_raw[6]`) carries at most this many raw
+// wasm-level argument slots; a spec claiming more than this many top-level
+// args can never be dispatched through that path -- see
+// lind_marshal_dispatch's own check. It is NOT the bound used to validate a
+// size_arg_index/extent arg_index against a specific call's raw_args array:
+// those are checked against that call's own actual `nargs` (passed
+// explicitly to _lind_eval_extent_operand/_lind_compute_size/_lind_pre_ptr),
+// since a V2 (variable-width) caller's raw_args array can legitimately be
+// longer than LIND_RAW_ARGS_MAX. V1 and V2 share these exact bound checks
+// (see _lind_marshal_prepare_arg/_lind_marshal_finish_shadow/
+// _lind_marshal_translate_return below) rather than each maintaining its
+// own pointer/handle safety logic.
 #define LIND_RAW_ARGS_MAX 6
 
 // Evaluates one lind_extent_operand: the argument's own value, an i32
@@ -580,14 +589,14 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
 // at generation time (gen_grate.py), not here.
 static inline int32_t _lind_eval_extent_operand(
     const struct lind_extent_operand *op,
-    const uint64_t *raw_args,
+    const uint64_t *raw_args, uint32_t nargs,
     uint64_t source_cage, uint64_t grate_cage,
     const char *reason)
 {
     if (op->source == LIND_EXTENT_CONSTANT)
         return (int32_t)op->const_value;
 
-    if (op->arg_index >= LIND_RAW_ARGS_MAX)
+    if (op->arg_index >= nargs)
         _lind_marshal_abort(reason);
     uint64_t raw = raw_args[op->arg_index];
     switch (op->source) {
@@ -624,7 +633,7 @@ static inline int32_t _lind_eval_extent_operand(
 
 static inline size_t _lind_compute_size(
     const struct lind_arg_spec *as,
-    const uint64_t *raw_args,
+    const uint64_t *raw_args, uint32_t nargs,
     uint64_t source_cage, uint64_t grate_cage)
 {
     switch (as->size_kind) {
@@ -632,13 +641,13 @@ static inline size_t _lind_compute_size(
             return (size_t)as->const_size;
 
         case LIND_SIZE_FROM_ARG:
-            if (as->size_arg_index >= LIND_RAW_ARGS_MAX)
+            if (as->size_arg_index >= nargs)
                 _lind_marshal_abort("size_arg_index out of range");
             return (size_t)raw_args[as->size_arg_index];
 
         case LIND_SIZE_FROM_ARG_POINTEE: {
             // Read uint32_t from source cage at the address stored in raw_args[i].
-            if (as->size_arg_index >= LIND_RAW_ARGS_MAX)
+            if (as->size_arg_index >= nargs)
                 _lind_marshal_abort("size_arg_index out of range");
             uint32_t size_val = 0;
             _lind_copy_or_abort(grate_cage, source_cage,
@@ -672,13 +681,13 @@ static inline size_t _lind_compute_size(
             // address outside the real buffer. Left for whichever future
             // change actually needs it.
             int32_t n = _lind_eval_extent_operand(
-                &as->size_operand, raw_args, source_cage, grate_cage,
+                &as->size_operand, raw_args, nargs, source_cage, grate_cage,
                 "strided vector: invalid count operand");
             // n<=0 sizes to 0 (nothing touched), not an error.
             if (n <= 0)
                 return 0;
             int32_t stride = _lind_eval_extent_operand(
-                &as->stride_operand, raw_args, source_cage, grate_cage,
+                &as->stride_operand, raw_args, nargs, source_cage, grate_cage,
                 "strided vector: invalid stride operand");
             if (stride < 0)
                 _lind_marshal_abort("strided vector: negative stride not supported");
@@ -719,7 +728,8 @@ static inline size_t _lind_compute_size(
 
 static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
                             uint64_t source_cage, uint64_t grate_cage,
-                            const uint64_t *raw_or_sibling, int in_struct,
+                            const uint64_t *raw_or_sibling, uint32_t nargs,
+                            int in_struct,
                             struct _lind_ptr_field_track **out_ptr_fields,
                             uint32_t *out_n_ptr_fields)
 {
@@ -749,7 +759,7 @@ static void *_lind_pre_ptr(uint64_t src_ptr, const struct lind_arg_spec *as,
         case LIND_SIZE_FROM_ARG:
         case LIND_SIZE_FROM_ARG_POINTEE:
         case LIND_SIZE_STRIDE_VECTOR:
-            size = _lind_compute_size(as, raw_or_sibling, source_cage, grate_cage);
+            size = _lind_compute_size(as, raw_or_sibling, nargs, source_cage, grate_cage);
             break;
         default:
             _lind_marshal_abort("pointer arg has no computable size");
@@ -943,9 +953,15 @@ static void *_lind_pre_ptr_array(uint64_t src_ptr, const struct lind_arg_spec *e
 
     // Marshal each element per its spec (e.g. each is a cstr pointer -> copy the string).
     for (uint32_t i = 0; i < n; i++) {
+        // nargs=0: an array element has no raw_args array of its own to
+        // index at all (only top-level args do) -- FROM_ARG/FROM_ARG_POINTEE/
+        // STRIDE_VECTOR sizing is unreachable in practice for an element
+        // spec (CSTR/CONST are the only kinds that make sense here), and
+        // nargs=0 turns an accidental one into a clean abort rather than an
+        // out-of-bounds/NULL read of a nonexistent raw_args array.
         void *child = elem
             ? _lind_pre_ptr((uint64_t)elems[i], elem, source_cage, grate_cage,
-                            NULL, 0, NULL, NULL)
+                            NULL, 0, 0, NULL, NULL)
             : (void *)(uintptr_t)elems[i];
         shadow[i] = (uint32_t)(uintptr_t)child;
     }
@@ -1092,6 +1108,253 @@ static void _lind_post_struct(const struct _lind_shadow *s,
 }
 
 // ---------------------------------------------------------------------------
+// Shared per-call marshalling primitives.
+//
+// Each function below handles exactly one argument or one shadow at a time,
+// parameterized by the real argument count (nargs) rather than any fixed
+// slot width. V1's fixed six-slot lind_marshal_dispatch (below) and a V2
+// generated adapter's own unrolled prepare/invoke/finish sequence both call
+// these same functions, so a correctness fix to pointer/handle/copy-back
+// safety logic applies to both transports at once instead of needing to be
+// made -- and kept in sync -- twice.
+// ---------------------------------------------------------------------------
+
+// Prepares one argument for the real call and returns the value to pass it:
+// a LIND_ARG_SCALAR's raw value unchanged; a LIND_ARG_HANDLE's real pointer
+// (0 passes through as "no handle"; a nonzero token that fails to translate
+// is fail-closed); or, for LIND_ARG_PTR, the shadow address after validating
+// and copying via _lind_pre_ptr. A shadow entry is appended (bumping
+// *nshadows) only when a real shadow copy was made -- a NULL source pointer
+// passes through with no entry, matching every existing caller.
+static inline uint64_t _lind_marshal_prepare_arg(
+    uint32_t arg_index,
+    const struct lind_arg_spec *as,
+    const uint64_t *raw_args, uint32_t nargs,
+    uint64_t source_cage, uint64_t grate_cage,
+    struct _lind_shadow *shadows, uint32_t *nshadows)
+{
+    uint64_t raw = raw_args[arg_index];
+
+    switch (as->kind) {
+        case LIND_ARG_SCALAR:
+            return raw;
+
+        case LIND_ARG_HANDLE:
+            if (raw == 0) return 0;
+            {
+                int found;
+                uint64_t translated =
+                    lind_translate_handle_checked(as->handle_class, raw, &found);
+                if (!found) _lind_marshal_abort("handle arg: invalid token");
+                return translated;
+            }
+
+        case LIND_ARG_PTR: {
+            if (raw == 0) return 0;
+
+            struct _lind_ptr_field_track *ptf = NULL;
+            uint32_t n_ptf = 0;
+            void *shadow = _lind_pre_ptr(raw, as, source_cage, grate_cage,
+                                          raw_args, nargs, 0, &ptf, &n_ptf);
+
+            size_t shadow_size = (as->layout != NULL)
+                ? as->layout->struct_size
+                : _lind_compute_size(as, raw_args, nargs, source_cage, grate_cage);
+            if (as->size_kind == LIND_SIZE_CSTR && shadow_size == 0)
+                shadow_size = _lind_measure_cstr(raw, source_cage, grate_cage);
+
+            if (shadow != (void *)(uintptr_t)raw) {
+                shadows[*nshadows].arg_index    = arg_index;
+                shadows[*nshadows].source_ptr   = raw;
+                shadows[*nshadows].shadow_ptr   = shadow;
+                shadows[*nshadows].size         = shadow_size;
+                shadows[*nshadows].direction    = as->ptr_direction;
+                shadows[*nshadows].source_cage  = source_cage;
+                shadows[*nshadows].grate_cage   = grate_cage;
+                shadows[*nshadows].layout       = as->layout;
+                shadows[*nshadows].ptr_fields   = ptf;
+                shadows[*nshadows].n_ptr_fields = n_ptf;
+                (*nshadows)++;
+            }
+            return (uint64_t)(uintptr_t)shadow;
+        }
+    }
+    _lind_marshal_abort("prepare_arg: unknown arg kind");
+    return 0; // unreachable (abort traps)
+}
+
+// Finishes one shadow after the real call: copies OUT/INOUT results back to
+// the source cage -- a flat buffer, a nested struct (_lind_post_struct), or
+// an OUT pointer-to-pointer that aliases another argument (strtol's char**
+// endptr; see lind_arg_spec.out_ptr_into_arg1's doc). `spec_args` is the
+// full per-call argument spec array (to look up the aliased argument's own
+// spec) and `shadows`/`nshadows` the full shadow set for this call (to find
+// the aliased argument's own shadow).
+static inline void _lind_marshal_finish_shadow(
+    uint32_t shadow_index,
+    const struct lind_arg_spec *spec_args,
+    const struct _lind_shadow *shadows, uint32_t nshadows,
+    uint64_t source_cage, uint64_t grate_cage)
+{
+    const struct _lind_shadow *s = &shadows[shadow_index];
+    const struct lind_arg_spec *sas = &spec_args[s->arg_index];
+
+    // `inner` is entirely callee-controlled -- never expose it, or an
+    // address derived from it, to the source cage without confirming it's a
+    // valid position within the aliased argument's own shadow allocation;
+    // fail closed otherwise (an out-of-bounds value here is either a
+    // library bug or a deliberate attempt to leak a grate-process address
+    // to the source cage).
+    if (sas->out_ptr_into_arg1 != 0) {
+        uint32_t target = sas->out_ptr_into_arg1 - 1;
+        uint32_t inner = *(uint32_t *)s->shadow_ptr;  // what the callee wrote
+        uint32_t translated = 0;                      // default: NULL
+        if (inner != 0) {
+            const struct _lind_shadow *tshadow = NULL;
+            for (uint32_t t = 0; t < nshadows; t++) {
+                if (shadows[t].arg_index == target) { tshadow = &shadows[t]; break; }
+            }
+            if (!tshadow)
+                _lind_marshal_abort("OUT ptr-to-ptr: aliased argument has no shadow");
+            _lind_check_shadow_owner(tshadow->source_cage, tshadow->grate_cage,
+                                      source_cage, grate_cage,
+                                      "OUT ptr-to-ptr: aliased shadow does not belong to this call's cages");
+            translated = (uint32_t)_lind_translate_shadow_ptr_or_abort(
+                (uintptr_t)tshadow->shadow_ptr, tshadow->size,
+                (sas->flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
+                tshadow->source_ptr, (uint64_t)inner,
+                "OUT ptr-to-ptr: value outside the aliased argument's shadow buffer");
+        }
+        _lind_copy_or_abort(grate_cage, source_cage,
+            (uint64_t)(uintptr_t)&translated, grate_cage,
+            s->source_ptr, source_cage, 4, 0);
+        return;
+    }
+
+    if (s->layout != NULL) {
+        _lind_post_struct(s, source_cage, grate_cage);
+    } else if (s->size > 0 &&
+               (s->direction == LIND_PTR_OUT || s->direction == LIND_PTR_INOUT)) {
+        _lind_copy_or_abort(grate_cage, source_cage,
+            (uint64_t)(uintptr_t)s->shadow_ptr, grate_cage,
+            s->source_ptr, source_cage,
+            (uint64_t)s->size, 0);
+    }
+}
+
+// Translates the real call's return value per `ret`. `raw_args`/`nargs` are
+// needed for LIND_RET_PTR_ALIAS_ARG (the original source-cage pointer of
+// arg[alias_arg_index]); `shadows`/`nshadows` for LIND_RET_PTR_INTO_ARG
+// (finding that argument's own shadow to translate a callee-returned
+// pointer into it).
+static inline uint64_t _lind_marshal_translate_return(
+    const struct lind_return_spec *ret,
+    const uint64_t *raw_args, uint32_t nargs,
+    const struct _lind_shadow *shadows, uint32_t nshadows,
+    uint64_t handler_ret,
+    uint64_t source_cage, uint64_t grate_cage)
+{
+    switch (ret->kind) {
+        case LIND_RET_VOID:
+            return 0;
+
+        case LIND_RET_PTR_ALIAS_ARG:
+            // alias_arg_index comes from the spec, not the calling cage, but
+            // a misconfigured/corrupt spec must not turn into an
+            // out-of-bounds read of raw_args -- fail closed like every
+            // other spec-supplied index in this file.
+            if (ret->alias_arg_index >= nargs)
+                _lind_marshal_abort("alias_arg_index out of range");
+            return raw_args[ret->alias_arg_index];
+
+        case LIND_RET_PTR_INTO_ARG: {
+            // handler_ret is a pointer into a shadow buffer -- entirely
+            // callee-controlled. Translate it to the source cage's
+            // equivalent address only once confirmed to lie within the
+            // aliased argument's own shadow allocation; never fall back to
+            // exposing the raw handler_ret (a grate-process address) to the
+            // source cage.
+            uint32_t idx = ret->alias_arg_index;
+            if (handler_ret == 0)
+                return 0;  // NULL return (not found)
+            const struct _lind_shadow *rshadow = NULL;
+            for (uint32_t s = 0; s < nshadows; s++) {
+                if (shadows[s].arg_index == idx) { rshadow = &shadows[s]; break; }
+            }
+            if (!rshadow)
+                _lind_marshal_abort("pointer-into-arg return: aliased argument has no shadow");
+            _lind_check_shadow_owner(rshadow->source_cage, rshadow->grate_cage,
+                                      source_cage, grate_cage,
+                                      "pointer-into-arg return: aliased shadow does not belong to this call's cages");
+            return _lind_translate_shadow_ptr_or_abort(
+                (uintptr_t)rshadow->shadow_ptr, rshadow->size,
+                (ret->flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
+                rshadow->source_ptr, handler_ret,
+                "pointer-into-arg return: value outside the aliased argument's shadow buffer");
+        }
+
+        case LIND_RET_HANDLE: {
+            // 0 means the handle table is full -- app_token is documented
+            // as never 0, so returning 0 to the source cage here would be
+            // indistinguishable from a real token. Fail closed instead.
+            uint64_t token = lind_register_handle(ret->handle_class, handler_ret);
+            if (token == 0) _lind_marshal_abort("handle table exhausted");
+            return token;
+        }
+
+        case LIND_RET_FORCE_LOCAL:
+        case LIND_RET_SCALAR:
+        default:
+            return handler_ret;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V2 float/double <-> uint64_t bit reinterpretation.
+//
+// V1's single generic dispatcher calls every real function through one
+// blindly-cast lind_handler6_t pointer, relying on --fpcast-emu to patch the
+// resulting ABI mismatch at the binary level (see FuncCastEmulation) --
+// including for a float/double-returning function, whose bits simply land
+// in the right place because of that binary-level trick, not because of any
+// C-level cast. A V2 generated adapter instead makes a real, correctly
+// prototyped C call to the real function, so there is no such trick to rely
+// on: a float/double value crossing into/out of the shared marshalling
+// primitives' uniform uint64_t needs an explicit, ordinary bit
+// reinterpretation instead. A plain C cast (`(uint64_t)some_double`) would
+// be wrong here -- it performs a NUMERIC conversion, not a bit
+// reinterpretation (3.0 would become 3, not the double's actual bit
+// pattern) -- exactly the kind of corruption this file's arithmetic checks
+// elsewhere exist to prevent.
+// ---------------------------------------------------------------------------
+
+// Unions, not memcpy: this header must stay includable without <string.h>
+// (see LIND_MARSHAL_NO_LIBC_HEADERS for freestanding grates).
+static inline uint64_t _lind_v2_bits_from_f64(double v) {
+    union { double d; uint64_t u; } c;
+    c.d = v;
+    return c.u;
+}
+
+static inline uint64_t _lind_v2_bits_from_f32(float v) {
+    union { float f; uint32_t u; } c;
+    c.f = v;
+    return (uint64_t)c.u;
+}
+
+static inline double _lind_v2_f64_from_bits(uint64_t bits) {
+    union { double d; uint64_t u; } c;
+    c.u = bits;
+    return c.d;
+}
+
+static inline float _lind_v2_f32_from_bits(uint64_t bits) {
+    union { float f; uint32_t u; } c;
+    c.u = (uint32_t)bits;
+    return c.f;
+}
+
+// ---------------------------------------------------------------------------
 // Core dispatch
 // ---------------------------------------------------------------------------
 
@@ -1146,61 +1409,11 @@ static inline uint64_t lind_marshal_dispatch(
     uint32_t nshadows = 0;
 
     // --- Pre-call ---
-    for (uint32_t i = 0; i < nargs && i < spec->nargs; i++) {
-        const struct lind_arg_spec *as = &spec->args[i];
-
-        switch (as->kind) {
-            case LIND_ARG_SCALAR:
-                handler_args[i] = raw_args[i];
-                break;
-
-            case LIND_ARG_HANDLE:
-                // 0 is "no handle" (like NULL) and passes through; a
-                // nonzero token that fails to translate is stale, forged,
-                // or the wrong class -- fail closed.
-                if (raw_args[i] == 0) {
-                    handler_args[i] = 0;
-                } else {
-                    int found;
-                    handler_args[i] = lind_translate_handle_checked(as->handle_class, raw_args[i], &found);
-                    if (!found) _lind_marshal_abort("handle arg: invalid token");
-                }
-                break;
-
-            case LIND_ARG_PTR: {
-                uint64_t src_ptr = raw_args[i];
-                if (src_ptr == 0) { handler_args[i] = 0; break; }
-
-                struct _lind_ptr_field_track *ptf = NULL;
-                uint32_t n_ptf = 0;
-                void *shadow = _lind_pre_ptr(src_ptr, as,
-                                              source_cage, grate_cage,
-                                              raw_args, 0,
-                                              &ptf, &n_ptf);
-                handler_args[i] = (uint64_t)(uintptr_t)shadow;
-
-                size_t shadow_size = (as->layout != NULL)
-                    ? as->layout->struct_size
-                    : _lind_compute_size(as, raw_args, source_cage, grate_cage);
-                if (as->size_kind == LIND_SIZE_CSTR && shadow_size == 0)
-                    shadow_size = _lind_measure_cstr(src_ptr, source_cage, grate_cage);
-
-                if (shadow != (void *)(uintptr_t)src_ptr) {
-                    shadows[nshadows].arg_index    = i;
-                    shadows[nshadows].source_ptr   = src_ptr;
-                    shadows[nshadows].shadow_ptr   = shadow;
-                    shadows[nshadows].size         = shadow_size;
-                    shadows[nshadows].direction    = as->ptr_direction;
-                    shadows[nshadows].source_cage  = source_cage;
-                    shadows[nshadows].grate_cage   = grate_cage;
-                    shadows[nshadows].layout       = as->layout;
-                    shadows[nshadows].ptr_fields   = ptf;
-                    shadows[nshadows].n_ptr_fields = n_ptf;
-                    nshadows++;
-                }
-                break;
-            }
-        }
+    uint32_t effective_nargs = nargs < spec->nargs ? nargs : spec->nargs;
+    for (uint32_t i = 0; i < effective_nargs; i++) {
+        handler_args[i] = _lind_marshal_prepare_arg(
+            i, &spec->args[i], raw_args, nargs, source_cage, grate_cage,
+            shadows, &nshadows);
     }
 
     // --- Handler ---
@@ -1214,109 +1427,15 @@ static inline uint64_t lind_marshal_dispatch(
 
     // --- Post-call ---
     for (uint32_t s = 0; s < nshadows; s++) {
-        const struct lind_arg_spec *sas = &spec->args[shadows[s].arg_index];
-
-        // OUT pointer-to-pointer that aliases an arg (strtol's char** endptr):
-        // the callee wrote a pointer into arg[target]'s buffer; translate it
-        // from the grate shadow to the source cage and write it back to the
-        // outer slot. `inner` is entirely callee-controlled -- never expose
-        // it, or an address derived from it, to the source cage without
-        // confirming it's a valid position within the aliased argument's own
-        // shadow allocation; fail closed otherwise (an out-of-bounds value
-        // here is either a library bug or a deliberate attempt to leak a
-        // grate-process address to the source cage).
-        if (sas->out_ptr_into_arg1 != 0) {
-            uint32_t target = sas->out_ptr_into_arg1 - 1;
-            uint32_t inner = *(uint32_t *)shadows[s].shadow_ptr;  // what the callee wrote
-            uint32_t translated = 0;                              // default: NULL
-            if (inner != 0) {
-                const struct _lind_shadow *tshadow = NULL;
-                for (uint32_t t = 0; t < nshadows; t++) {
-                    if (shadows[t].arg_index == target) { tshadow = &shadows[t]; break; }
-                }
-                if (!tshadow)
-                    _lind_marshal_abort("OUT ptr-to-ptr: aliased argument has no shadow");
-                _lind_check_shadow_owner(tshadow->source_cage, tshadow->grate_cage,
-                                          source_cage, grate_cage,
-                                          "OUT ptr-to-ptr: aliased shadow does not belong to this call's cages");
-                translated = (uint32_t)_lind_translate_shadow_ptr_or_abort(
-                    (uintptr_t)tshadow->shadow_ptr, tshadow->size,
-                    (sas->flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
-                    tshadow->source_ptr, (uint64_t)inner,
-                    "OUT ptr-to-ptr: value outside the aliased argument's shadow buffer");
-            }
-            _lind_copy_or_abort(grate_cage, source_cage,
-                (uint64_t)(uintptr_t)&translated, grate_cage,
-                shadows[s].source_ptr, source_cage, 4, 0);
-            continue;
-        }
-
-        if (shadows[s].layout != NULL) {
-            _lind_post_struct(&shadows[s], source_cage, grate_cage);
-        } else if (shadows[s].size > 0 &&
-                   (shadows[s].direction == LIND_PTR_OUT ||
-                    shadows[s].direction == LIND_PTR_INOUT)) {
-            _lind_copy_or_abort(grate_cage, source_cage,
-                (uint64_t)(uintptr_t)shadows[s].shadow_ptr, grate_cage,
-                shadows[s].source_ptr, source_cage,
-                (uint64_t)shadows[s].size, 0);
-        }
+        _lind_marshal_finish_shadow(s, spec->args, shadows, nshadows,
+                                     source_cage, grate_cage);
     }
 
     // --- Return translation ---
-    uint64_t result;
-    switch (spec->ret.kind) {
-        case LIND_RET_VOID:
-            result = 0;
-            break;
+    uint64_t result = _lind_marshal_translate_return(
+        &spec->ret, raw_args, nargs, shadows, nshadows, handler_ret,
+        source_cage, grate_cage);
 
-        case LIND_RET_PTR_ALIAS_ARG:
-            result = raw_args[spec->ret.alias_arg_index];
-            break;
-
-        case LIND_RET_PTR_INTO_ARG: {
-            // handler_ret is a pointer into a shadow buffer -- entirely
-            // callee-controlled. Translate it to the source cage's
-            // equivalent address only once confirmed to lie within the
-            // aliased argument's own shadow allocation; never fall back to
-            // exposing the raw handler_ret (a grate-process address) to the
-            // source cage.
-            uint32_t idx = spec->ret.alias_arg_index;
-            if (handler_ret == 0) {
-                result = 0;  // NULL return (not found)
-                break;
-            }
-            const struct _lind_shadow *rshadow = NULL;
-            for (uint32_t s = 0; s < nshadows; s++) {
-                if (shadows[s].arg_index == idx) { rshadow = &shadows[s]; break; }
-            }
-            if (!rshadow)
-                _lind_marshal_abort("pointer-into-arg return: aliased argument has no shadow");
-            _lind_check_shadow_owner(rshadow->source_cage, rshadow->grate_cage,
-                                      source_cage, grate_cage,
-                                      "pointer-into-arg return: aliased shadow does not belong to this call's cages");
-            result = _lind_translate_shadow_ptr_or_abort(
-                (uintptr_t)rshadow->shadow_ptr, rshadow->size,
-                (spec->ret.flags & LIND_ARGSPEC_ALLOW_ONE_PAST) != 0,
-                rshadow->source_ptr, handler_ret,
-                "pointer-into-arg return: value outside the aliased argument's shadow buffer");
-            break;
-        }
-
-        case LIND_RET_HANDLE:
-            // 0 means the handle table is full -- app_token is documented
-            // as never 0, so returning 0 to the source cage here would be
-            // indistinguishable from a real token. Fail closed instead.
-            result = lind_register_handle(spec->ret.handle_class, handler_ret);
-            if (result == 0) _lind_marshal_abort("handle table exhausted");
-            break;
-
-        case LIND_RET_FORCE_LOCAL:
-        case LIND_RET_SCALAR:
-        default:
-            result = handler_ret;
-            break;
-    }
     _lind_marshal_reset();
     return result;
 }

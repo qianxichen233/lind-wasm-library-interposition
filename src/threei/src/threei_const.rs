@@ -58,3 +58,7 @@ pub const COPY_HANDLER_TABLE_TO_CAGE_SYSCALL: u64 = 1003;
 ///
 /// Match the definition in `glibc/lind_syscall_num.h`.
 pub const REGISTER_LIB_HANDLER_SYSCALL: u64 = 1004;
+/// 3i-specific syscall number for `register_lib_handler_v2`.
+///
+/// Match the definition in `glibc/lind_syscall_num.h`.
+pub const REGISTER_LIB_HANDLER_V2_SYSCALL: u64 = 1005;

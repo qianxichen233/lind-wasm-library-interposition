@@ -19,6 +19,18 @@ threei = { path = "../threei" }
 lazy_static = "1.4"
 dashmap = { version = "6" }
 
+[dev-dependencies]
+# Test-only: the V2 adapter resolution tests (tests/v2_adapter_tests.rs) need
+# to construct deliberately mismatched grate module fixtures (missing export,
+# wrong signature, unsupported v128 param, ...) for registration-time
+# validation testing. Raw WAT text lets those be generated programmatically
+# instead of hand-authoring a combinatorial set of C source files, and the
+# v128 case specifically can't be produced by the C toolchain at all (same
+# documented gap lib3i-portal-signature-check exists for). This does not
+# affect the production build: dev-dependency features are only unified into
+# `cargo test`/`cargo build --tests`, never a normal `cargo build`.
+wasmtime = { workspace = true, features = ['threads', 'runtime', 'anyhow', 'wat', 'cranelift'] }
+
 [features]
 default = []
 debug-grate-calls = []

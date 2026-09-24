@@ -33,6 +33,11 @@ tests/grate-tests/lib-interpose/full-libm/generated/
 /tests/grate-tests/lib-interpose/full-*/*_full_grate.c
 /tests/grate-tests/lib-interpose/auto-openblas-daxpy/openblas_daxpy_auto_grate.c
 /tests/grate-tests/lib-interpose/auto-conststride/conststride_auto_grate.c
+/tests/grate-tests/lib-interpose/auto-conststride/conststride_v2_grate.c
+/tests/grate-tests/lib-interpose/auto-v2wide/v2wide_adapters.c
+/tests/grate-tests/lib-interpose/auto-v2wide/handle_v2_grate.c
+/tests/grate-tests/lib-interpose/auto-openblas-v2wide/daxpby_v2_adapter.c
+/tests/grate-tests/lib-interpose/auto-v2wide-abi/combine_v2_adapter.c
 
 # Local library-interposition research and working notes
 /impl-log.md

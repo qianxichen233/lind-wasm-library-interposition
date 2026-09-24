@@ -62,16 +62,20 @@ SUPPORTED_RET = {"void", "scalar", "ptr_alias_arg", "ptr_into_arg", "handle"}
 SUPPORTED_SIZE = {None, "none", "na", "const", "from_arg", "from_arg_pointee",
                   "cstr", "ptr_array", "stride_vector"}
 
-# The interposition runtime's call-site transport is fixed-arity at this many
-# raw wasm-level argument/cage-id pairs (pass_fptr_to_wt / register_lib_handler
-# / lind_marshal_dispatch — see tests/grate-tests/lib-interpose/lind_marshal.h's
-# LIND_RAW_ARGS_MAX). marshal-infer already force_locals anything wider
-# (tools/marshal-infer/src/Infer.cpp's kMaxRawArgSlots/enforceRawArgSlotCap),
-# so this check is normally redundant with a fresh <lib>.marshal.json — it
-# exists as this tool's OWN independent gate against stale, hand-edited, or
-# older JSON that still marks such a function "marshal": generating a handler
-# for one would compile fine and only abort (taking the whole grate process
-# down with it) on the function's first real call.
+# V1's call-site transport is fixed-arity at this many raw wasm-level
+# argument/cage-id pairs (pass_fptr_to_wt / register_lib_handler /
+# lind_marshal_dispatch — see tests/grate-tests/lib-interpose/lind_marshal.h's
+# LIND_RAW_ARGS_MAX). This is THIS tool's own, primary enforcement of that
+# width, not a redundant backstop: marshal-infer (Infer.cpp's kMaxRawArgSlots/
+# annotateWideRawArgSlots) only ANNOTATES a wider function's slot count now,
+# it no longer force_locals purely for width — the variable-width V2
+# transport can carry such a function via gen_v2_adapter.py, which reuses this same
+# unmarshalable_reason() with max_args=None. A "marshal"-decision function
+# wider than this IS expected input here, not stale/hand-edited JSON; this
+# check is what keeps V1 generation specifically from picking it up (V1's
+# own transport genuinely cannot carry it — generating a handler for one
+# would compile fine and only abort, taking the whole grate process down
+# with it, on the function's first real call).
 #
 # This width is duplicated, not shared, across marshal-infer, gen_grate.py,
 # lind_marshal.h, and linker.rs — all four must be changed together;
@@ -213,10 +217,15 @@ def _valid_extent_operand(o, nargs):
     return isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx < nargs
 
 
-def unmarshalable_reason(f, warn=False):
+def unmarshalable_reason(f, warn=False, max_args=LIND_RAW_ARGS_MAX):
     """None iff the runtime can faithfully marshal every part of this spec;
     otherwise a short, specific, actionable reason why not -- naming the
-    exact argument/pointee and the exact malformed field, never just "no"."""
+    exact argument/pointee and the exact malformed field, never just "no".
+
+    `max_args`: the raw-ABI-slot cap to enforce, or None to skip that check
+    entirely. gen_grate.py's own V1 dispatch is fixed at LIND_RAW_ARGS_MAX
+    (the default here); gen_v2_adapter.py reuses this same per-argument walk
+    for its variable-width adapters, which have no such fixed cap."""
     name = f.get("name", "")
     if name in NEVER_INTERPOSE:
         return "function is in NEVER_INTERPOSE (control-flow terminator / exec-family / static-link-blocked / binaryen bug)"
@@ -227,19 +236,22 @@ def unmarshalable_reason(f, warn=False):
             return f"function name contains NEVER_INTERPOSE_SUBSTR {s!r}"
     # `args` is already one JSON entry per raw wasm-level ABI slot (sret and
     # multi-slot params are pre-flattened by marshal-infer), so its length IS
-    # the raw slot count -- see LIND_RAW_ARGS_MAX. Inference should already
-    # have force_localed anything this wide; reaching "marshal" here means the
-    # JSON disagrees with the runtime's transport width (stale, hand-edited,
-    # or produced by an older marshal-infer). Loud and specific, unlike the
-    # generic "dropped" summary below: this is an input-correctness bug, not
-    # routine unsupported-feature filtering, and generating a handler for it
-    # would compile fine and only abort -- taking the whole grate process down
-    # with it -- on the function's first real call.
+    # the raw slot count -- see LIND_RAW_ARGS_MAX. Inference marks a wide
+    # function "marshal" too now (it only ANNOTATES the width, in a warning --
+    # see Infer.cpp's annotateWideRawArgSlots): with the DEFAULT max_args
+    # (V1's own fixed 6-slot dispatch), reaching this branch is the NORMAL,
+    # expected outcome for a function V2 could carry but V1 cannot, not a
+    # JSON bug -- gen_v2_adapter.py picks these up instead (max_args=None
+    # skips this check entirely there). Generating a V1 handler for one here
+    # would compile fine and only abort -- taking the whole grate process
+    # down with it -- on the function's first real call, so this exclusion is
+    # still enforced, just no longer described as an anomaly.
     nargs = len(f.get("args", []))
-    if nargs > LIND_RAW_ARGS_MAX:
+    if max_args is not None and nargs > max_args:
         reason = (f"needs {nargs} raw ABI slots, exceeding the interposition "
-                  f"transport's {LIND_RAW_ARGS_MAX}-slot capacity (marked "
-                  f"\"marshal\" despite this -- stale or hand-edited JSON?)")
+                  f"transport's {max_args}-slot capacity (V1-only; a "
+                  f"variable-width V2 adapter can still be generated via "
+                  f"gen_v2_adapter.py)")
         if warn:
             print(f"[gen_grate] REJECTING {name}: {reason}", file=sys.stderr)
         return reason

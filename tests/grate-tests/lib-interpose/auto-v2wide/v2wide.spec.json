@@ -1,0 +1,37 @@
+{
+  "functions": [
+    {
+      "name": "toy_wide_marshal",
+      "decision": "marshal",
+      "ret": { "kind": "ptr_alias_arg", "alias_arg": 4 },
+      "args": [
+        { "kind": "scalar", "type": "int", "size": 4 },
+        { "kind": "scalar", "type": "double", "size": 8 },
+        { "kind": "ptr", "type": "<ptr>", "size": 4, "dir": "in",
+          "size_kind": "stride_vector",
+          "size_operand": { "arg_index": 0, "source": "value" },
+          "stride_operand": { "arg_index": 3, "source": "value" },
+          "const_size": 8 },
+        { "kind": "scalar", "type": "int", "size": 4 },
+        { "kind": "ptr", "type": "<ptr>", "size": 4, "dir": "inout",
+          "size_kind": "stride_vector",
+          "size_operand": { "arg_index": 0, "source": "value" },
+          "stride_operand": { "arg_index": 5, "source": "value" },
+          "const_size": 8 },
+        { "kind": "scalar", "type": "int", "size": 4 },
+        { "kind": "handle", "handle_class": "toy_handle_class" },
+        { "kind": "scalar", "type": "int", "size": 4 },
+        { "kind": "ptr", "type": "<ptr>", "size": 4, "dir": "out",
+          "size_kind": "const", "const_size": 4 }
+      ]
+    },
+    {
+      "name": "toy_set_errno",
+      "decision": "marshal",
+      "ret": { "kind": "void" },
+      "args": [
+        { "kind": "scalar", "type": "int", "size": 4 }
+      ]
+    }
+  ]
+}

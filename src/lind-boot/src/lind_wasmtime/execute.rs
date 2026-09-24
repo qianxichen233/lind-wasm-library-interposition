@@ -76,6 +76,12 @@ pub fn execute_wasmtime(lindboot_cli: CliOptions) -> anyhow::Result<i32> {
         grate_callback_trampoline,
         grate_cleanup_funcptr,
     );
+    // V2 (variable-width) counterpart -- see grate_callback_trampoline_v2's
+    // own doc.
+    threei::register_trampoline_v2(
+        threei_const::RUNTIME_TYPE_WASMTIME,
+        grate_callback_trampoline_v2,
+    );
 
     // Register syscall handlers (clone/exec/exit) with 3i
     if !register_wasmtime_syscall_entry() {
