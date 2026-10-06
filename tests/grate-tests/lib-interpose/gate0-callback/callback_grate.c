@@ -1,22 +1,26 @@
-// Gate 0 (cross-cage function-pointer callbacks) feasibility probe: grate B.
+// Cross-cage function-pointer callback feasibility probe: grate B.
 //
 // Hand-rolled V2 grate for `library_call` -- deliberately bypasses
 // lind_marshal.h's declarative arg-spec system entirely. A function-pointer
-// argument isn't representable in that schema yet (that's Gate 1/2's
-// "callback contract" work, out of scope here); for this probe, the HOST
+// argument isn't representable in that schema yet; the HOST
 // (GrateWorker::install_callback_proxies, in wasmtime-lind-3i, run before
 // this adapter is ever called) already replaces the caller's raw table
 // index with a proxy index valid in THIS module's own table, so the adapter
 // below just calls through it like any ordinary local function pointer --
 // no cross-cage awareness needed at the wasm level at all.
 //
-// The registration descriptor "1:i::0" marks parameter 0 (the sole i32
-// parameter) as a callback: manifest version 1, params "i", results ""
-// (void), callback_params "0".
+// The registration descriptor "1:i:i:0" marks parameter 0 (the sole i32
+// parameter) as a callback: manifest version 1, params "i", results "i",
+// callback_params "0". The result lets a trap or rejection inside the
+// callback surface as an ordinary GRATE_ERR return value to the caller
+// instead of an unrecoverable wasm trap -- a void-returning interposed
+// call has no slot to carry that sentinel through, so a callback failure
+// there would abort the whole calling cage, with no way to make a second
+// call afterward to prove cleanup actually happened.
 //
 // Compile:
-//   lind-clang -s --compile-grate --fpcast-emu callback_grate.c \
-//       -- -Wl,--export-table
+//   lind-clang -s --compile-grate callback_grate.c \
+//       -- -Wl,--export-table -Wl,--growable-table
 // Run (from lindfs/):
 //   lind_run --preload env=/lib/liblibrary_call_stub.so:interposed \
 //       grates/callback_grate.cwasm /callback_cage.cwasm
@@ -27,12 +31,13 @@
 #include <stdint.h>
 
 __attribute__((export_name("__lind_v2_adapter_library_call")))
-void __lind_v2_adapter_library_call(uint64_t source_cage, uint64_t grate_cage,
-                                     int32_t callback_tableidx) {
+int32_t __lind_v2_adapter_library_call(uint64_t source_cage, uint64_t grate_cage,
+                                        int32_t callback_tableidx) {
     (void)source_cage;
     (void)grate_cage;
     void (*callback)(int) = (void (*)(int))(uintptr_t)callback_tableidx;
     callback(42);
+    return 0;
 }
 
 // V2 registration/resolution requires every V2 module to export this exact
@@ -81,7 +86,7 @@ int main(int argc, char *argv[]) {
     if (pid == 0) {
         int cageid = getpid();
         int r = register_lib_handler_v2(cageid, "env", "library_call", grateid,
-                                         "__lind_v2_adapter_library_call", "1:i::0");
+                                         "__lind_v2_adapter_library_call", "1:i:i:0");
         if (r != 0) {
             fprintf(stderr, "[gate0-callback-grate] register library_call failed: %d\n", r);
             __builtin_trap();

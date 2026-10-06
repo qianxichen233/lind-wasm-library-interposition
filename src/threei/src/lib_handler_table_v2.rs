@@ -27,17 +27,26 @@ pub struct V2Registration {
     pub adapter_export: String,
     pub manifest_version: u32,
     pub signature: V2Signature,
-    /// Gate 0 (cross-cage function-pointer callbacks) scaffolding: 0-based
-    /// indices, into `signature.params`, of parameters the caller's raw i32
-    /// is a table index into the CALLING cage's own indirect-function table
-    /// rather than an ordinary scalar. Deliberately not part of
-    /// `V2Signature`: that type's equality is the WASM-level value-type
-    /// identity checked against a caller's independently-derived signature
-    /// (`v2_signature_from_func_ty` in `linker.rs`), which has no way to
-    /// know about callback semantics and would then never match. Empty for
-    /// every registration that isn't callback-aware -- the normal case,
-    /// checked once at portal-install time so calls to every other
-    /// interposed function pay nothing for this.
+    /// 0-based indices, into `signature.params`, of parameters whose raw
+    /// i32 is a table index into the CALLING cage's own indirect-function
+    /// table -- a function pointer the caller is passing in -- rather than
+    /// an ordinary scalar value. Each index names a distinct I32 parameter
+    /// (enforced by `parse_v2_signature_desc`): the dispatcher resolves the
+    /// caller's real target function at that index and replaces the
+    /// argument with a locally callable proxy before the grate's adapter
+    /// ever runs (see `GrateWorker::install_callback_proxies`), so the
+    /// adapter itself needs no cross-cage awareness. The one currently
+    /// supported callback shape is `(i32) -> ()`; a richer callback type
+    /// system belongs in a dedicated schema, not this field.
+    ///
+    /// Deliberately not part of `V2Signature`: that type's equality is the
+    /// WASM-level value-type identity checked against a caller's
+    /// independently-derived signature (`v2_signature_from_func_ty` in
+    /// `linker.rs`), which has no way to know about callback semantics and
+    /// would then never match. Empty for every registration that isn't
+    /// callback-aware -- the normal case, checked once at portal-install
+    /// time so calls to every other interposed function pay nothing for
+    /// this.
     pub callback_params: Vec<u32>,
 }
 
@@ -400,13 +409,13 @@ fn parse_v2_type_char(c: char) -> Option<V2ValueType> {
 /// (see `parse_v2_type_char`) -- e.g. `"2:iid:d"` is manifest version 2,
 /// params `[I32, I32, F64]`, results `[F64]`.
 ///
-/// The optional 4th segment is Gate 0 (cross-cage function-pointer
-/// callbacks) scaffolding: a comma-separated list of 0-based parameter
+/// The optional 4th segment is a comma-separated list of 0-based parameter
 /// indices whose raw i32 is a table index into the CALLING cage's own
-/// indirect-function table, e.g. `"1:i::0"` marks parameter 0 of a
-/// one-param, void-result function. Absent or empty means no callback
-/// parameters -- every pre-existing 3-segment descriptor continues to parse
-/// identically to before this segment existed.
+/// indirect-function table (a function pointer), e.g. `"1:i::0"` marks
+/// parameter 0 of a one-param, void-result function. Absent or empty means
+/// no callback parameters -- every descriptor without this segment parses
+/// identically to one with an empty 4th segment. Each named index must be
+/// in range, distinct, and an I32 parameter, enforced below.
 ///
 /// A raw `extern "C"` syscall (see `register_lib_handler_v2` below) has a
 /// fixed six-raw-argument-pair shape, the exact width limitation V2 exists
@@ -439,6 +448,21 @@ fn parse_v2_signature_desc(s: &str) -> Option<(u32, V2Signature, Vec<u32>)> {
             .map(|p| p.parse::<u32>().ok())
             .collect::<Option<Vec<_>>>()?
     };
+
+    // Every callback index must name a real, distinct, I32 parameter. A
+    // duplicate is especially dangerous, not just redundant: the first
+    // occurrence replaces the caller's raw index with a LOCAL proxy index
+    // before the second occurrence is processed, so the second pass would
+    // misinterpret that already-replaced proxy index as another raw
+    // caller-side table index.
+    let mut seen = std::collections::HashSet::new();
+    for &idx in &callback_params {
+        let idx = idx as usize;
+        if idx >= params.len() || !seen.insert(idx) || params[idx] != V2ValueType::I32 {
+            return None;
+        }
+    }
+
     Some((version, V2Signature { params, results }, callback_params))
 }
 
@@ -527,4 +551,64 @@ pub fn register_lib_handler_v2(
     );
 
     0
+}
+
+#[cfg(test)]
+mod signature_desc_tests {
+    use super::*;
+
+    #[test]
+    fn no_fourth_segment_means_no_callback_params() {
+        let (version, sig, callback_params) = parse_v2_signature_desc("1:ii:i").unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(sig.params, vec![V2ValueType::I32, V2ValueType::I32]);
+        assert_eq!(sig.results, vec![V2ValueType::I32]);
+        assert_eq!(callback_params, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn empty_fourth_segment_means_no_callback_params() {
+        let (_, _, callback_params) = parse_v2_signature_desc("1:i:").unwrap();
+        assert_eq!(callback_params, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn valid_callback_index_is_accepted() {
+        let (_, _, callback_params) = parse_v2_signature_desc("1:i::0").unwrap();
+        assert_eq!(callback_params, vec![0]);
+    }
+
+    #[test]
+    fn multiple_distinct_i32_callback_indices_are_accepted() {
+        let (_, _, callback_params) = parse_v2_signature_desc("1:iii::0,2").unwrap();
+        assert_eq!(callback_params, vec![0, 2]);
+    }
+
+    #[test]
+    fn out_of_range_callback_index_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::1").is_none());
+        assert!(parse_v2_signature_desc("1:i::99").is_none());
+    }
+
+    #[test]
+    fn duplicate_callback_index_is_rejected() {
+        // Rejected rather than silently deduplicated: the first occurrence
+        // would replace the argument with a local proxy index before the
+        // second occurrence runs, so the second pass would misread that
+        // proxy index as another raw caller-side table index.
+        assert!(parse_v2_signature_desc("1:ii::0,0").is_none());
+    }
+
+    #[test]
+    fn non_i32_callback_index_is_rejected() {
+        assert!(parse_v2_signature_desc("1:l::0").is_none());
+        assert!(parse_v2_signature_desc("1:f::0").is_none());
+        assert!(parse_v2_signature_desc("1:d::0").is_none());
+    }
+
+    #[test]
+    fn malformed_callback_segment_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::not_a_number").is_none());
+        assert!(parse_v2_signature_desc("1:i::0,").is_none());
+    }
 }

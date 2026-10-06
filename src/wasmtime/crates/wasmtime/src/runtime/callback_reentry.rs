@@ -1,18 +1,16 @@
-//! Gate 0 (cross-cage function-pointer callbacks) scaffolding: lets a V2
-//! grate call re-enter the calling cage's own `Store` to invoke a function
-//! pointer the caller passed in, while that caller is suspended partway
+//! Cross-cage re-entry for function-pointer callbacks: lets a library call's
+//! grate invoke a function pointer the calling cage passed in, by calling
+//! back into that cage's own `Store` while it sits suspended partway
 //! through the same synchronous dispatch that is still on this OS thread's
 //! call stack.
 //!
-//! See `local-notes/active/plan-cross-cage-function-pointers.md`'s "Re-entry
-//! model" for the invariants this must uphold. The short version: the V2
-//! portal closure in `linker.rs` already holds a live, exclusive
-//! `StoreContextMut` for the calling cage (A) for the entire duration of the
-//! nested dispatch into the grate (B) -- `dispatch_lib_call_v2` does not
-//! return until every nested call, including any callback invocation, has
-//! finished. This module lets that SAME borrow be reused, not re-acquired,
-//! from deep inside that nested call, by threading it through a thread-local
-//! stack as a raw pointer instead of a typed reference: the intervening
+//! A library call's V2 portal (`linker.rs`) holds a live, exclusive
+//! `StoreContextMut` for the calling cage for the entire duration of the
+//! nested dispatch into the grate -- the dispatch does not return until
+//! every nested call, including any callback invocation, has finished. This
+//! module lets that SAME borrow be reused, not re-acquired, from deep
+//! inside that nested call, by threading it through a thread-local stack as
+//! a raw pointer instead of a typed reference: the intervening transport
 //! layers (`threei`, the `extern "C"` trampoline) are deliberately generic-
 //! and Wasmtime-free, so a typed reference cannot pass through them as an
 //! ordinary function parameter.
@@ -25,13 +23,21 @@
 //! only run while that same call is still on the stack -- a callback proxy
 //! is only ever invoked as part of the grate's own Wasm execution, which
 //! itself only runs inside that window. No other code path independently
-//! acquires a second mutable reference to the same `Store`.
+//! acquires a second mutable reference to the same `Store`. Each pushed
+//! frame carries a process-wide-unique token, and `Drop` checks it against
+//! the top of the stack UNCONDITIONALLY (not `debug_assert!`, which
+//! compiles out in release builds): a mismatch means the LIFO invariant
+//! this raw pointer's safety depends on has already been violated, and
+//! continuing would risk a later lookup handing out a dangling `Store`
+//! reference, so it panics rather than silently leaving a stale frame
+//! reachable.
 
 use crate::prelude::*;
 use crate::{StoreContextMut, StoreInner, Table};
 use core::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Per-cage registry of the cage's own shared indirect-function table.
@@ -46,10 +52,11 @@ use std::sync::{Mutex, OnceLock};
 /// so `with_active_frame`'s caller doesn't need to guess which instance (if
 /// any) happens to re-export it.
 ///
-/// Gate 0 scaffolding: populated only by the initial cage-boot path
-/// (`execute_with_lind`/`execute_wasmtime`) today, not yet by fork/exec/
-/// thread re-attachment -- those are Gate 5's "lifecycle" scope, not this
-/// probe's.
+/// Populated only by the initial cage-boot path (`execute_with_lind`/
+/// `execute_wasmtime`) today, not by fork/exec/thread re-attachment: a
+/// callback whose calling cage was created by one of those paths has no
+/// registered table and so rejects cleanly (`get_cage_table` returns
+/// `None`) rather than resolving a stale or missing one.
 static CAGE_TABLES: OnceLock<Mutex<HashMap<u64, Table>>> = OnceLock::new();
 
 fn cage_tables() -> &'static Mutex<HashMap<u64, Table>> {
@@ -77,12 +84,22 @@ struct Frame<T: 'static> {
     store_ptr: *mut StoreInner<T>,
 }
 
+/// Process-wide-unique identity for one pushed frame, independent of
+/// `cageid` (which is not unique: the same cage can legitimately appear
+/// more than once on this stack if a callback it receives leads back into
+/// a second, nested call to itself). Used to detect out-of-order guard
+/// destruction unconditionally, not just in debug builds.
+fn next_frame_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 thread_local! {
     /// Stack of currently-suspended callers, most recent (innermost) last.
     /// A `Vec` rather than a single slot: nested A-to-B-to-C dispatch pushes
     /// more than one frame before any pops, one per cage currently
     /// suspended on this same OS thread's call stack.
-    static ACTIVE_FRAMES: RefCell<Vec<(u64, Box<dyn Any>)>> = RefCell::new(Vec::new());
+    static ACTIVE_FRAMES: RefCell<Vec<(u64, u64, Box<dyn Any>)>> = RefCell::new(Vec::new());
 }
 
 /// RAII guard for one pushed frame. Must be created immediately before the
@@ -90,6 +107,7 @@ thread_local! {
 /// call returns -- see the module doc's nesting argument.
 pub struct ActiveFrameGuard {
     cageid: u64,
+    token: u64,
 }
 
 impl ActiveFrameGuard {
@@ -99,8 +117,9 @@ impl ActiveFrameGuard {
     pub fn push<T: 'static>(cageid: u64, table: Table, store: &mut StoreContextMut<'_, T>) -> Self {
         let store_ptr: *mut StoreInner<T> = &mut *store.0 as *mut StoreInner<T>;
         let frame = Frame::<T> { table, store_ptr };
-        ACTIVE_FRAMES.with(|frames| frames.borrow_mut().push((cageid, Box::new(frame))));
-        ActiveFrameGuard { cageid }
+        let token = next_frame_token();
+        ACTIVE_FRAMES.with(|frames| frames.borrow_mut().push((cageid, token, Box::new(frame))));
+        ActiveFrameGuard { cageid, token }
     }
 }
 
@@ -108,10 +127,20 @@ impl Drop for ActiveFrameGuard {
     fn drop(&mut self) {
         ACTIVE_FRAMES.with(|frames| {
             let popped = frames.borrow_mut().pop();
-            debug_assert!(
-                popped.is_some_and(|(c, _)| c == self.cageid),
-                "active-frame stack popped out of LIFO order"
-            );
+            match popped {
+                Some((_, token, _)) if token == self.token => {}
+                other => {
+                    let found = other.map(|(c, t, _)| (c, t));
+                    panic!(
+                        "active-frame stack corrupted: expected to pop token {} \
+                         (cageid {}), found {found:?} instead -- a callback \
+                         re-entry guard was dropped out of LIFO order, which \
+                         would otherwise leave a dangling Store pointer \
+                         reachable by a later lookup",
+                        self.token, self.cageid
+                    );
+                }
+            }
         });
     }
 }
@@ -123,6 +152,12 @@ impl Drop for ActiveFrameGuard {
 /// rather than silently doing nothing or aliasing unrelated state. The
 /// innermost (most recently pushed) matching frame is used, matching normal
 /// call-stack shadowing if the same cage were (erroneously) re-entrant.
+///
+/// Also returns `None` if a frame for `cageid` exists but was pushed under
+/// a different `T` (the type parameter identifies which concrete host
+/// state/`Store` type this call expects) -- a type mismatch is a caller
+/// bug, not a cross-cage safety issue, so it is reported the same
+/// not-available way rather than panicking.
 pub fn with_active_frame<T: 'static, R>(
     cageid: u64,
     f: impl FnOnce(StoreContextMut<'_, T>, Table) -> R,
@@ -132,8 +167,8 @@ pub fn with_active_frame<T: 'static, R>(
             .borrow()
             .iter()
             .rev()
-            .find(|(c, _)| *c == cageid)
-            .and_then(|(_, boxed)| {
+            .find(|(c, _, _)| *c == cageid)
+            .and_then(|(_, _, boxed)| {
                 boxed
                     .downcast_ref::<Frame<T>>()
                     .map(|fr| (fr.table, fr.store_ptr))

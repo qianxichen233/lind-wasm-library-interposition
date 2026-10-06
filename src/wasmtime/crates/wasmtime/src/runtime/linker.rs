@@ -1430,11 +1430,10 @@ impl<T> Linker<T> {
 
                             let grate_cage = registration.grate_cage;
                             let signature_id = registration.signature.id();
-                            // Gate 0 (cross-cage function-pointer callbacks)
-                            // scaffolding: checked once here, at install
-                            // time, not per call -- every other interposed
-                            // function's portal never even looks at the
-                            // active-frame stack.
+                            // Checked once here, at install time, not per
+                            // call: every other interposed function's
+                            // portal never even looks at the active-frame
+                            // stack below.
                             let has_callback_params = !registration.callback_params.is_empty();
                             let expected_results: Vec<threei::V2ValueType> = func_ty
                                 .results()
