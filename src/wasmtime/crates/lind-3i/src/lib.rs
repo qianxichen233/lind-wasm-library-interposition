@@ -786,6 +786,69 @@ impl<'a, T> Drop for ActiveCallGuard<'a, T> {
     }
 }
 
+/// Lowers one `V2ValueType` to Wasmtime's own `ValType` -- the inverse of
+/// `val_type_to_v2_value_type` below. `ValType` has no `PartialEq` (hence
+/// going through `V2ValueType`, which does, for every comparison in this
+/// file), so this direction exists only to build the proxy's actual
+/// `FuncType` once a shape has already been decided.
+fn v2_value_type_to_val_type(ty: threei::V2ValueType) -> ValType {
+    match ty {
+        threei::V2ValueType::I32 => ValType::I32,
+        threei::V2ValueType::I64 => ValType::I64,
+        threei::V2ValueType::F32 => ValType::F32,
+        threei::V2ValueType::F64 => ValType::F64,
+    }
+}
+
+/// Lowers a real, resolved Wasm value type to `V2ValueType`, or `None` if
+/// it's a value type the V2 transport (and so a callback signature, which
+/// reuses its vocabulary) cannot carry at all -- e.g. `v128` or a
+/// reference type. A real target callback using one of these is an
+/// "unsupported Wasm value type" rejection, the same condition
+/// `lib3i_v2_unsupported_signature_reason` in `linker.rs` checks for the
+/// OUTER function's own signature.
+fn val_type_to_v2_value_type(ty: &ValType) -> Option<threei::V2ValueType> {
+    match ty {
+        ValType::I32 => Some(threei::V2ValueType::I32),
+        ValType::I64 => Some(threei::V2ValueType::I64),
+        ValType::F32 => Some(threei::V2ValueType::F32),
+        ValType::F64 => Some(threei::V2ValueType::F64),
+        _ => None,
+    }
+}
+
+/// The declared, lowered `V2ValueType` shape of one callback signature:
+/// its own parameter list and (zero- or one-element) result list, in the
+/// same vocabulary a real resolved function's type is compared against
+/// (`val_type_to_v2_value_type`) -- so "declared shape" and "real shape"
+/// are always compared at the SAME level, never `ValType` (no
+/// `PartialEq`) against `CallbackParamKind`/`CallbackRetKind` directly.
+/// `Pointer`/`FunctionPointer` never reach here: `register_lib_handler_v2`
+/// rejects a callback signature containing either at registration time,
+/// before any `V2Registration` carrying one could exist.
+fn callback_signature_v2_values(
+    sig: &threei::CallbackSignature,
+) -> (Vec<threei::V2ValueType>, Vec<threei::V2ValueType>) {
+    let params = sig
+        .params
+        .iter()
+        .map(|p| match p {
+            threei::CallbackParamKind::Scalar(v) => *v,
+            threei::CallbackParamKind::Pointer => {
+                unreachable!("pointer-bearing callback parameters are rejected at registration")
+            }
+        })
+        .collect();
+    let results = match sig.ret {
+        threei::CallbackRetKind::Void => Vec::new(),
+        threei::CallbackRetKind::Scalar(v) => vec![v],
+        threei::CallbackRetKind::FunctionPointer => {
+            unreachable!("function-pointer-returning callbacks are rejected at registration")
+        }
+    };
+    (params, results)
+}
+
 impl<T: 'static> GrateWorker<T> {
     /// Reset this worker’s stack pointer to the top of its private stack slot.
     ///
@@ -945,17 +1008,22 @@ impl<T: 'static> GrateWorker<T> {
         }
     }
 
-    /// For every index `registration.callback_params` marks, the caller's
-    /// raw i32 is a table index into ITS OWN indirect-function table
-    /// (`source_cage`) -- a function pointer the caller is passing in --
-    /// not an ordinary scalar. Resolve the real target `Func` there now --
-    /// while `source_cage`'s re-entry frame is still active -- build a host
-    /// proxy that calls back into it, install the proxy into THIS worker's
-    /// own table, and replace the argument with the proxy's local index
-    /// before the adapter ever sees it. `0` (wasm's conventional null
-    /// funcref slot) passes through unchanged: never a real target, so
-    /// never worth a proxy. The currently supported callback shape is
-    /// `(i32) -> ()`.
+    /// For every `registration.callback_params` entry, the caller's raw
+    /// i32 at that parameter index is a table index into ITS OWN
+    /// indirect-function table (`source_cage`) -- a function pointer the
+    /// caller is passing in -- not an ordinary scalar. Resolve the real
+    /// target `Func` there now -- while `source_cage`'s re-entry frame is
+    /// still active -- checked against the entry's declared
+    /// `CallbackSignature` (a "callback ABI mismatch" rejection if the
+    /// real resolved function's lowered type doesn't match), build a host
+    /// proxy of that exact type that calls back into it, install the
+    /// proxy into THIS worker's own table, and replace the argument with
+    /// the proxy's local index before the adapter ever sees it. `0`
+    /// (wasm's conventional null funcref slot) passes through unchanged
+    /// when the declared signature allows it (`nullable`); when it
+    /// doesn't, `0` is rejected before anything else runs -- a null the
+    /// contract declared impossible is a caller bug, not a value to
+    /// silently tolerate.
     ///
     /// Reuses a slot from `callback_proxy_free_slots` where available
     /// instead of always growing the table, so a long-running cage making
@@ -968,20 +1036,21 @@ impl<T: 'static> GrateWorker<T> {
     ///
     /// Returns `Err` (never a fabricated callback or a silent local call)
     /// if `source_cage` has no active frame, the index is out of bounds,
-    /// the table slot isn't a function, or table growth fails -- having
+    /// the table slot isn't a function, the real function's type doesn't
+    /// match the declared signature, or table growth fails -- having
     /// already released back to the free list any proxy THIS call
     /// installed before the failure, so a later callback parameter's
     /// failure never leaks an earlier one's slot.
     fn install_callback_proxies(
         &mut self,
         source_cage: u64,
-        callback_params: &[u32],
+        callback_params: &[threei::CallbackArgContract],
         args: &[Val],
     ) -> Result<(Vec<Val>, Vec<u64>), String> {
         let mut args = args.to_vec();
         let mut installed = Vec::new();
-        for &idx in callback_params {
-            let idx = idx as usize;
+        for contract in callback_params {
+            let idx = contract.arg_index as usize;
             let Some(&Val::I32(raw_index)) = args.get(idx) else {
                 self.release_callback_proxies(&installed);
                 return Err(format!(
@@ -989,21 +1058,66 @@ impl<T: 'static> GrateWorker<T> {
                 ));
             };
             if raw_index == 0 {
+                if !contract.signature.nullable {
+                    self.release_callback_proxies(&installed);
+                    return Err(format!(
+                        "callback parameter {idx} is null, but its declared signature is \
+                         not nullable"
+                    ));
+                }
                 continue;
             }
 
+            let (expected_params, expected_results) =
+                callback_signature_v2_values(&contract.signature);
+
             let target =
                 match wasmtime::with_active_frame::<T, _>(source_cage, |mut store_a, table_a| {
-                    match table_a.get(&mut store_a, raw_index as u64) {
-                        Some(Ref::Func(Some(f))) => Ok(f),
+                    let f = match table_a.get(&mut store_a, raw_index as u64) {
+                        Some(Ref::Func(Some(f))) => f,
                         Some(Ref::Func(None)) => {
-                            Err("callback table slot is null in the source cage".to_string())
+                            return Err(
+                                "callback table slot is null in the source cage".to_string()
+                            );
                         }
-                        Some(_) => Err("callback table slot is not a funcref".to_string()),
+                        Some(_) => {
+                            return Err("callback table slot is not a funcref".to_string());
+                        }
                         None => {
-                            Err("callback table index out of bounds in source cage".to_string())
+                            return Err(
+                                "callback table index out of bounds in source cage".to_string()
+                            );
                         }
+                    };
+                    let real_ty = f.ty(&store_a);
+                    let Some(real_params) = real_ty
+                        .params()
+                        .map(|t| val_type_to_v2_value_type(&t))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err(
+                            "callback's real resolved type uses an unsupported Wasm value type"
+                                .to_string(),
+                        );
+                    };
+                    let Some(real_results) = real_ty
+                        .results()
+                        .map(|t| val_type_to_v2_value_type(&t))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err(
+                            "callback's real resolved type uses an unsupported Wasm value type"
+                                .to_string(),
+                        );
+                    };
+                    if real_params != expected_params || real_results != expected_results {
+                        return Err(format!(
+                            "callback ABI mismatch: declared signature params={expected_params:?} \
+                             results={expected_results:?}, but the real callback's resolved type \
+                             is params={real_params:?} results={real_results:?}"
+                        ));
                     }
+                    Ok(f)
                 }) {
                     Some(resolved) => match resolved {
                         Ok(f) => f,
@@ -1020,7 +1134,16 @@ impl<T: 'static> GrateWorker<T> {
                     }
                 };
 
-            let proxy_ty = FuncType::new(self.store.engine(), [ValType::I32], []);
+            let proxy_param_types: Vec<ValType> = expected_params
+                .iter()
+                .map(|v| v2_value_type_to_val_type(*v))
+                .collect();
+            let proxy_result_types: Vec<ValType> = expected_results
+                .iter()
+                .map(|v| v2_value_type_to_val_type(*v))
+                .collect();
+            let proxy_ty =
+                FuncType::new(self.store.engine(), proxy_param_types, proxy_result_types);
             let proxy = Func::new(
                 &mut self.store,
                 proxy_ty,

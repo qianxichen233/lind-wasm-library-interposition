@@ -16,6 +16,95 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::lib_call_v2::{V2Signature, V2ValueType};
 
+/// One parameter of a callback's OWN signature -- never the host
+/// function's. `Pointer` is representable so this schema does not change
+/// shape once pointer-bearing callback marshalling exists, but a
+/// registration containing one is rejected today (see `CallbackSignature`'s
+/// own doc): nothing resolves a callback parameter's pointer extent yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackParamKind {
+    Scalar(V2ValueType),
+    Pointer,
+}
+
+/// A callback's own return value. `FunctionPointer` (a callback that
+/// itself returns a callback) is representable for the same forward-
+/// compatibility reason as `CallbackParamKind::Pointer`, and is equally
+/// rejected today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackRetKind {
+    Void,
+    Scalar(V2ValueType),
+    FunctionPointer,
+}
+
+/// How long a callback endpoint may be invoked after the call that
+/// supplied it returns. `DuringCall` is the only lifetime the dispatcher
+/// currently enforces (a proxy is installed, used, and reclaimed within
+/// one outer call -- see `GrateWorker::install_callback_proxies`);
+/// `Retained` is representable, and rejected as unsupported today, until
+/// a lifecycle-managed proxy registration exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackLifetime {
+    DuringCall,
+    Retained,
+}
+
+/// A callback's full, versioned contract: the lowered Wasm shape of the
+/// function pointer itself, independent of (and nested one level below)
+/// the `V2Signature` of the host function the callback was passed into.
+///
+/// Deliberately NOT referenced by a named, separately-registered id the
+/// way the inference tool's own `callback_signatures` config registry
+/// works (see `tools/marshal-infer/CONFIG.md`'s "Callback contracts"):
+/// that registry's whole job is resolving a human-reviewed name into a
+/// fully-lowered shape once, at config-load time, long before anything
+/// reaches this runtime -- by the time a registration reaches here, there
+/// is no id left to look up, only an already-resolved shape. A second,
+/// runtime-side name registry would just be a redundant copy of a check
+/// the inference layer already owns end to end.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallbackSignature {
+    pub params: Vec<CallbackParamKind>,
+    pub ret: CallbackRetKind,
+    pub lifetime: CallbackLifetime,
+    pub nullable: bool,
+    pub reentry_policy: ReentryPolicy,
+}
+
+/// Which invocation-thread/re-entry policy a callback requires. A closed
+/// vocabulary, not a recorded-but-uninterpreted string: a descriptor
+/// naming a policy this runtime does not actually implement must be
+/// rejected at registration time, not accepted and silently ignored.
+///
+/// `SameThreadOnly` is the only variant because it is the only policy
+/// implemented: `wasmtime::callback_reentry`'s active-frame stack is
+/// thread-local, and a callback proxy is only ever invoked synchronously,
+/// on the same OS thread that is suspended inside the outer call that
+/// supplied it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReentryPolicy {
+    SameThreadOnly,
+}
+
+impl ReentryPolicy {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "same_thread_only" => Some(ReentryPolicy::SameThreadOnly),
+            _ => None,
+        }
+    }
+}
+
+/// One function-pointer argument of a `V2Registration`: which parameter
+/// index (into the outer `V2Signature`) carries it, and the callback's own
+/// contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallbackArgContract {
+    pub arg_index: u32,
+    pub signature: CallbackSignature,
+}
+
 /// One symbol's V2 registration: which grate cage owns it, the exported
 /// adapter function's name inside that grate's module (resolved by name at
 /// worker-creation time, never by address -- see the module doc), the
@@ -27,17 +116,17 @@ pub struct V2Registration {
     pub adapter_export: String,
     pub manifest_version: u32,
     pub signature: V2Signature,
-    /// 0-based indices, into `signature.params`, of parameters whose raw
-    /// i32 is a table index into the CALLING cage's own indirect-function
-    /// table -- a function pointer the caller is passing in -- rather than
-    /// an ordinary scalar value. Each index names a distinct I32 parameter
-    /// (enforced by `parse_v2_signature_desc`): the dispatcher resolves the
-    /// caller's real target function at that index and replaces the
-    /// argument with a locally callable proxy before the grate's adapter
-    /// ever runs (see `GrateWorker::install_callback_proxies`), so the
-    /// adapter itself needs no cross-cage awareness. The one currently
-    /// supported callback shape is `(i32) -> ()`; a richer callback type
-    /// system belongs in a dedicated schema, not this field.
+    /// Parameters, by index into `signature.params`, whose raw i32 is a
+    /// table index into the CALLING cage's own indirect-function table --
+    /// a function pointer the caller is passing in -- rather than an
+    /// ordinary scalar value. Each entry's `arg_index` names a distinct
+    /// I32 parameter (enforced by `parse_v2_signature_desc`): the
+    /// dispatcher resolves the caller's real target function at that
+    /// index, checks it against the entry's own `CallbackSignature`, and
+    /// replaces the argument with a locally callable proxy before the
+    /// grate's adapter ever runs (see
+    /// `GrateWorker::install_callback_proxies`), so the adapter itself
+    /// needs no cross-cage awareness.
     ///
     /// Deliberately not part of `V2Signature`: that type's equality is the
     /// WASM-level value-type identity checked against a caller's
@@ -47,7 +136,7 @@ pub struct V2Registration {
     /// callback-aware -- the normal case, checked once at portal-install
     /// time so calls to every other interposed function pay nothing for
     /// this.
-    pub callback_params: Vec<u32>,
+    pub callback_params: Vec<CallbackArgContract>,
 }
 
 fn lib_handler_table_v2() -> &'static Mutex<HashMap<u64, HashMap<(String, String), u64>>> {
@@ -403,19 +492,104 @@ fn parse_v2_type_char(c: char) -> Option<V2ValueType> {
     }
 }
 
+/// Parses one callback-parameter type character: the same `i`/`l`/`f`/`d`
+/// vocabulary as an ordinary V2 value, plus `p` for a pointer-classified
+/// callback parameter. A `p` always parses successfully here (the
+/// grammar can represent it); whether it's actually ACCEPTED is a
+/// separate, later check -- see `parse_callback_spec`'s own doc.
+fn parse_callback_param_char(c: char) -> Option<CallbackParamKind> {
+    if c == 'p' {
+        Some(CallbackParamKind::Pointer)
+    } else {
+        parse_v2_type_char(c).map(CallbackParamKind::Scalar)
+    }
+}
+
+/// Parses a callback's return-shape string: empty = void, one type
+/// character (`i`/`l`/`f`/`d`) = that scalar, `p` = a function-pointer
+/// result. More than one character is always malformed -- a callback, like
+/// the outer V2 transport, carries at most one result.
+fn parse_callback_ret_str(s: &str) -> Option<CallbackRetKind> {
+    let mut chars = s.chars();
+    let Some(c) = chars.next() else {
+        return Some(CallbackRetKind::Void);
+    };
+    if chars.next().is_some() {
+        return None;
+    }
+    if c == 'p' {
+        Some(CallbackRetKind::FunctionPointer)
+    } else {
+        parse_v2_type_char(c).map(CallbackRetKind::Scalar)
+    }
+}
+
+/// Parses one `@`-separated callback-argument spec:
+/// `"<arg_index>@<params>@<ret>@<lifetime>@<nullable>@<reentry_policy>"`,
+/// e.g. `"0@i@@D@0@same_thread_only"` -- parameter 0 is a callback taking
+/// one I32 and returning void, `during_call`-scoped, non-nullable, with
+/// reentry policy "same_thread_only". `lifetime` is `D` (`during_call`) or
+/// `R` (`retained`); `nullable` is `0` or `1`; `reentry_policy` is one of
+/// `ReentryPolicy`'s closed vocabulary (just "same_thread_only" today) --
+/// an unrecognized policy name is malformed input, not a value recorded
+/// verbatim and left for something else to (maybe) interpret later.
+///
+/// Successfully parsing a spec is NOT the same as accepting it: a `p`
+/// (pointer) parameter, a `p` (function-pointer) return, or
+/// `lifetime=="R"` all parse into a structurally valid `CallbackSignature`
+/// -- the schema can represent them -- but `register_lib_handler_v2`
+/// rejects all three explicitly as not yet supported, rather than this
+/// parser pretending they don't exist or silently dropping them.
+fn parse_callback_spec(spec: &str) -> Option<(u32, CallbackSignature)> {
+    let mut parts = spec.splitn(6, '@');
+    let arg_index: u32 = parts.next()?.parse().ok()?;
+    let params_str = parts.next()?;
+    let ret_str = parts.next()?;
+    let lifetime_str = parts.next()?;
+    let nullable_str = parts.next()?;
+    let reentry_policy = parts.next()?;
+
+    let params = params_str
+        .chars()
+        .map(parse_callback_param_char)
+        .collect::<Option<Vec<_>>>()?;
+    let ret = parse_callback_ret_str(ret_str)?;
+    let lifetime = match lifetime_str {
+        "D" => CallbackLifetime::DuringCall,
+        "R" => CallbackLifetime::Retained,
+        _ => return None,
+    };
+    let nullable = match nullable_str {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    let reentry_policy = ReentryPolicy::parse(reentry_policy)?;
+
+    Some((
+        arg_index,
+        CallbackSignature {
+            params,
+            ret,
+            lifetime,
+            nullable,
+            reentry_policy,
+        },
+    ))
+}
+
 /// Parses a compact signature descriptor string of the form
-/// `"<manifest_version>:<params>:<results>[:<callback_params>]"`, where
+/// `"<manifest_version>:<params>:<results>[:<callback_specs>]"`, where
 /// `params`/`results` are each a (possibly empty) run of type characters
 /// (see `parse_v2_type_char`) -- e.g. `"2:iid:d"` is manifest version 2,
 /// params `[I32, I32, F64]`, results `[F64]`.
 ///
-/// The optional 4th segment is a comma-separated list of 0-based parameter
-/// indices whose raw i32 is a table index into the CALLING cage's own
-/// indirect-function table (a function pointer), e.g. `"1:i::0"` marks
-/// parameter 0 of a one-param, void-result function. Absent or empty means
-/// no callback parameters -- every descriptor without this segment parses
-/// identically to one with an empty 4th segment. Each named index must be
-/// in range, distinct, and an I32 parameter, enforced below.
+/// The optional 4th segment is a comma-separated list of callback-argument
+/// specs (see `parse_callback_spec`), one per parameter whose raw i32 is a
+/// table index into the CALLING cage's own indirect-function table (a
+/// function pointer) rather than an ordinary scalar value. Absent or empty
+/// means no callback parameters -- every descriptor without this segment
+/// parses identically to one with an empty 4th segment.
 ///
 /// A raw `extern "C"` syscall (see `register_lib_handler_v2` below) has a
 /// fixed six-raw-argument-pair shape, the exact width limitation V2 exists
@@ -426,12 +600,12 @@ fn parse_v2_type_char(c: char) -> Option<V2ValueType> {
 /// dispatch layer already translates to a host address" mechanism
 /// `lib_name_ptr`/`symbol_name_ptr` already rely on, instead of inventing a
 /// new argument-passing mechanism just for this one call.
-fn parse_v2_signature_desc(s: &str) -> Option<(u32, V2Signature, Vec<u32>)> {
+fn parse_v2_signature_desc(s: &str) -> Option<(u32, V2Signature, Vec<CallbackArgContract>)> {
     let mut parts = s.splitn(4, ':');
     let version: u32 = parts.next()?.parse().ok()?;
     let params_str = parts.next()?;
     let results_str = parts.next()?;
-    let callback_params_str = parts.next().unwrap_or("");
+    let callback_specs_str = parts.next().unwrap_or("");
     let params = params_str
         .chars()
         .map(parse_v2_type_char)
@@ -440,30 +614,68 @@ fn parse_v2_signature_desc(s: &str) -> Option<(u32, V2Signature, Vec<u32>)> {
         .chars()
         .map(parse_v2_type_char)
         .collect::<Option<Vec<_>>>()?;
-    let callback_params = if callback_params_str.is_empty() {
+    let callback_params = if callback_specs_str.is_empty() {
         Vec::new()
     } else {
-        callback_params_str
+        callback_specs_str
             .split(',')
-            .map(|p| p.parse::<u32>().ok())
+            .map(|spec| {
+                let (arg_index, signature) = parse_callback_spec(spec)?;
+                Some(CallbackArgContract {
+                    arg_index,
+                    signature,
+                })
+            })
             .collect::<Option<Vec<_>>>()?
     };
 
-    // Every callback index must name a real, distinct, I32 parameter. A
-    // duplicate is especially dangerous, not just redundant: the first
+    // Every callback arg_index must name a real, distinct, I32 parameter.
+    // A duplicate is especially dangerous, not just redundant: the first
     // occurrence replaces the caller's raw index with a LOCAL proxy index
     // before the second occurrence is processed, so the second pass would
     // misinterpret that already-replaced proxy index as another raw
     // caller-side table index.
     let mut seen = std::collections::HashSet::new();
-    for &idx in &callback_params {
-        let idx = idx as usize;
+    for c in &callback_params {
+        let idx = c.arg_index as usize;
         if idx >= params.len() || !seen.insert(idx) || params[idx] != V2ValueType::I32 {
             return None;
         }
     }
 
     Some((version, V2Signature { params, results }, callback_params))
+}
+
+/// A callback spec can parse into a structurally valid `CallbackSignature`
+/// describing a shape nothing in this runtime actually implements yet:
+/// a pointer-bearing callback parameter (callback argument marshalling is
+/// scalar-only), a callback returning a function pointer, or a retained
+/// (outlives the call that installed it) lifetime. Returns the rejection
+/// message for the first such shape found, or `None` if every entry is
+/// fully supported today -- checked explicitly, rather than silently
+/// accepted and mishandled later.
+fn reject_unsupported_callback_shape(callback_params: &[CallbackArgContract]) -> Option<String> {
+    for c in callback_params {
+        if c.signature.params.contains(&CallbackParamKind::Pointer) {
+            return Some(format!(
+                "arg{}: pointer-bearing callback parameters are not yet supported",
+                c.arg_index
+            ));
+        }
+        if c.signature.ret == CallbackRetKind::FunctionPointer {
+            return Some(format!(
+                "arg{}: a callback returning a function pointer is not yet supported",
+                c.arg_index
+            ));
+        }
+        if c.signature.lifetime == CallbackLifetime::Retained {
+            return Some(format!(
+                "arg{}: retained callback lifetime is not yet supported (during_call only)",
+                c.arg_index
+            ));
+        }
+    }
+    None
 }
 
 /// Register a V2 (variable-width) library-level handler for
@@ -537,6 +749,11 @@ pub fn register_lib_handler_v2(
         return -1;
     };
 
+    if let Some(reason) = reject_unsupported_callback_shape(&callback_params) {
+        eprintln!("[3i|register_lib_handler_v2] {reason}");
+        return -1;
+    }
+
     register_lib_handler_v2_entry(
         target_cage_id,
         &lib_name,
@@ -563,31 +780,82 @@ mod signature_desc_tests {
         assert_eq!(version, 1);
         assert_eq!(sig.params, vec![V2ValueType::I32, V2ValueType::I32]);
         assert_eq!(sig.results, vec![V2ValueType::I32]);
-        assert_eq!(callback_params, Vec::<u32>::new());
+        assert_eq!(callback_params, Vec::<CallbackArgContract>::new());
     }
 
     #[test]
     fn empty_fourth_segment_means_no_callback_params() {
         let (_, _, callback_params) = parse_v2_signature_desc("1:i:").unwrap();
-        assert_eq!(callback_params, Vec::<u32>::new());
+        assert!(callback_params.is_empty());
+    }
+
+    // --- schema round-trip: every declarable shape parses back out exactly ---
+
+    #[test]
+    fn round_trip_void_during_call_nonnullable() {
+        let (_, _, cbs) = parse_v2_signature_desc("1:i::0@i@@D@0@same_thread_only").unwrap();
+        assert_eq!(cbs.len(), 1);
+        let sig = &cbs[0].signature;
+        assert_eq!(cbs[0].arg_index, 0);
+        assert_eq!(
+            sig.params,
+            vec![CallbackParamKind::Scalar(V2ValueType::I32)]
+        );
+        assert_eq!(sig.ret, CallbackRetKind::Void);
+        assert_eq!(sig.lifetime, CallbackLifetime::DuringCall);
+        assert!(!sig.nullable);
+        assert_eq!(sig.reentry_policy, ReentryPolicy::SameThreadOnly);
     }
 
     #[test]
-    fn valid_callback_index_is_accepted() {
-        let (_, _, callback_params) = parse_v2_signature_desc("1:i::0").unwrap();
-        assert_eq!(callback_params, vec![0]);
+    fn round_trip_every_scalar_param_and_result_type() {
+        let (_, _, cbs) = parse_v2_signature_desc("1:i::0@ilfd@d@D@1@same_thread_only").unwrap();
+        let sig = &cbs[0].signature;
+        assert_eq!(
+            sig.params,
+            vec![
+                CallbackParamKind::Scalar(V2ValueType::I32),
+                CallbackParamKind::Scalar(V2ValueType::I64),
+                CallbackParamKind::Scalar(V2ValueType::F32),
+                CallbackParamKind::Scalar(V2ValueType::F64),
+            ]
+        );
+        assert_eq!(sig.ret, CallbackRetKind::Scalar(V2ValueType::F64));
+        assert!(sig.nullable);
     }
 
     #[test]
-    fn multiple_distinct_i32_callback_indices_are_accepted() {
-        let (_, _, callback_params) = parse_v2_signature_desc("1:iii::0,2").unwrap();
-        assert_eq!(callback_params, vec![0, 2]);
+    fn round_trip_retained_lifetime_parses_even_though_rejected_later() {
+        // Parsing and accepting are different checks -- see
+        // reject_unsupported_callback_shape_tests below for the rejection.
+        let (_, _, cbs) = parse_v2_signature_desc("1:i::0@i@@R@0@same_thread_only").unwrap();
+        assert_eq!(cbs[0].signature.lifetime, CallbackLifetime::Retained);
     }
+
+    #[test]
+    fn round_trip_pointer_param_and_function_pointer_result_parse_even_though_rejected_later() {
+        let (_, _, cbs) = parse_v2_signature_desc("1:i::0@p@p@D@0@same_thread_only").unwrap();
+        let sig = &cbs[0].signature;
+        assert_eq!(sig.params, vec![CallbackParamKind::Pointer]);
+        assert_eq!(sig.ret, CallbackRetKind::FunctionPointer);
+    }
+
+    #[test]
+    fn multiple_distinct_callback_specs_are_accepted() {
+        let (_, _, cbs) =
+            parse_v2_signature_desc("1:ii::0@i@@D@0@same_thread_only,1@l@@D@0@same_thread_only")
+                .unwrap();
+        assert_eq!(cbs.len(), 2);
+        assert_eq!(cbs[0].arg_index, 0);
+        assert_eq!(cbs[1].arg_index, 1);
+    }
+
+    // --- malformed input ---
 
     #[test]
     fn out_of_range_callback_index_is_rejected() {
-        assert!(parse_v2_signature_desc("1:i::1").is_none());
-        assert!(parse_v2_signature_desc("1:i::99").is_none());
+        assert!(parse_v2_signature_desc("1:i::1@i@@D@0@same_thread_only").is_none());
+        assert!(parse_v2_signature_desc("1:i::99@i@@D@0@same_thread_only").is_none());
     }
 
     #[test]
@@ -596,19 +864,113 @@ mod signature_desc_tests {
         // would replace the argument with a local proxy index before the
         // second occurrence runs, so the second pass would misread that
         // proxy index as another raw caller-side table index.
-        assert!(parse_v2_signature_desc("1:ii::0,0").is_none());
+        assert!(parse_v2_signature_desc(
+            "1:ii::0@i@@D@0@same_thread_only,0@i@@D@0@same_thread_only"
+        )
+        .is_none());
     }
 
     #[test]
-    fn non_i32_callback_index_is_rejected() {
-        assert!(parse_v2_signature_desc("1:l::0").is_none());
-        assert!(parse_v2_signature_desc("1:f::0").is_none());
-        assert!(parse_v2_signature_desc("1:d::0").is_none());
+    fn non_i32_outer_arg_targeted_by_callback_is_rejected() {
+        assert!(parse_v2_signature_desc("1:l::0@i@@D@0@same_thread_only").is_none());
+        assert!(parse_v2_signature_desc("1:f::0@i@@D@0@same_thread_only").is_none());
+        assert!(parse_v2_signature_desc("1:d::0@i@@D@0@same_thread_only").is_none());
     }
 
     #[test]
-    fn malformed_callback_segment_is_rejected() {
-        assert!(parse_v2_signature_desc("1:i::not_a_number").is_none());
-        assert!(parse_v2_signature_desc("1:i::0,").is_none());
+    fn missing_spec_segments_are_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@i@@D@0").is_none()); // no reentry_policy
+        assert!(parse_v2_signature_desc("1:i::0").is_none()); // bare index, old grammar
+    }
+
+    #[test]
+    fn unknown_callback_param_char_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@x@@D@0@same_thread_only").is_none());
+    }
+
+    #[test]
+    fn multi_character_callback_ret_is_rejected() {
+        // A callback, like the outer V2 transport, carries at most one result.
+        assert!(parse_v2_signature_desc("1:i::0@i@ii@D@0@same_thread_only").is_none());
+    }
+
+    #[test]
+    fn unknown_callback_ret_char_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@i@x@D@0@same_thread_only").is_none());
+    }
+
+    #[test]
+    fn bad_lifetime_char_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@i@@X@0@same_thread_only").is_none());
+    }
+
+    #[test]
+    fn bad_nullable_char_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@i@@D@2@same_thread_only").is_none());
+    }
+
+    #[test]
+    fn empty_reentry_policy_is_rejected() {
+        assert!(parse_v2_signature_desc("1:i::0@i@@D@0@").is_none());
+    }
+
+    #[test]
+    fn unrecognized_reentry_policy_is_rejected() {
+        // A closed vocabulary (ReentryPolicy), not a recorded-but-
+        // uninterpreted string: a plausible-looking but unimplemented
+        // policy name must be rejected the same as outright garbage.
+        assert!(parse_v2_signature_desc("1:i::0@i@@D@0@any_thread").is_none());
+        assert!(parse_v2_signature_desc("1:i::0@i@@D@0@not-alnum").is_none());
+    }
+}
+
+#[cfg(test)]
+mod reject_unsupported_callback_shape_tests {
+    use super::*;
+
+    fn contract(signature: CallbackSignature) -> CallbackArgContract {
+        CallbackArgContract {
+            arg_index: 0,
+            signature,
+        }
+    }
+
+    fn supported_signature() -> CallbackSignature {
+        CallbackSignature {
+            params: vec![CallbackParamKind::Scalar(V2ValueType::I32)],
+            ret: CallbackRetKind::Void,
+            lifetime: CallbackLifetime::DuringCall,
+            nullable: false,
+            reentry_policy: ReentryPolicy::SameThreadOnly,
+        }
+    }
+
+    #[test]
+    fn fully_supported_shape_is_accepted() {
+        assert!(reject_unsupported_callback_shape(&[contract(supported_signature())]).is_none());
+    }
+
+    #[test]
+    fn pointer_param_is_rejected() {
+        let mut sig = supported_signature();
+        sig.params.push(CallbackParamKind::Pointer);
+        let reason = reject_unsupported_callback_shape(&[contract(sig)]).unwrap();
+        assert!(reason.contains("pointer-bearing callback parameters"));
+    }
+
+    #[test]
+    fn function_pointer_result_is_rejected() {
+        let mut sig = supported_signature();
+        sig.ret = CallbackRetKind::FunctionPointer;
+        let reason = reject_unsupported_callback_shape(&[contract(sig)]).unwrap();
+        assert!(reason.contains("function pointer"));
+    }
+
+    #[test]
+    fn retained_lifetime_is_rejected() {
+        let mut sig = supported_signature();
+        sig.lifetime = CallbackLifetime::Retained;
+        let reason = reject_unsupported_callback_shape(&[contract(sig)]).unwrap();
+        assert!(reason.contains("retained"));
     }
 }

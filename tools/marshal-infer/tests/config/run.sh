@@ -517,6 +517,299 @@ check "contract pointee_i32 targets a plain scalar, not a pointer: message" \
     "$(grep -c "is not a pointer to a 32-bit" "$WORK/e5.err")" "1"
 
 echo ""
+echo "=== callback contracts (function-pointer arguments) ==="
+# Schema round-trip, malformed-input, and ABI-lowering coverage for the
+# function-pointer callback-contract extension: Config.h's CallbackRef/
+# CallbackSignature, ParamTree.h's NodeKind::Function, and
+# Infer.cpp's validateContractAgainstSignature callback branch.
+
+echo "--- malformed callback_signatures / callback_signature refs (schema only, no bitcode needed) ---"
+
+echo '{"config_version": 1, "contracts": {"f": {"0": {"callback_signature": "missing_sig"}}}}' > "$WORK/cb_unknown_sig.json"
+rc="$(try_config "$WORK/cb_unknown_sig.json")"
+check "unknown callback signature id: exit code" "$rc" "1"
+check "unknown callback signature id: message" \
+    "$(grep -c "unknown callback signature id 'missing_sig'" "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_extra_key.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}], "ret": {"kind": "void"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": "same_thread_only"
+}}, "contracts": {"f": {"0": {"callback_signature": "sig", "extra": 1}}}}
+EOF
+rc="$(try_config "$WORK/cb_extra_key.json")"
+check "callback_signature ref with extra key: exit code" "$rc" "1"
+check "callback_signature ref with extra key: message" \
+    "$(grep -c "unknown key 'extra'" "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_ptr_missing_dir.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "ptr", "size_kind": "const", "const_size": 4}],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_ptr_missing_dir.json")"
+check "callback ptr param missing dir (unresolved pointer semantics): exit code" "$rc" "1"
+check "callback ptr param missing dir: message" \
+    "$(grep -c 'required for kind="ptr"' "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_ptr_missing_sizekind.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "ptr", "dir": "in"}],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_ptr_missing_sizekind.json")"
+check "callback ptr param missing size_kind (unresolved pointer semantics): exit code" "$rc" "1"
+check "callback ptr param missing size_kind: message" \
+    "$(grep -c 'required for kind="ptr"' "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_scalar_with_dir.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "dir": "in"}],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_scalar_with_dir.json")"
+check "callback scalar param carrying pointer-only key: exit code" "$rc" "1"
+check "callback scalar param carrying pointer-only key: message" \
+    "$(grep -c "must not carry 'dir'" "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_from_arg_oob.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "ptr", "dir": "in", "size_kind": "from_arg", "size_arg_index": 5}],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_from_arg_oob.json")"
+check "callback from_arg size_arg_index out of range: exit code" "$rc" "1"
+check "callback from_arg size_arg_index out of range: message" \
+    "$(grep -c "does not name an existing callback parameter" "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_bad_ret_kind.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}], "ret": {"kind": "bogus"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_bad_ret_kind.json")"
+check "callback unknown ret.kind: exit code" "$rc" "1"
+
+cat > "$WORK/cb_scalar_ret_no_type.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}], "ret": {"kind": "scalar"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_scalar_ret_no_type.json")"
+check "callback scalar return missing scalar_type: exit code" "$rc" "1"
+
+cat > "$WORK/cb_empty_reentry.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}], "ret": {"kind": "void"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": ""
+}}}
+EOF
+rc="$(try_config "$WORK/cb_empty_reentry.json")"
+check "callback empty reentry_policy: exit code" "$rc" "1"
+check "callback empty reentry_policy: message" \
+    "$(grep -c 'must be "same_thread_only"' "$WORK/probe.err")" "1"
+
+# reentry_policy is a CLOSED vocabulary, matching the runtime's own
+# ReentryPolicy enum (threei::lib_handler_table_v2, one implemented
+# variant: SameThreadOnly) -- a plausible-looking but unimplemented name
+# must be rejected here, not accepted and only discovered later when the
+# runtime consumer rejects the contract this tool already said was fine.
+cat > "$WORK/cb_unsupported_reentry.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}], "ret": {"kind": "void"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": "any_thread"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_unsupported_reentry.json")"
+check "callback unsupported reentry_policy value: exit code" "$rc" "1"
+check "callback unsupported reentry_policy value: message" \
+    "$(grep -c 'must be "same_thread_only"' "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_scalar_param_no_type.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "scalar"}], "ret": {"kind": "void"},
+  "lifetime": "retained", "nullable": false, "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_scalar_param_no_type.json")"
+check "callback scalar param missing scalar_type: exit code" "$rc" "1"
+check "callback scalar param missing scalar_type: message" \
+    "$(grep -c 'required for kind="scalar"' "$WORK/probe.err")" "1"
+
+cat > "$WORK/cb_ptr_param_with_type.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"sig": {
+  "params": [{"kind": "ptr", "dir": "in", "size_kind": "cstr", "scalar_type": "int32"}],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}}
+EOF
+rc="$(try_config "$WORK/cb_ptr_param_with_type.json")"
+check "callback ptr param carrying scalar_type: exit code" "$rc" "1"
+check "callback ptr param carrying scalar_type: message" \
+    "$(grep -c "must not carry 'scalar_type'" "$WORK/probe.err")" "1"
+
+echo "--- ABI validation against the real callback signature (needs real .bc) ---"
+cp "$SCRIPT_DIR/callback_contract.c" "$WORK/cbc.c"
+( cd "$WORK" && "$LIND_COMPILE" --emit-llvm cbc.c ) >/dev/null 2>&1
+CBC="$WORK/cbc.bc"
+
+echo "--- no reviewed contract: force_local, not a silent guess ---"
+"$MARSHAL_INFER" --json -o "$WORK/cb_nocontract.json" "$CBC" 2>/dev/null
+check "no callback contract: decision" \
+    "$(pyjq "$WORK/cb_nocontract.json" "[x for x in f['functions'] if x['name']=='takes_error_handler'][0]['decision']")" \
+    "force_local"
+check "no callback contract: warning names the argument" \
+    "$(pyjq "$WORK/cb_nocontract.json" "any('no reviewed callback contract' in w for w in [x for x in f['functions'] if x['name']=='takes_error_handler'][0]['warnings'])")" \
+    "True"
+
+echo "--- SAFETY: a NESTED function pointer (struct field) must never be copied as raw data ---"
+# struct ops_with_callback's 'callback' field is a function pointer with
+# no reviewed contract possible (callback contracts are top-level-argument
+# only) -- must force_local, never be classified as a constant-sized
+# copyable struct (which would silently hand the far cage a meaningless
+# function-table index).
+check "nested function pointer field: decision" \
+    "$(pyjq "$WORK/cb_nocontract.json" "[x for x in f['functions'] if x['name']=='takes_struct_with_callback'][0]['decision']")" \
+    "force_local"
+check "nested function pointer field: warning names the field" \
+    "$(pyjq "$WORK/cb_nocontract.json" "any('function pointer' in w for w in [x for x in f['functions'] if x['name']=='takes_struct_with_callback'][0]['warnings'])")" \
+    "True"
+
+cat > "$WORK/cb_valid.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"xerbla_handler": {
+  "params": [
+    {"kind": "ptr", "dir": "in", "size_kind": "from_arg", "size_arg_index": 2},
+    {"kind": "ptr", "dir": "inout", "size_kind": "const", "const_size": 4},
+    {"kind": "scalar", "scalar_type": "int32"}
+  ],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": true,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_error_handler": {"0": {"callback_signature": "xerbla_handler"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_valid.json" -o "$WORK/cb_valid.json.out" "$CBC" 2>"$WORK/cb_valid.err"
+rc=$?
+check "valid callback contract: exit code" "$rc" "0"
+cb_fn() { pyjq "$WORK/cb_valid.json.out" "[x for x in f['functions'] if x['name']=='takes_error_handler'][0]$1"; }
+check "valid callback contract: decision" "$(cb_fn "['decision']")" "marshal"
+check "valid callback contract: arg0 kind" "$(cb_fn "['args'][0]['kind']")" "callback"
+check "valid callback contract: arg0 signature_id" "$(cb_fn "['args'][0]['signature_id']")" "xerbla_handler"
+check "valid callback contract: arg0 lifetime" "$(cb_fn "['args'][0]['lifetime']")" "retained"
+check "valid callback contract: arg0 nullable" "$(cb_fn "['args'][0]['nullable']")" "True"
+check "valid callback contract: arg0 reentry_policy" "$(cb_fn "['args'][0]['reentry_policy']")" "same_thread_only"
+check "valid callback contract: arg0 param0 kind" "$(cb_fn "['args'][0]['params'][0]['kind']")" "ptr"
+check "valid callback contract: arg0 param0 dir" "$(cb_fn "['args'][0]['params'][0]['dir']")" "in"
+check "valid callback contract: arg0 param0 size_kind" "$(cb_fn "['args'][0]['params'][0]['size_kind']")" "from_arg"
+check "valid callback contract: arg0 param0 size_arg_index" "$(cb_fn "['args'][0]['params'][0]['size_arg_index']")" "2"
+check "valid callback contract: arg0 param1 size_kind" "$(cb_fn "['args'][0]['params'][1]['size_kind']")" "const"
+check "valid callback contract: arg0 param1 const_size" "$(cb_fn "['args'][0]['params'][1]['const_size']")" "4"
+check "valid callback contract: arg0 param2 kind" "$(cb_fn "['args'][0]['params'][2]['kind']")" "scalar"
+check "valid callback contract: arg0 param2 scalar_type" "$(cb_fn "['args'][0]['params'][2]['scalar_type']")" "int32"
+check "valid callback contract: arg0 ret kind" "$(cb_fn "['args'][0]['ret']['kind']")" "void"
+
+echo "--- target is not a function-pointer argument ---"
+cat > "$WORK/cb_bad_target.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"xerbla_handler": {
+  "params": [
+    {"kind": "ptr", "dir": "in", "size_kind": "from_arg", "size_arg_index": 2},
+    {"kind": "ptr", "dir": "inout", "size_kind": "const", "const_size": 4},
+    {"kind": "scalar", "scalar_type": "int32"}
+  ],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": true,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"plain_pointer_fn": {"0": {"callback_signature": "xerbla_handler"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_target.json" -o "$WORK/cb_bt.json" "$CBC" 2>"$WORK/cb_bt.err"
+check "callback target not a function pointer: exit code" "$?" "1"
+check "callback target not a function pointer: message" \
+    "$(grep -c "target is not a function-pointer argument" "$WORK/cb_bt.err")" "1"
+
+echo "--- callback ABI mismatch: param count ---"
+cat > "$WORK/cb_bad_paramcount.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"xerbla_handler": {
+  "params": [
+    {"kind": "ptr", "dir": "in", "size_kind": "from_arg", "size_arg_index": 2},
+    {"kind": "ptr", "dir": "inout", "size_kind": "const", "const_size": 4},
+    {"kind": "scalar", "scalar_type": "int32"}
+  ],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": true,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_two_param_handler": {"0": {"callback_signature": "xerbla_handler"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_paramcount.json" -o "$WORK/cb_pc.json" "$CBC" 2>"$WORK/cb_pc.err"
+check "callback ABI mismatch (param count): exit code" "$?" "1"
+check "callback ABI mismatch (param count): message" \
+    "$(grep -c "declares 3 parameter(s), but the real callback type has 2" "$WORK/cb_pc.err")" "1"
+
+echo "--- callback ABI mismatch: param kind ---"
+cat > "$WORK/cb_bad_paramkind.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"two_wrong_kind": {
+  "params": [
+    {"kind": "scalar", "scalar_type": "int32"},
+    {"kind": "ptr", "dir": "in", "size_kind": "cstr"}
+  ],
+  "ret": {"kind": "void"}, "lifetime": "during_call", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_two_param_handler": {"0": {"callback_signature": "two_wrong_kind"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_paramkind.json" -o "$WORK/cb_pk.json" "$CBC" 2>"$WORK/cb_pk.err"
+check "callback ABI mismatch (param kind): exit code" "$?" "1"
+check "callback ABI mismatch (param kind): message" \
+    "$(grep -c "param0 declared as \"scalar\", but the real callback parameter's type" "$WORK/cb_pk.err")" "1"
+
+echo "--- callback ABI mismatch: return shape ---"
+cat > "$WORK/cb_bad_ret.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"scalar_ret_wrong": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}],
+  "ret": {"kind": "void"}, "lifetime": "during_call", "nullable": false,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_scalar_ret_handler": {"0": {"callback_signature": "scalar_ret_wrong"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_ret.json" -o "$WORK/cb_rt.json" "$CBC" 2>"$WORK/cb_rt.err"
+check "callback ABI mismatch (return shape): exit code" "$?" "1"
+check "callback ABI mismatch (return shape): message" \
+    "$(grep -c "declares a void return, but the real callback returns int" "$WORK/cb_rt.err")" "1"
+
+echo "--- callback ABI mismatch: scalar return exact type (void mismatch already covers kind; this covers scalar-vs-scalar exactness) ---"
+cat > "$WORK/cb_bad_ret_exact.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"scalar_ret_exact_wrong": {
+  "params": [{"kind": "scalar", "scalar_type": "int32"}],
+  "ret": {"kind": "scalar", "scalar_type": "float64"}, "lifetime": "during_call",
+  "nullable": false, "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_scalar_ret_handler": {"0": {"callback_signature": "scalar_ret_exact_wrong"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_ret_exact.json" -o "$WORK/cb_rte.json" "$CBC" 2>"$WORK/cb_rte.err"
+check "callback ABI mismatch (scalar return exact type): exit code" "$?" "1"
+check "callback ABI mismatch (scalar return exact type): message" \
+    "$(grep -c 'declares a scalar return of scalar_type "float64", but the real callback return type (int) lowers to "int32"' "$WORK/cb_rte.err")" "1"
+
+echo "--- callback ABI mismatch: scalar param exact type ---"
+cat > "$WORK/cb_bad_paramtype_exact.json" <<'EOF'
+{"config_version": 1, "callback_signatures": {"xerbla_handler_badtype": {
+  "params": [
+    {"kind": "ptr", "dir": "in", "size_kind": "from_arg", "size_arg_index": 2},
+    {"kind": "ptr", "dir": "inout", "size_kind": "const", "const_size": 4},
+    {"kind": "scalar", "scalar_type": "float64"}
+  ],
+  "ret": {"kind": "void"}, "lifetime": "retained", "nullable": true,
+  "reentry_policy": "same_thread_only"
+}}, "contracts": {"takes_error_handler": {"0": {"callback_signature": "xerbla_handler_badtype"}}}}
+EOF
+"$MARSHAL_INFER" --json --config "$WORK/cb_bad_paramtype_exact.json" -o "$WORK/cb_pte.json" "$CBC" 2>"$WORK/cb_pte.err"
+check "callback ABI mismatch (scalar param exact type): exit code" "$?" "1"
+check "callback ABI mismatch (scalar param exact type): message" \
+    "$(grep -c 'param2 declares scalar_type "float64", but the real callback parameter.s type (int) lowers to "int32"' "$WORK/cb_pte.err")" "1"
+
+echo ""
 echo "=== coverage threshold enforcement ==="
 cat > "$WORK/cov_pass.json" <<'EOF'
 {"config_version": 1, "coverage": {"enabled": true, "min_marshal_count": 1}}

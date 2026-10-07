@@ -9,14 +9,18 @@
 // below just calls through it like any ordinary local function pointer --
 // no cross-cage awareness needed at the wasm level at all.
 //
-// The registration descriptor "1:i:i:0" marks parameter 0 (the sole i32
-// parameter) as a callback: manifest version 1, params "i", results "i",
-// callback_params "0". The result lets a trap or rejection inside the
-// callback surface as an ordinary GRATE_ERR return value to the caller
-// instead of an unrecoverable wasm trap -- a void-returning interposed
-// call has no slot to carry that sentinel through, so a callback failure
-// there would abort the whole calling cage, with no way to make a second
-// call afterward to prove cleanup actually happened.
+// The registration descriptor "1:i:i:0@i@@D@0@same_thread_only" marks
+// parameter 0 (the sole i32 parameter) as a callback: manifest version 1,
+// outer params "i", outer results "i", one callback spec for argument 0
+// whose own signature takes one i32 and returns void ("i@"), is
+// during_call-scoped ("D"), non-nullable ("0"), with reentry policy
+// "same_thread_only". The outer function's i32 result lets a trap or
+// rejection inside the callback surface as an ordinary GRATE_ERR return
+// value to the caller instead of an unrecoverable wasm trap -- a void-
+// returning interposed call has no slot to carry that sentinel through,
+// so a callback failure there would abort the whole calling cage, with
+// no way to make a second call afterward to prove cleanup actually
+// happened.
 //
 // Compile:
 //   lind-clang -s --compile-grate callback_grate.c \
@@ -86,7 +90,8 @@ int main(int argc, char *argv[]) {
     if (pid == 0) {
         int cageid = getpid();
         int r = register_lib_handler_v2(cageid, "env", "library_call", grateid,
-                                         "__lind_v2_adapter_library_call", "1:i:i:0");
+                                         "__lind_v2_adapter_library_call",
+                                         "1:i:i:0@i@@D@0@same_thread_only");
         if (r != 0) {
             fprintf(stderr, "[gate0-callback-grate] register library_call failed: %d\n", r);
             __builtin_trap();

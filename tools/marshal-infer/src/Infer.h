@@ -67,8 +67,13 @@ void inferFunction(const llvm::Function &f, FunctionTrees &ft,
 // wrong-typed operand index would otherwise be baked into the emitted JSON
 // verbatim (extentOperandFromContract performs no validation of its own)
 // and read back by the runtime as if it had been proven correct.
+// `config` is needed to resolve a CallbackRef entry's signatureId against
+// Config::callbackSignatures -- a StrideVector-only contract never
+// touches it, but the two contract kinds share one validation entry
+// point (see FunctionContractEntry's own comment on why).
 bool validateContractAgainstSignature(const FunctionTrees &ft,
                                       const FunctionContract &contract,
+                                      const Config &config,
                                       std::string &err);
 
 } // namespace marshal

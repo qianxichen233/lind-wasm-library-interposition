@@ -185,6 +185,67 @@ static void jsonNode(raw_ostream &os, const TreeNode *n, unsigned ind,
     return;
   }
 
+  // A function-pointer argument resolved via a reviewed callback contract
+  // (Config.h's CallbackRef/CallbackSignature) is its own canonical
+  // kind, like a handle: it carries no dir/size_kind of its own, and the
+  // callback's own signature is lowered inline here (into "params"/"ret")
+  // rather than recursed into via "pointee" -- a human-reviewed contract,
+  // not the ordinary DWARF-driven child tree, is what the runtime needs
+  // to actually invoke it. Operand indices under "params" are always
+  // relative to the CALLBACK's own parameter list, never the host
+  // function's, so (unlike the "pointee" recursion for an ordinary
+  // pointer) they are never passed through argRemap.
+  if (n->isCallback) {
+    os << "\"kind\":\"callback\"";
+    if (isField) {
+      os << ",\"field\":"; jsonStr(os, n->fieldName);
+      os << ",\"offset\":" << n->offsetBytes;
+      os << ",\"touched\":" << (n->touched ? "true" : "false");
+    }
+    os << ",\"signature_id\":"; jsonStr(os, n->callbackSignatureId);
+    os << ",\"lifetime\":"; jsonStr(os, n->callbackLifetime);
+    os << ",\"nullable\":" << (n->callbackNullable ? "true" : "false");
+    os << ",\"reentry_policy\":"; jsonStr(os, n->callbackReentryPolicy);
+    os << ",\"params\":[\n";
+    std::string cpad((ind + 1) * 2, ' ');
+    for (size_t i = 0; i < n->callbackParams.size(); ++i) {
+      const CallbackParamClassification &cp = n->callbackParams[i];
+      os << cpad << "{\"kind\":"; jsonStr(os, cp.isPointer ? "ptr" : "scalar");
+      if (cp.isPointer) {
+        os << ",\"dir\":"; jsonStr(os, dirName(cp.dir));
+        os << ",\"size_kind\":"; jsonStr(os, sizeKindName(cp.sizeKind));
+        if (cp.sizeKind == SizeKind::Const)
+          os << ",\"const_size\":" << cp.constSize;
+        if (cp.sizeKind == SizeKind::FromArg)
+          os << ",\"size_arg_index\":" << cp.sizeArgIndex;
+        if (cp.sizeKind == SizeKind::StrideVector) {
+          auto operand = [&](const char *key, const ExtentOperand &op) {
+            os << ",\"" << key << "\":{\"arg_index\":" << op.argIndex
+               << ",\"source\":"; jsonStr(os, extentSourceName(op.source));
+            if (op.source == ExtentSource::Constant)
+              os << ",\"const_value\":" << op.constValue;
+            os << "}";
+          };
+          operand("size_operand", cp.sizeOperand);
+          operand("stride_operand", cp.strideOperand);
+          os << ",\"stride_elem_size\":" << cp.strideElemSize;
+        }
+      } else {
+        os << ",\"scalar_type\":"; jsonStr(os, cp.scalarType);
+      }
+      os << "}";
+      os << (i + 1 < n->callbackParams.size() ? ",\n" : "\n");
+    }
+    os << pad << "],\"ret\":{\"kind\":";
+    jsonStr(os, callbackRetKindName(n->callbackRet.kind));
+    if (n->callbackRet.kind == CallbackRetKind::Scalar) {
+      os << ",\"scalar_type\":"; jsonStr(os, n->callbackRet.scalarType);
+    }
+    os << "}";
+    os << "}";
+    return;
+  }
+
   // An inner pointer translated as an offset into another argument (strtol
   // endptr) — into_arg always names a TOP-LEVEL sibling argument, regardless
   // of the fact that this node itself is one level below it (the pointee of
@@ -579,7 +640,7 @@ int main(int argc, char **argv) {
       auto it = config.contracts.find(ft->funcName);
       if (it != config.contracts.end()) {
         std::string verr;
-        if (!validateContractAgainstSignature(*ft, it->second, verr))
+        if (!validateContractAgainstSignature(*ft, it->second, config, verr))
           contractErrors.push_back(verr);
       }
     }

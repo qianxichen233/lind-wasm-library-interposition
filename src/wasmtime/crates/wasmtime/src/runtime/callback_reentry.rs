@@ -31,6 +31,17 @@
 //! continuing would risk a later lookup handing out a dangling `Store`
 //! reference, so it panics rather than silently leaving a stale frame
 //! reachable.
+//!
+//! This module does not track instance generations (exec()/teardown
+//! replacing what a `cageid` names). A callback is only ever resolved
+//! while its source cage is synchronously suspended partway through the
+//! very call that supplied it -- that cage cannot be exec()'d or torn
+//! down and recreated by some other path while blocked on its own
+//! outgoing call, so nothing can make a frame stale for as long as it is
+//! reachable here. A lifecycle that can actually outlive the call that
+//! installed it (a *retained* callback, not yet supported -- see
+//! `threei::CallbackLifetime`) will need its own cheap revocation
+//! mechanism when it exists, not a check added speculatively here first.
 
 use crate::prelude::*;
 use crate::{StoreContextMut, StoreInner, Table};
