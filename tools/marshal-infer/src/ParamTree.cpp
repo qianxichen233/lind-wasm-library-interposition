@@ -10,12 +10,13 @@ namespace marshal {
 
 const char *nodeKindName(NodeKind k) {
   switch (k) {
-  case NodeKind::Scalar:  return "scalar";
-  case NodeKind::Pointer: return "ptr";
-  case NodeKind::Struct:  return "struct";
-  case NodeKind::Union:   return "union";
-  case NodeKind::Array:   return "array";
-  case NodeKind::Unknown: return "unknown";
+  case NodeKind::Scalar:   return "scalar";
+  case NodeKind::Pointer:  return "ptr";
+  case NodeKind::Struct:   return "struct";
+  case NodeKind::Union:    return "union";
+  case NodeKind::Array:    return "array";
+  case NodeKind::Function: return "function";
+  case NodeKind::Unknown:  return "unknown";
   }
   return "unknown";
 }
@@ -60,6 +61,15 @@ const char *confidenceName(Confidence c) {
   case Confidence::Configured: return "configured";
   }
   return "proven";
+}
+
+const char *callbackRetKindName(CallbackRetKind k) {
+  switch (k) {
+  case CallbackRetKind::Void:           return "void";
+  case CallbackRetKind::Scalar:         return "scalar";
+  case CallbackRetKind::FunctionPointer: return "function_pointer";
+  }
+  return "void";
 }
 
 const char *retKindName(RetKind r) {
@@ -192,10 +202,32 @@ std::unique_ptr<TreeNode> buildTreeFromDIType(const DIType *rawTy,
   }
 
   if (tag == dwarf::DW_TAG_subroutine_type) {
-    // A function type (reached via a function pointer). Not marshalable as data;
-    // mark Unknown so a struct carrying a vtable becomes unresolvable.
-    node->kind = NodeKind::Unknown;
+    // A function type, reached as a pointer's pointee -- the callback
+    // case. A STRUCT carrying a function-pointer member (e.g. a vtable)
+    // still becomes unresolvable overall: nothing outside the dedicated
+    // function-pointer-ARGUMENT path (Infer.cpp's callback-contract
+    // application, keyed off a top-level Pointer node whose child is
+    // exactly this kind) ever resolves a NodeKind::Function node, so one
+    // reached through a struct field is explicitly rejected as residue
+    // (Infer.cpp's annotateComposite), never silently treated as plain
+    // copyable data.
+    node->kind = NodeKind::Function;
     node->typeName = "<func>";
+    auto *subTy = cast<DISubroutineType>(ty);
+    DITypeRefArray typeArray = subTy->getTypeArray();
+    if (typeArray.size() > 0) {
+      // Same convention buildFunctionTrees uses for the function being
+      // analyzed, reused here for this nested callback type: index 0 is
+      // the return type (null = void, handled by buildTreeFromDIType's
+      // own null-root branch above), 1.. are the parameters.
+      node->children.push_back(buildTreeFromDIType(typeArray[0], maxDepth - 1));
+      for (unsigned i = 1; i < typeArray.size(); ++i) {
+        DIType *argTy = typeArray[i];
+        if (!argTy)
+          break; // varargs sentinel
+        node->children.push_back(buildTreeFromDIType(argTy, maxDepth - 1));
+      }
+    }
     return node;
   }
 

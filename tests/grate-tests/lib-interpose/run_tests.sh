@@ -177,6 +177,19 @@ fi
 cp "$SCRIPT_DIR/fail-closed/libextentexpr_stub.so" "$LINDFS/lib/libextentexpr_stub.so"
 echo ""
 
+# gate0-callback/liblibrary_call_stub.c: preloaded fallback for the
+# cross-cage function-pointer callback tests below -- same fail-closed-stub
+# role as the others above.
+echo "Building shared fixture: liblibrary_call_stub.so"
+if ! "$LIND_COMPILE" --compile-library "$SCRIPT_DIR/gate0-callback/liblibrary_call_stub.c" \
+        > /tmp/lib-interpose-compile.log 2>&1; then
+    echo "FATAL: failed to build gate0-callback/liblibrary_call_stub.c:"
+    cat /tmp/lib-interpose-compile.log
+    exit 2
+fi
+cp "$SCRIPT_DIR/gate0-callback/liblibrary_call_stub.so" "$LINDFS/lib/liblibrary_call_stub.so"
+echo ""
+
 # auto-v2wide/v2wide_adapters.c is generated fresh here with
 # tools/marshal-gen/gen_v2_adapter.py from the checked-in
 # auto-v2wide/v2wide.spec.json) -- same "compiled fresh from source each
@@ -235,9 +248,20 @@ compile_src() {
 }
 
 # compile_grate <src.c> [extra clang/source args...]
+#
+# GRATE_NO_FPCAST_EMU=true (reset to the default after use, same convention
+# as GRATE_EXTRA) skips --fpcast-emu: Binaryen's emulation pass rewrites
+# every COMPILE-TIME table entry and call_indirect site to a canonical
+# wrapper shape, which a RUNTIME-installed host Func (see gate0-callback/'s
+# callback proxy) never gets wrapped into -- calling through it then traps
+# with "indirect call type mismatch". Every other grate in this suite wants
+# the emulation; only a grate that installs new table entries at runtime
+# needs to opt out.
 compile_grate() {
     local src="$1"; shift
-    "$LIND_COMPILE" -s --compile-grate --fpcast-emu "$src" -I "$SCRIPT_DIR" "$@" \
+    local fpcast_flag="--fpcast-emu"
+    [[ "${GRATE_NO_FPCAST_EMU:-false}" == "true" ]] && fpcast_flag=""
+    "$LIND_COMPILE" -s --compile-grate ${fpcast_flag} "$src" -I "$SCRIPT_DIR" "$@" \
         > /tmp/lib-interpose-compile.log 2>&1
 }
 
@@ -1895,6 +1919,104 @@ run_test "auto-v2wide-real-exec" \
     -- "[Grate|v2wide-real] toy_wide_marshal handler ran"
 
 DECLARED_TESTS+=("auto-v2wide")
+
+# --------------------------------------------------------------------------
+# gate0-callback: cross-cage function-pointer callback feasibility probe.
+# Cage A passes its own function pointer into the interposed
+# `library_call`; the host (GrateWorker::install_callback_proxies) resolves
+# it against cage A's re-entry frame, installs a host-side proxy into the
+# grate's own table, and the grate's adapter calls through that proxy --
+# which re-enters A's own suspended Store to run A's real callback --
+# before `library_call` returns. See callback_cage.c/callback_grate.c for
+# the exact scenario; the descriptor "1:i:i:0@i@@D@0@same_thread_only" marks
+# parameter 0 as a callback table index (not an ordinary scalar), declares
+# its own one-i32-param/void-result/during_call/non-nullable signature,
+# and the outer i32 result lets a rejected or trapped callback surface as
+# an ordinary return value instead of a wasm trap.
+#
+# Not run through the standard lind_marshal.h-generated adapter path: a
+# function-pointer argument has no representation in that schema.
+# GRATE_NO_FPCAST_EMU is required -- see compile_grate's own doc for why.
+# --growable-table is required because a statically-compiled table
+# otherwise has no room for the proxy (initial == max).
+# --------------------------------------------------------------------------
+GRATE_EXTRA=(-Wl,--export-table -Wl,--growable-table)
+GRATE_NO_FPCAST_EMU=true
+run_test "gate0-callback" \
+    "gate0-callback/callback_cage.c" \
+    "gate0-callback/callback_grate.c" \
+    "env=/lib/liblibrary_call_stub.so" "yes" \
+    "/callback_cage.cwasm" \
+    -- "[gate0-callback-grate] registered 1/1 handlers" \
+       "[Cage|gate0-callback] PASS: callback executed, observed=42" \
+    --
+
+# gate0-callback-cleanup: the same mechanism under repeated use. 20
+# ordinary calls followed by one call whose callback deliberately traps,
+# followed by one more ordinary call. "growth event #1" is required
+# (proves a proxy was installed at all) and "growth event #2" is forbidden
+# anywhere in the output (proves none of the 21 later callback-bearing
+# calls -- including the one right after the trap -- grew the table again;
+# every one of them reused the single reclaimed slot instead).
+#
+# LIND_GRATE_WORKERS=1 pins this grate to a single worker: the growth
+# counter and free-slot list are both worker-local (each worker owns its
+# own table), so with the default pool of up to MAX_GRATE_WORKERS (32)
+# workers, 22 total calls round-robin across distinct, never-reused
+# workers and would never actually exercise slot reuse at all.
+LIND_GRATE_WORKERS=1 run_test "gate0-callback-cleanup" \
+    "gate0-callback/callback_cage.c" \
+    "gate0-callback/callback_grate.c" \
+    "env=/lib/liblibrary_call_stub.so" "yes" \
+    "/callback_cage.cwasm" "20" \
+    -- "[gate0-callback-grate] registered 1/1 handlers" \
+       "[Cage|gate0-callback] trapping callback correctly rejected" \
+       "[Cage|gate0-callback] PASS: recovered after trap, callback executed, observed=42" \
+    -- "[lind-3i] callback proxy table growth event #1" \
+    -- "[lind-3i] callback proxy table growth event #2"
+
+# gate0-callback-abimismatch: callback ABI-lowering mismatch. The
+# grate declares the callback as taking one i64 where cage A's real
+# callback actually takes one i32; GrateWorker::install_callback_proxies
+# must reject this once it resolves the real function and compares its
+# actual lowered type against the declared signature, before installing
+# any proxy -- never by calling the wrong-shaped function and observing
+# it misbehave.
+run_test "gate0-callback-abimismatch" \
+    "gate0-callback/callback_cage_expect_reject.c" \
+    "gate0-callback/callback_grate_abimismatch.c" \
+    "env=/lib/liblibrary_call_stub.so" "yes" \
+    "/callback_cage_expect_reject.cwasm" \
+    -- "[gate0-callback-grate-abimismatch] registered 1/1 handlers" \
+       "[Cage|gate0-callback-abimismatch] PASS: ABI mismatch rejected, callback never ran" \
+    --
+
+# gate0-callback-null-rejected: non-nullable contract + NULL callback.
+# callback_grate.c declares nullable=0; a NULL function pointer must be
+# rejected before anything else runs, not silently treated as "nothing to
+# proxy."
+run_test "gate0-callback-null-rejected" \
+    "gate0-callback/callback_cage_null_rejected.c" \
+    "gate0-callback/callback_grate.c" \
+    "env=/lib/liblibrary_call_stub.so" "yes" \
+    "/callback_cage_null_rejected.cwasm" \
+    -- "[gate0-callback-grate] registered 1/1 handlers" \
+       "[Cage|gate0-callback-null-rejected] PASS: NULL callback rejected (not nullable)" \
+    --
+
+# gate0-callback-null-accepted: nullable contract + NULL callback.
+# callback_grate_nullable.c declares nullable=1; a NULL function pointer
+# must pass through ordinarily -- no proxy installed, no rejection.
+run_test "gate0-callback-null-accepted" \
+    "gate0-callback/callback_cage_null_accepted.c" \
+    "gate0-callback/callback_grate_nullable.c" \
+    "env=/lib/liblibrary_call_stub.so" "yes" \
+    "/callback_cage_null_accepted.cwasm" \
+    -- "[gate0-callback-grate-nullable] registered 1/1 handlers" \
+       "[Cage|gate0-callback-null-accepted] PASS: NULL callback accepted (nullable)" \
+    --
+GRATE_NO_FPCAST_EMU=false
+GRATE_EXTRA=()
 
 # --------------------------------------------------------------------------
 # Completeness check: every directory with a *_grate.c must be declared

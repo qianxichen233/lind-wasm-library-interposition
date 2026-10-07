@@ -233,6 +233,12 @@ pub fn execute_with_lind(
         wstore.as_context_mut().set_stack_base(stack_high as u64);
         wstore.as_context_mut().set_stack_top(stack_low as u64);
 
+        // Records this cage's own shared table so that a callback proxy
+        // installed in some OTHER cage can later resolve a function-pointer
+        // table index this cage handed it -- see `get_cage_table`'s own
+        // doc for why this registry exists rather than resolving the table
+        // from the caller's own module exports.
+        wasmtime::register_cage_table(cageid, table_inner);
         dylink_metadata.table = Some(table_inner);
         dylink_metadata.epoch_handler = Some(epoch);
     }

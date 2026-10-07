@@ -338,8 +338,26 @@ bool isParseEndptrFn(StringRef raw) {
 // skips) and any other leftover. Handles are opaque — their uncopied pointee is
 // not inspected.
 bool treeHasUnmappable(const TreeNode *n) {
-  if (n->isHandle || n->ptrIntoArg) return false;
+  // A callback node is opaque the same way a handle is: its "pointee" is
+  // the callback's own signature tree, lowered via the resolved contract
+  // rather than deep-copied, so nothing below it needs to be (or can be)
+  // inspected by the ordinary pointer-mappability walk.
+  if (n->isHandle || n->isCallback || n->ptrIntoArg) return false;
   if (n->kind == NodeKind::Unknown) return true;
+  // A function pointer (Pointer -> Function) whose OWNING pointer wasn't
+  // itself resolved via a reviewed callback contract (isCallback, already
+  // excluded above) is unmappable as raw data, full stop -- checked by
+  // pointee KIND directly, never by sizeKind. A function pointer's value
+  // is a function-table index with no meaning outside the cage that
+  // produced it; copying it byte-for-byte (e.g. as a field of an
+  // otherwise-plain-data struct, where nothing upstream of this walk
+  // special-cases it) would silently hand the far cage garbage. This
+  // catches a NESTED occurrence (a struct field, found only by the
+  // recursion below) exactly as it would a top-level one, independent of
+  // whatever sizeKind some other analysis pass may have assigned.
+  if (n->kind == NodeKind::Pointer && !n->children.empty() &&
+      n->children[0]->kind == NodeKind::Function)
+    return true;
   if (n->kind == NodeKind::Pointer && n->sizeKind != SizeKind::Const &&
       n->sizeKind != SizeKind::FromArg &&
       n->sizeKind != SizeKind::FromArgPointee && n->sizeKind != SizeKind::Cstr &&
@@ -2051,10 +2069,21 @@ bool annotateComposite(TreeNode *s, FunctionTrees &ft, size_t topArg) {
         ft.warnings.push_back("arg" + std::to_string(topArg) + " field '" +
             fld->fieldName + "': pointer-to-pointer (non-string) — not marshalable");
       }
-    } else if (pe->kind == NodeKind::Unknown) {       // ptr to fn/truncated
+    } else if (pe->kind == NodeKind::Unknown) {       // ptr to truncated/unresolved
       resolvable = false;
       ft.warnings.push_back("arg" + std::to_string(topArg) + " field '" +
-          fld->fieldName + "': pointer to fn/unresolved — not marshalable");
+          fld->fieldName + "': pointer to unresolved type — not marshalable");
+    } else if (pe->kind == NodeKind::Function) {
+      // A function-pointer FIELD (e.g. a vtable-shaped struct). Callback
+      // contracts are keyed by top-level argument index only; nothing
+      // resolves a callback reached through a struct field, so this is
+      // always residue -- never guessed at as a sized/cstr pointer the way a
+      // genuine pointer-to-scalar field would be (treeHasUnmappable's
+      // own pointee-kind check is a second, independent backstop for
+      // this same case, should it ever reach that walk some other way).
+      resolvable = false;
+      ft.warnings.push_back("arg" + std::to_string(topArg) + " field '" +
+          fld->fieldName + "': function pointer — not marshalable");
     } else {                                    // ptr to scalar
       uint64_t elem = pe->sizeBytes ? pe->sizeBytes : 1;
       if (tightPair) { fld->sizeKind = SizeKind::FromArg; fld->sizeArgIndex = sizeField; }
@@ -2718,10 +2747,71 @@ Dir dirFromContract(const std::string &s) {
   return Dir::In;
 }
 
+// Translates one reviewed callback parameter (Config.h's vocabulary) into
+// ParamTree.h's CallbackParamClassification, the same validated-at-load-
+// time-so-no-further-checking-needed convention as extentOperandFromContract/
+// dirFromContract above.
+CallbackParamClassification
+callbackParamFromContract(const CallbackParamContract &c) {
+  CallbackParamClassification out;
+  out.isPointer = (c.kind == "ptr");
+  if (!out.isPointer) {
+    out.scalarType = c.scalarType;
+    return out;
+  }
+  out.dir = dirFromContract(c.dir);
+  if (c.sizeKind == "const") {
+    out.sizeKind = SizeKind::Const;
+    out.constSize = c.constSize;
+  } else if (c.sizeKind == "from_arg") {
+    out.sizeKind = SizeKind::FromArg;
+    out.sizeArgIndex = c.sizeArgIndex;
+  } else if (c.sizeKind == "cstr") {
+    out.sizeKind = SizeKind::Cstr;
+  } else if (c.sizeKind == "stride_vector") {
+    out.sizeKind = SizeKind::StrideVector;
+    out.sizeOperand = extentOperandFromContract(c.sizeOperand);
+    out.strideOperand = extentOperandFromContract(c.strideOperand);
+    out.strideElemSize = c.strideElemSize;
+  }
+  return out;
+}
+
+CallbackReturnClassification
+callbackReturnFromContract(const CallbackReturnContract &c) {
+  CallbackReturnClassification out;
+  if (c.kind == "scalar") {
+    out.kind = CallbackRetKind::Scalar;
+    out.scalarType = c.scalarType;
+  } else if (c.kind == "function_pointer") {
+    out.kind = CallbackRetKind::FunctionPointer;
+  } else {
+    out.kind = CallbackRetKind::Void;
+  }
+  return out;
+}
+
+// Classifies a scalar TreeNode's REAL raw wasm value-type slot, for exact
+// comparison against a callback contract's declared scalar_type -- "some
+// scalar" is not enough for the runtime descriptor to generate a correct
+// call (it needs i32/i64/f32/f64 specifically). Returns nullopt for
+// anything that doesn't lower to exactly one such slot (currently only
+// `long double`/fp128, which this target splits into two raw i64 halves
+// -- not representable as a single scalar_type).
+std::optional<std::string> classifyScalarAbiType(const TreeNode *t) {
+  if (t->typeName == "float") return std::string("float32");
+  if (t->typeName == "double") return std::string("float64");
+  if (t->typeName == "long double") return std::nullopt;
+  if (t->sizeBytes >= 1 && t->sizeBytes <= 4) return std::string("int32");
+  if (t->sizeBytes == 8) return std::string("int64");
+  return std::nullopt;
+}
+
 } // namespace
 
 bool validateContractAgainstSignature(const FunctionTrees &ft,
                                       const FunctionContract &contract,
+                                      const Config &config,
                                       std::string &err) {
   auto argDesc = [&](int idx) {
     return "'" + ft.funcName + "' arg" + std::to_string(idx);
@@ -2767,15 +2857,146 @@ bool validateContractAgainstSignature(const FunctionTrees &ft,
     }
     return true;
   };
+
+  // Validates one callback-signature reference against the REAL
+  // function-pointer argument it's attached to: the signature id must be
+  // registered, and its declared shape (param count/kind, return shape)
+  // must match what DWARF actually says the callback's type is. Both an
+  // unregistered signature id and a declared shape that disagrees with
+  // the real ABI ("callback ABI mismatch") are rejected here, never
+  // silently applied.
+  auto checkCallback = [&](int targetArg, const CallbackRef &ref) -> bool {
+    auto sigIt = config.callbackSignatures.find(ref.signatureId);
+    if (sigIt == config.callbackSignatures.end()) {
+      err = "config contract for " + argDesc(targetArg) +
+            ": unknown callback signature id '" + ref.signatureId +
+            "' (not defined in callback_signatures)";
+      return false;
+    }
+    const CallbackSignature &sig = sigIt->second;
+    const TreeNode *target = ft.params[(size_t)targetArg].get();
+    if (target->kind != NodeKind::Pointer || target->children.empty() ||
+        target->children[0]->kind != NodeKind::Function) {
+      err = "config contract for " + argDesc(targetArg) +
+            ": target is not a function-pointer argument (actual type: " +
+            target->typeName + ")";
+      return false;
+    }
+    // fn->children[0] = the callback's own return type; fn->children[1:] =
+    // the callback's own parameters, in order -- see ParamTree.h's
+    // NodeKind::Function.
+    const TreeNode *fn = target->children[0].get();
+    size_t realParamCount = fn->children.empty() ? 0 : fn->children.size() - 1;
+    if (realParamCount != sig.params.size()) {
+      err = "config contract for " + argDesc(targetArg) +
+            ": callback signature '" + ref.signatureId + "' declares " +
+            std::to_string(sig.params.size()) +
+            " parameter(s), but the real callback type has " +
+            std::to_string(realParamCount);
+      return false;
+    }
+    for (size_t i = 0; i < sig.params.size(); ++i) {
+      const TreeNode *realParam = fn->children[i + 1].get();
+      const CallbackParamContract &declared = sig.params[i];
+      bool declaredIsPtr = declared.kind == "ptr";
+      bool realIsPtr = realParam->kind == NodeKind::Pointer;
+      bool realIsScalar = realParam->kind == NodeKind::Scalar;
+      if ((declaredIsPtr && !realIsPtr) || (!declaredIsPtr && !realIsScalar)) {
+        err = "config contract for " + argDesc(targetArg) +
+              ": callback signature '" + ref.signatureId + "' param" +
+              std::to_string(i) + " declared as \"" + declared.kind +
+              "\", but the real callback parameter's type (" +
+              realParam->typeName + ") does not match";
+        return false;
+      }
+      // A declared "scalar" param additionally needs its EXACT raw wasm
+      // value-type slot verified -- "some scalar" would let a contract
+      // declaring scalar_type="float64" against a real `int` parameter
+      // through, and the runtime has no way to catch that at dispatch
+      // time (it trusts the descriptor, it doesn't re-derive it from
+      // DWARF).
+      if (!declaredIsPtr) {
+        std::optional<std::string> realType = classifyScalarAbiType(realParam);
+        if (!realType || *realType != declared.scalarType) {
+          err = "config contract for " + argDesc(targetArg) +
+                ": callback signature '" + ref.signatureId + "' param" +
+                std::to_string(i) + " declares scalar_type \"" +
+                declared.scalarType +
+                "\", but the real callback parameter's type (" +
+                realParam->typeName + ") " +
+                (realType ? ("lowers to \"" + *realType + "\"")
+                          : "does not lower to a single raw scalar slot");
+          return false;
+        }
+      }
+    }
+    // Return shape: "void" <-> the real return tree's own null-type
+    // representation (kind=Unknown, typeName="void" -- see
+    // buildTreeFromDIType's null-root branch); "scalar" <-> a real scalar
+    // leaf; "function_pointer" is checked only for the ABI shape it needs
+    // today (a pointer) and never fully resolved here.
+    const TreeNode *realRet =
+        fn->children.empty() ? nullptr : fn->children[0].get();
+    bool realIsVoid = !realRet || (realRet->kind == NodeKind::Unknown &&
+                                   realRet->typeName == "void");
+    if (sig.ret.kind == "void" && !realIsVoid) {
+      err = "config contract for " + argDesc(targetArg) +
+            ": callback signature '" + ref.signatureId +
+            "' declares a void return, but the real callback returns " +
+            (realRet ? realRet->typeName : "void");
+      return false;
+    }
+    if (sig.ret.kind == "scalar") {
+      if (!realRet || realRet->kind != NodeKind::Scalar) {
+        err = "config contract for " + argDesc(targetArg) +
+              ": callback signature '" + ref.signatureId +
+              "' declares a scalar return, but the real callback return "
+              "type (" + (realRet ? realRet->typeName : "void") +
+              ") is not a scalar";
+        return false;
+      }
+      // Same exactness requirement as a scalar PARAMETER above: "some
+      // scalar" would let scalar_type="float64" through against a real
+      // `int` return.
+      std::optional<std::string> realType = classifyScalarAbiType(realRet);
+      if (!realType || *realType != sig.ret.scalarType) {
+        err = "config contract for " + argDesc(targetArg) +
+              ": callback signature '" + ref.signatureId +
+              "' declares a scalar return of scalar_type \"" +
+              sig.ret.scalarType + "\", but the real callback return "
+              "type (" + realRet->typeName + ") " +
+              (realType ? ("lowers to \"" + *realType + "\"")
+                        : "does not lower to a single raw scalar slot");
+        return false;
+      }
+    }
+    if (sig.ret.kind == "function_pointer" &&
+        (!realRet || realRet->kind != NodeKind::Pointer)) {
+      err = "config contract for " + argDesc(targetArg) +
+            ": callback signature '" + ref.signatureId +
+            "' declares a function-pointer return, but the real callback "
+            "return type (" + (realRet ? realRet->typeName : "void") +
+            ") is not a pointer";
+      return false;
+    }
+    return true;
+  };
+
   for (const auto &kv : contract) {
     int p = kv.first;
-    const StrideVectorContract &c = kv.second;
+    const FunctionContractEntry &entry = kv.second;
     if (p < 0 || (size_t)p >= ft.params.size()) {
       err = "config contract for " + argDesc(p) +
             ": no such argument (function has " +
             std::to_string(ft.params.size()) + " parameter(s))";
       return false;
     }
+    if (entry.callback) {
+      if (!checkCallback(p, *entry.callback))
+        return false;
+      continue;
+    }
+    const StrideVectorContract &c = *entry.strideVector;
     if (ft.params[(size_t)p]->kind != NodeKind::Pointer) {
       err = "config contract for " + argDesc(p) +
             ": target is not a pointer argument (actual type: " +
@@ -2940,10 +3161,41 @@ void inferFunction(const Function &F, FunctionTrees &ft,
         ft.warnings.push_back("arg" + std::to_string(p) + ": struct '" +
             pointee->typeName + "' not fully resolvable — force_local");
       }
+    } else if (pointee->kind == NodeKind::Function) {
+      // Function-pointer argument: resolvable only via a reviewed
+      // callback contract, never by analyzing the callback's own body.
+      // validateContractAgainstSignature
+      // has already confirmed, before inferFunction ever runs, that a
+      // present CallbackRef's signature id is registered and ABI-matches
+      // this exact argument's real DWARF signature -- a mismatch aborts
+      // the whole run rather than reaching here.
+      const CallbackRef *cbRef =
+          (contract && contract->count((int)p) && contract->at((int)p).callback)
+              ? &*contract->at((int)p).callback
+              : nullptr;
+      if (cbRef) {
+        const CallbackSignature &sig =
+            config->callbackSignatures.at(cbRef->signatureId);
+        node->isCallback = true;
+        node->callbackSignatureId = cbRef->signatureId;
+        node->callbackLifetime = sig.lifetime;
+        node->callbackNullable = sig.nullable;
+        node->callbackReentryPolicy = sig.reentryPolicy;
+        for (const CallbackParamContract &pc : sig.params)
+          node->callbackParams.push_back(callbackParamFromContract(pc));
+        node->callbackRet = callbackReturnFromContract(sig.ret);
+        node->confidence = Confidence::Configured;
+      } else {
+        ft.forceLocal = true;
+        ft.warnings.push_back(
+            "arg" + std::to_string(p) +
+            ": function-pointer argument with no reviewed callback "
+            "contract — force_local");
+      }
     } else if (pointee->kind == NodeKind::Unknown) {
-      ft.forceLocal = true;                             // pointer to function/etc
+      ft.forceLocal = true;                             // unresolved/truncated type
       ft.warnings.push_back("arg" + std::to_string(p) +
-          ": pointer to function/unresolved type — force_local");
+          ": unresolved pointee type (void*/truncated/cyclic) — force_local");
     } else if (pointee->kind == NodeKind::Pointer &&
                isPtrArrayArg(ft.funcName, p)) {
       // argv/envp: a NULL-terminated array of cstr pointers (IN). Deep-copy each
@@ -3044,14 +3296,22 @@ void inferFunction(const Function &F, FunctionTrees &ft,
             (fromPointee ? ": byte buffer size taken from *arg"
                          : ": byte buffer size paired to arg") +
             std::to_string(sizeArg) + " heuristically");
-      } else if (contract && contract->count((int)p)) {
+      } else if (contract && contract->count((int)p) &&
+                contract->at((int)p).strideVector) {
         // A checked-in config contract (Config.h) asserts this argument's
         // extent -- a human has verified it, presumably because static
         // analysis couldn't (see StrideVectorContract's own comment). This
         // wins over whatever the analyzer below would otherwise conclude,
         // and is recorded as such (Confidence::Configured) so the output
         // JSON always shows which functions were analyzed vs. asserted.
-        const StrideVectorContract &c = contract->at((int)p);
+        // Guarded by `.strideVector` (not just presence of an entry): a
+        // config entry for this argIndex could instead be a CallbackRef
+        // meant for a function-pointer argument -- a mismatch
+        // validateContractAgainstSignature already rejects as a hard
+        // config error (aborting the whole run), but inferFunction must
+        // not crash on it in the meantime; falling through to the
+        // ordinary "could not size" path below is always safe.
+        const StrideVectorContract &c = *contract->at((int)p).strideVector;
         node->sizeKind = SizeKind::StrideVector;
         node->sizeOperand = extentOperandFromContract(c.sizeOperand);
         node->strideOperand = extentOperandFromContract(c.strideOperand);
@@ -3174,8 +3434,9 @@ void inferFunction(const Function &F, FunctionTrees &ft,
       node->dir = Dir::In;
 
     // Direction defaults when not observable here (access in a callee, or via
-    // pointer arithmetic we don't track).
-    if (node->dir == Dir::Unknown && !node->isHandle) {
+    // pointer arithmetic we don't track). A resolved callback carries no
+    // copy-direction of its own (it is invoked, never deep-copied).
+    if (node->dir == Dir::Unknown && !node->isHandle && !node->isCallback) {
       if (node->sizeKind == SizeKind::Cstr) {
         // C strings are read-only inputs by overwhelming convention.
         node->dir = Dir::In;
@@ -3191,9 +3452,10 @@ void inferFunction(const Function &F, FunctionTrees &ft,
       }
     }
 
-    // Any pointer we still couldn't size (and isn't a handle) is non-mappable →
+    // Any pointer we still couldn't size (and isn't a handle or a resolved
+    // callback -- neither carries a sizeKind of its own) is non-mappable →
     // the whole function runs locally (E2 / V4).
-    if (!node->isHandle && node->sizeKind != SizeKind::Const &&
+    if (!node->isHandle && !node->isCallback && node->sizeKind != SizeKind::Const &&
         node->sizeKind != SizeKind::FromArg &&
         node->sizeKind != SizeKind::FromArgPointee &&
         node->sizeKind != SizeKind::Cstr &&

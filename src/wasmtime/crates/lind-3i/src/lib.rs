@@ -82,7 +82,10 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use sysdefs::constants::lind_platform_const;
 use sysdefs::constants::lind_platform_const::*;
 use wasmtime::error::Context as WasmtimeContext;
-use wasmtime::{Engine, Extern, Global, Instance, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{
+    Caller, Engine, Extern, Func, FuncType, Global, Instance, Linker, Module, Ref, Store,
+    TypedFunc, Val, ValType,
+};
 
 type PassFptrTyped = TypedFunc<
     (
@@ -292,6 +295,23 @@ struct GrateWorker<T: 'static> {
     /// Before each call, the worker resets its `__stack_pointer` to this value
     /// so execution starts from a clean stack state within its own slot.
     stack_top: u32,
+
+    /// Indices into this worker's own indirect-function table that
+    /// previously held a callback proxy (see `install_callback_proxies`)
+    /// and have since been cleared back to null. A wasm table can only
+    /// grow, never shrink, so a slot a callback argument no longer needs is
+    /// reclaimed into this list instead of abandoned: the next call that
+    /// needs a proxy reuses one of these indices before growing the table
+    /// again, bounding table growth across repeated calls rather than
+    /// leaking one slot per call forever.
+    callback_proxy_free_slots: Vec<u64>,
+
+    /// Counts how many times `install_callback_proxies` has actually grown
+    /// this worker's table (as opposed to reusing a freed slot), logged at
+    /// each occurrence. A healthy, long-running grate should see this stay
+    /// small and flat under repeated callback-bearing calls; a steadily
+    /// climbing count means slots are leaking rather than being reclaimed.
+    callback_proxy_grow_count: u64,
 }
 
 /// Compute the base address of the stack region assigned to a specific worker.
@@ -766,6 +786,69 @@ impl<'a, T> Drop for ActiveCallGuard<'a, T> {
     }
 }
 
+/// Lowers one `V2ValueType` to Wasmtime's own `ValType` -- the inverse of
+/// `val_type_to_v2_value_type` below. `ValType` has no `PartialEq` (hence
+/// going through `V2ValueType`, which does, for every comparison in this
+/// file), so this direction exists only to build the proxy's actual
+/// `FuncType` once a shape has already been decided.
+fn v2_value_type_to_val_type(ty: threei::V2ValueType) -> ValType {
+    match ty {
+        threei::V2ValueType::I32 => ValType::I32,
+        threei::V2ValueType::I64 => ValType::I64,
+        threei::V2ValueType::F32 => ValType::F32,
+        threei::V2ValueType::F64 => ValType::F64,
+    }
+}
+
+/// Lowers a real, resolved Wasm value type to `V2ValueType`, or `None` if
+/// it's a value type the V2 transport (and so a callback signature, which
+/// reuses its vocabulary) cannot carry at all -- e.g. `v128` or a
+/// reference type. A real target callback using one of these is an
+/// "unsupported Wasm value type" rejection, the same condition
+/// `lib3i_v2_unsupported_signature_reason` in `linker.rs` checks for the
+/// OUTER function's own signature.
+fn val_type_to_v2_value_type(ty: &ValType) -> Option<threei::V2ValueType> {
+    match ty {
+        ValType::I32 => Some(threei::V2ValueType::I32),
+        ValType::I64 => Some(threei::V2ValueType::I64),
+        ValType::F32 => Some(threei::V2ValueType::F32),
+        ValType::F64 => Some(threei::V2ValueType::F64),
+        _ => None,
+    }
+}
+
+/// The declared, lowered `V2ValueType` shape of one callback signature:
+/// its own parameter list and (zero- or one-element) result list, in the
+/// same vocabulary a real resolved function's type is compared against
+/// (`val_type_to_v2_value_type`) -- so "declared shape" and "real shape"
+/// are always compared at the SAME level, never `ValType` (no
+/// `PartialEq`) against `CallbackParamKind`/`CallbackRetKind` directly.
+/// `Pointer`/`FunctionPointer` never reach here: `register_lib_handler_v2`
+/// rejects a callback signature containing either at registration time,
+/// before any `V2Registration` carrying one could exist.
+fn callback_signature_v2_values(
+    sig: &threei::CallbackSignature,
+) -> (Vec<threei::V2ValueType>, Vec<threei::V2ValueType>) {
+    let params = sig
+        .params
+        .iter()
+        .map(|p| match p {
+            threei::CallbackParamKind::Scalar(v) => *v,
+            threei::CallbackParamKind::Pointer => {
+                unreachable!("pointer-bearing callback parameters are rejected at registration")
+            }
+        })
+        .collect();
+    let results = match sig.ret {
+        threei::CallbackRetKind::Void => Vec::new(),
+        threei::CallbackRetKind::Scalar(v) => vec![v],
+        threei::CallbackRetKind::FunctionPointer => {
+            unreachable!("function-pointer-returning callbacks are rejected at registration")
+        }
+    };
+    (params, results)
+}
+
 impl<T: 'static> GrateWorker<T> {
     /// Reset this worker’s stack pointer to the top of its private stack slot.
     ///
@@ -925,6 +1008,238 @@ impl<T: 'static> GrateWorker<T> {
         }
     }
 
+    /// For every `registration.callback_params` entry, the caller's raw
+    /// i32 at that parameter index is a table index into ITS OWN
+    /// indirect-function table (`source_cage`) -- a function pointer the
+    /// caller is passing in -- not an ordinary scalar. Resolve the real
+    /// target `Func` there now -- while `source_cage`'s re-entry frame is
+    /// still active -- checked against the entry's declared
+    /// `CallbackSignature` (a "callback ABI mismatch" rejection if the
+    /// real resolved function's lowered type doesn't match), build a host
+    /// proxy of that exact type that calls back into it, install the
+    /// proxy into THIS worker's own table, and replace the argument with
+    /// the proxy's local index before the adapter ever sees it. `0`
+    /// (wasm's conventional null funcref slot) passes through unchanged
+    /// when the declared signature allows it (`nullable`); when it
+    /// doesn't, `0` is rejected before anything else runs -- a null the
+    /// contract declared impossible is a caller bug, not a value to
+    /// silently tolerate.
+    ///
+    /// Reuses a slot from `callback_proxy_free_slots` where available
+    /// instead of always growing the table, so a long-running cage making
+    /// repeated calls doesn't grow this table without bound (a wasm table
+    /// can grow but never shrink). Returns the possibly-replaced arguments
+    /// together with every table index this call newly occupied (reused or
+    /// grown) -- the caller is responsible for reclaiming them via
+    /// `release_callback_proxies` once the call this proxy was installed
+    /// for has finished, regardless of outcome.
+    ///
+    /// Returns `Err` (never a fabricated callback or a silent local call)
+    /// if `source_cage` has no active frame, the index is out of bounds,
+    /// the table slot isn't a function, the real function's type doesn't
+    /// match the declared signature, or table growth fails -- having
+    /// already released back to the free list any proxy THIS call
+    /// installed before the failure, so a later callback parameter's
+    /// failure never leaks an earlier one's slot.
+    fn install_callback_proxies(
+        &mut self,
+        source_cage: u64,
+        callback_params: &[threei::CallbackArgContract],
+        args: &[Val],
+    ) -> Result<(Vec<Val>, Vec<u64>), String> {
+        let mut args = args.to_vec();
+        let mut installed = Vec::new();
+        for contract in callback_params {
+            let idx = contract.arg_index as usize;
+            let Some(&Val::I32(raw_index)) = args.get(idx) else {
+                self.release_callback_proxies(&installed);
+                return Err(format!(
+                    "callback parameter {idx} is not present or not an I32 table index"
+                ));
+            };
+            if raw_index == 0 {
+                if !contract.signature.nullable {
+                    self.release_callback_proxies(&installed);
+                    return Err(format!(
+                        "callback parameter {idx} is null, but its declared signature is \
+                         not nullable"
+                    ));
+                }
+                continue;
+            }
+
+            let (expected_params, expected_results) =
+                callback_signature_v2_values(&contract.signature);
+
+            let target =
+                match wasmtime::with_active_frame::<T, _>(source_cage, |mut store_a, table_a| {
+                    let f = match table_a.get(&mut store_a, raw_index as u64) {
+                        Some(Ref::Func(Some(f))) => f,
+                        Some(Ref::Func(None)) => {
+                            return Err(
+                                "callback table slot is null in the source cage".to_string()
+                            );
+                        }
+                        Some(_) => {
+                            return Err("callback table slot is not a funcref".to_string());
+                        }
+                        None => {
+                            return Err(
+                                "callback table index out of bounds in source cage".to_string()
+                            );
+                        }
+                    };
+                    let real_ty = f.ty(&store_a);
+                    let Some(real_params) = real_ty
+                        .params()
+                        .map(|t| val_type_to_v2_value_type(&t))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err(
+                            "callback's real resolved type uses an unsupported Wasm value type"
+                                .to_string(),
+                        );
+                    };
+                    let Some(real_results) = real_ty
+                        .results()
+                        .map(|t| val_type_to_v2_value_type(&t))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return Err(
+                            "callback's real resolved type uses an unsupported Wasm value type"
+                                .to_string(),
+                        );
+                    };
+                    if real_params != expected_params || real_results != expected_results {
+                        return Err(format!(
+                            "callback ABI mismatch: declared signature params={expected_params:?} \
+                             results={expected_results:?}, but the real callback's resolved type \
+                             is params={real_params:?} results={real_results:?}"
+                        ));
+                    }
+                    Ok(f)
+                }) {
+                    Some(resolved) => match resolved {
+                        Ok(f) => f,
+                        Err(reason) => {
+                            self.release_callback_proxies(&installed);
+                            return Err(reason);
+                        }
+                    },
+                    None => {
+                        self.release_callback_proxies(&installed);
+                        return Err(format!(
+                            "no active re-entry frame for source cage {source_cage}"
+                        ));
+                    }
+                };
+
+            let proxy_param_types: Vec<ValType> = expected_params
+                .iter()
+                .map(|v| v2_value_type_to_val_type(*v))
+                .collect();
+            let proxy_result_types: Vec<ValType> = expected_results
+                .iter()
+                .map(|v| v2_value_type_to_val_type(*v))
+                .collect();
+            let proxy_ty =
+                FuncType::new(self.store.engine(), proxy_param_types, proxy_result_types);
+            let proxy = Func::new(
+                &mut self.store,
+                proxy_ty,
+                move |_caller: Caller<'_, T>, params, results| match wasmtime::with_active_frame::<
+                    T,
+                    _,
+                >(
+                    source_cage,
+                    |store_a, _table_a| target.call(store_a, params, results),
+                ) {
+                    Some(inner) => inner,
+                    None => Err(wasmtime::Error::msg(format!(
+                        "callback proxy: no active re-entry frame for cage {source_cage}"
+                    ))),
+                },
+            );
+
+            let Some(Extern::Table(dest_table)) = self
+                .instance
+                .get_export(&mut self.store, "__indirect_function_table")
+            else {
+                self.release_callback_proxies(&installed);
+                return Err(
+                    "this grate's module does not export __indirect_function_table".to_string(),
+                );
+            };
+            let index = match self.callback_proxy_free_slots.pop() {
+                Some(reused) => reused,
+                None => match dest_table.grow(&mut self.store, 1, Ref::Func(None)) {
+                    Ok(grown) => {
+                        self.callback_proxy_grow_count += 1;
+                        eprintln!(
+                            "[lind-3i] callback proxy table growth event #{}",
+                            self.callback_proxy_grow_count
+                        );
+                        grown
+                    }
+                    Err(e) => {
+                        self.release_callback_proxies(&installed);
+                        return Err(format!("callback proxy table growth failed: {e:#}"));
+                    }
+                },
+            };
+            if let Err(e) = dest_table.set(&mut self.store, index, Ref::Func(Some(proxy))) {
+                self.callback_proxy_free_slots.push(index);
+                self.release_callback_proxies(&installed);
+                return Err(format!("callback proxy table install failed: {e:#}"));
+            }
+
+            installed.push(index);
+            args[idx] = Val::I32(index as i32);
+        }
+        Ok((args, installed))
+    }
+
+    /// Clears every listed table index back to a null funcref and returns
+    /// it to `callback_proxy_free_slots` for reuse. Called once a call
+    /// `install_callback_proxies` installed proxies for has finished,
+    /// regardless of whether it succeeded, was rejected, or trapped --
+    /// cleanup must not depend on the call's outcome, only on whether a
+    /// proxy was installed for it.
+    ///
+    /// A slot is returned to the free list ONLY after it is confirmed
+    /// cleared. An index is never recycled on a failed clear: the slot
+    /// would still hold a proxy scoped to a call that has already
+    /// returned, and `install_callback_proxies`'s own `Table::set` would
+    /// overwrite it on reuse in the ordinary case, but there is no such
+    /// guarantee against this SAME index being reached directly by an
+    /// unrelated `call_indirect` in the meantime -- that would let a
+    /// `during_call`-scoped callback stay callable after its call ended.
+    /// Failing to clear a slot this code itself just finished using is not
+    /// a recoverable error to work around; it means something about this
+    /// worker's table is no longer behaving as this code assumes, so it
+    /// panics rather than silently keep serving calls against it.
+    fn release_callback_proxies(&mut self, indices: &[u64]) {
+        if indices.is_empty() {
+            return;
+        }
+        let Some(Extern::Table(dest_table)) = self
+            .instance
+            .get_export(&mut self.store, "__indirect_function_table")
+        else {
+            panic!(
+                "callback proxy cleanup: this grate's module no longer exports \
+                 __indirect_function_table, with {} proxy slot(s) still to reclaim",
+                indices.len()
+            );
+        };
+        for &idx in indices {
+            if let Err(e) = dest_table.set(&mut self.store, idx, Ref::Func(None)) {
+                panic!("callback proxy cleanup: failed to clear table slot {idx}: {e:#}");
+            }
+            self.callback_proxy_free_slots.push(idx);
+        }
+    }
+
     /// Run one V2 (variable-width) grate request inside this worker: resolve
     /// (and cache) the registered adapter export, then call it with dynamic
     /// argument/result vectors -- no process-global mutable argument buffer,
@@ -940,29 +1255,53 @@ impl<T: 'static> GrateWorker<T> {
         self.reset_worker_stack();
         self.seed_errno_before_call();
 
-        let adapter =
+        // Resolved before the adapter lookup below: both mutably borrow
+        // `self` (the proxy installer through `self.store`/`self.instance`,
+        // the cache lookup through `self.v2_adapter_cache`), and the
+        // adapter lookup's result stays borrowed from `self` for the rest
+        // of this function, so the two calls cannot be interleaved.
+        let mut installed_proxies: Vec<u64> = Vec::new();
+        let args_owned;
+        let args = if registration.callback_params.is_empty() {
+            args
+        } else {
+            match self.install_callback_proxies(source_cage, &registration.callback_params, args) {
+                Ok((replaced, installed)) => {
+                    installed_proxies = installed;
+                    args_owned = replaced;
+                    &args_owned
+                }
+                Err(reason) => return v2_adapter::V2CallOutcome::Rejected(reason),
+            }
+        };
+
+        let outcome =
             match self
                 .v2_adapter_cache
                 .resolve(&mut self.store, &self.instance, registration)
             {
-                Ok(a) => a,
-                Err(rejection) => {
-                    return v2_adapter::V2CallOutcome::Rejected(rejection.to_string());
-                }
+                Ok(adapter) => match v2_adapter::call_v2_adapter(
+                    &mut self.store,
+                    adapter,
+                    source_cage,
+                    registration.grate_cage,
+                    args,
+                ) {
+                    Ok(results) => v2_adapter::V2CallOutcome::Ok(results),
+                    Err(e) => v2_adapter::V2CallOutcome::Trapped(format!(
+                        "V2 adapter trapped in worker {}: {e:#}",
+                        self.worker_id
+                    )),
+                },
+                Err(rejection) => v2_adapter::V2CallOutcome::Rejected(rejection.to_string()),
             };
-        let outcome = match v2_adapter::call_v2_adapter(
-            &mut self.store,
-            adapter,
-            source_cage,
-            registration.grate_cage,
-            args,
-        ) {
-            Ok(results) => v2_adapter::V2CallOutcome::Ok(results),
-            Err(e) => v2_adapter::V2CallOutcome::Trapped(format!(
-                "V2 adapter trapped in worker {}: {e:#}",
-                self.worker_id
-            )),
-        };
+
+        // Every installed proxy is `during_call`-scoped (there is no
+        // retained-callback lifetime yet): reclaimed here unconditionally,
+        // regardless of whether the call above succeeded, was rejected, or
+        // trapped, so a repeated callback-bearing call never leaks a table
+        // slot.
+        self.release_callback_proxies(&installed_proxies);
 
         self.relay_errno_after_call();
 
@@ -1051,6 +1390,8 @@ where
         memory,
         stack_base,
         stack_top,
+        callback_proxy_free_slots: Vec::new(),
+        callback_proxy_grow_count: 0,
     })
 }
 

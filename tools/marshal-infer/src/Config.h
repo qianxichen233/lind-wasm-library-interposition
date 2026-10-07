@@ -19,7 +19,9 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace marshal {
 
@@ -50,13 +52,94 @@ struct StrideVectorContract {
                     // contract).
 };
 
+// One declared parameter of a reviewed callback signature, in the SAME
+// marshalling vocabulary an ordinary function parameter uses -- but
+// describing the CALLBACK's own parameter, never the host function's.
+// kind=="ptr" MUST carry a complete dir+size_kind classification; there
+// is no partial/placeholder pointer entry here. An incomplete pointer
+// classification is rejected outright, not downgraded to a residue,
+// because nothing analyzes a callback's own body to recover what a
+// human left out.
+struct CallbackParamContract {
+  std::string kind;      // "scalar" | "ptr"
+  std::string dir;       // "in" | "out" | "inout" -- required for kind=="ptr"
+  std::string sizeKind;  // "const" | "from_arg" | "cstr" | "stride_vector"
+                         // -- required for kind=="ptr"
+  uint64_t constSize = 0;              // sizeKind=="const": byte count
+  int sizeArgIndex = -1;               // sizeKind=="from_arg": index into
+                                       // THIS callback's OWN param list,
+                                       // never the host function's
+  ContractExtentOperand sizeOperand;   // sizeKind=="stride_vector"
+  ContractExtentOperand strideOperand; // sizeKind=="stride_vector"
+  uint64_t strideElemSize = 0;         // sizeKind=="stride_vector": per-element bytes
+  // "int32" | "int64" | "float32" | "float64" -- required for kind=="scalar",
+  // forbidden for kind=="ptr" (a pointer always lowers to a flat i32
+  // address on this target, with no such ambiguity). The runtime
+  // descriptor needs the EXACT raw wasm value-type slot a scalar
+  // parameter occupies, not merely "it's a scalar" -- validated against
+  // the callback's real DWARF parameter type (Infer.cpp's
+  // classifyScalarAbiType) before being trusted, the same way every
+  // other contract field here is.
+  std::string scalarType;
+};
+
+// A callback's own return value. "function_pointer" (a callback that
+// itself returns a callback) is represented here so the schema does not
+// need to change shape once that case is supported, but nothing consumes
+// it yet.
+struct CallbackReturnContract {
+  std::string kind;        // "void" | "scalar" | "function_pointer"
+  std::string scalarType;  // "int32" | "int64" | "float32" | "float64" --
+                           // required for kind=="scalar"
+};
+
+// One versioned, named callback signature. Defined ONCE in a config's
+// top-level "callback_signatures" registry (Config::callbackSignatures)
+// and referenced BY ID from a per-argument contract (CallbackRef below),
+// so "unknown callback signature id" is a real, checkable condition and
+// a signature shared across many call sites (e.g. every OpenBLAS
+// function taking an xerbla-shaped error handler) is described exactly
+// once, not repeated per call site.
+struct CallbackSignature {
+  std::vector<CallbackParamContract> params;
+  CallbackReturnContract ret;
+  std::string lifetime;       // "during_call" | "retained"
+  bool nullable = false;
+  // Closed vocabulary: "same_thread_only" is the only value this build
+  // accepts, matching the runtime's own ReentryPolicy enum
+  // (threei::lib_handler_table_v2) -- a free-form string here could let
+  // this tool emit "decision":"marshal" for a contract the runtime
+  // consumer rejects outright at registration time.
+  std::string reentryPolicy;
+};
+
+// A per-argument reference to a registered callback signature -- the
+// callback-world analog of StrideVectorContract for an ordinary pointer
+// argument. The referenced id is resolved and ABI-validated against the
+// real function-pointer argument's own DWARF signature by Infer.cpp's
+// validateCallbackContractAgainstSignature, never trusted unchecked.
+struct CallbackRef {
+  std::string signatureId;
+};
+
+// One argument's contract entry is EITHER a StrideVector size assertion
+// for an ordinary pointer, OR a callback-signature reference for a
+// function-pointer argument -- never both; an argument is structurally
+// one or the other. Exactly one of these is populated, enforced by
+// Config.cpp's parser (which shape it parses is decided by which
+// discriminating keys are present), not by this struct itself.
+struct FunctionContractEntry {
+  std::optional<StrideVectorContract> strideVector;
+  std::optional<CallbackRef> callback;
+};
+
 // Keyed by argIndex: a DWARF/source-parameter position, the same you'd get
 // counting the C function's own declared parameters left-to-right -- NOT
 // necessarily the final JSON output's "args" array position, which shifts
 // when the function has a hidden sret argument or a multi-slot (fp128)
 // parameter ahead of it (see ParamTree.h's TreeNode::abiSlots /
 // FunctionTrees::retSretArg for why).
-using FunctionContract = std::map<int, StrideVectorContract>;
+using FunctionContract = std::map<int, FunctionContractEntry>;
 
 // Fails the whole marshal-infer run (nonzero exit, no JSON written) when
 // this library's MARSHAL rate drops below an expected floor -- the concrete
@@ -83,6 +166,9 @@ struct Config {
   // fulfill must fail loudly, not be quietly downgraded).
   unsigned maxDelegationHops = 1;
   std::map<std::string, FunctionContract> contracts; // exported symbol -> contract
+  // Named callback signatures, defined once and referenced by id from a
+  // CallbackRef in `contracts` -- see CallbackSignature's own comment.
+  std::map<std::string, CallbackSignature> callbackSignatures;
   CoveragePolicy coverage;
 };
 

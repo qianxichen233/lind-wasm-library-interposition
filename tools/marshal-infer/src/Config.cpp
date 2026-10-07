@@ -190,6 +190,242 @@ bool parseStrideVectorContract(const json::Object &obj, const std::string &conte
   return true;
 }
 
+// Argument indices inside a callback signature refer to the CALLBACK's
+// own parameter list (bounded by kMaxArgIndex the same way an ordinary
+// argIndex is -- this loader validates the VALUE's range here; whether it
+// actually names an existing callback parameter is checked later, once
+// the whole params array is known, by the caller).
+bool parseCallbackParamContract(const json::Object &obj, const std::string &context,
+                                CallbackParamContract &out, std::string &err) {
+  if (!checkKeys(obj,
+                 {"kind", "dir", "size_kind", "const_size", "size_arg_index",
+                  "size_operand", "stride_operand", "stride_elem_size",
+                  "scalar_type"},
+                 context, err))
+    return false;
+  std::optional<StringRef> kind;
+  if (!requireStr(obj, "kind", context, kind, err))
+    return false;
+  if (!kind || (*kind != "scalar" && *kind != "ptr")) {
+    err = context + ".kind: must be \"scalar\" or \"ptr\"";
+    return false;
+  }
+  out.kind = kind->str();
+  if (*kind == "scalar") {
+    // A scalar callback parameter carries no dir/size_kind -- the same
+    // "no extent fields for a non-pointer" rule an ordinary scalar
+    // argument follows. Presence of any pointer-only key here means the
+    // config disagrees with itself about this parameter's own kind.
+    for (const char *forbidden :
+        {"dir", "size_kind", "const_size", "size_arg_index", "size_operand",
+         "stride_operand", "stride_elem_size"}) {
+      if (obj.get(forbidden)) {
+        err = context + ": kind=\"scalar\" must not carry '" +
+              std::string(forbidden) + "'";
+        return false;
+      }
+    }
+    // scalar_type is REQUIRED (not merely allowed) for a scalar callback
+    // parameter -- "some scalar" is not enough for the runtime descriptor
+    // to generate a correct call; it needs the exact raw wasm value-type
+    // slot (i32/i64/f32/f64), the same vocabulary CallbackReturnContract
+    // already uses for a callback's own return.
+    std::optional<StringRef> st;
+    if (!requireStr(obj, "scalar_type", context, st, err))
+      return false;
+    if (!st || (*st != "int32" && *st != "int64" && *st != "float32" && *st != "float64")) {
+      err = context +
+            ".scalar_type: must be \"int32\", \"int64\", \"float32\", or "
+            "\"float64\" (required for kind=\"scalar\")";
+      return false;
+    }
+    out.scalarType = st->str();
+    return true;
+  }
+  // kind == "ptr": dir and size_kind are BOTH required -- an incomplete
+  // pointer classification is rejected at load time, rather than left
+  // for a downstream consumer to notice is missing.
+  // scalar_type is meaningless here (a pointer always lowers to a flat
+  // i32 address) and is rejected rather than silently ignored.
+  if (obj.get("scalar_type")) {
+    err = context + ": kind=\"ptr\" must not carry 'scalar_type'";
+    return false;
+  }
+  std::optional<StringRef> dir;
+  if (!requireStr(obj, "dir", context, dir, err))
+    return false;
+  if (!dir || (*dir != "in" && *dir != "out" && *dir != "inout")) {
+    err = context + ".dir: must be \"in\", \"out\", or \"inout\" (required for kind=\"ptr\")";
+    return false;
+  }
+  out.dir = dir->str();
+  std::optional<StringRef> sizeKind;
+  if (!requireStr(obj, "size_kind", context, sizeKind, err))
+    return false;
+  if (!sizeKind || (*sizeKind != "const" && *sizeKind != "from_arg" &&
+                    *sizeKind != "cstr" && *sizeKind != "stride_vector")) {
+    err = context +
+          ".size_kind: must be \"const\", \"from_arg\", \"cstr\", or "
+          "\"stride_vector\" (required for kind=\"ptr\")";
+    return false;
+  }
+  out.sizeKind = sizeKind->str();
+  if (*sizeKind == "const") {
+    std::optional<int64_t> cs;
+    if (!requireInt(obj, "const_size", context, cs, err))
+      return false;
+    if (!cs || *cs <= 0 || *cs > (int64_t)UINT32_MAX) {
+      err = context + ".const_size: must be a positive integer (<= " +
+            std::to_string(UINT32_MAX) + ") (required for size_kind=\"const\")";
+      return false;
+    }
+    out.constSize = (uint64_t)*cs;
+  } else if (*sizeKind == "from_arg") {
+    std::optional<int64_t> idx;
+    if (!requireInt(obj, "size_arg_index", context, idx, err))
+      return false;
+    if (!idx || *idx < 0 || *idx > kMaxArgIndex) {
+      err = context + ".size_arg_index: must be between 0 and " +
+            std::to_string(kMaxArgIndex) + " (required for size_kind=\"from_arg\")";
+      return false;
+    }
+    out.sizeArgIndex = (int)*idx;
+  } else if (*sizeKind == "stride_vector") {
+    if (!parseExtentOperand(obj, "size_operand", out.sizeOperand, context, err))
+      return false;
+    if (!parseExtentOperand(obj, "stride_operand", out.strideOperand, context, err))
+      return false;
+    std::optional<int64_t> es;
+    if (!requireInt(obj, "stride_elem_size", context, es, err))
+      return false;
+    if (!es || *es <= 0 || *es > (int64_t)UINT32_MAX) {
+      err = context + ".stride_elem_size: must be a positive integer (<= " +
+            std::to_string(UINT32_MAX) + ") (required for size_kind=\"stride_vector\")";
+      return false;
+    }
+    out.strideElemSize = (uint64_t)*es;
+  }
+  // size_kind=="cstr" needs no further fields.
+  return true;
+}
+
+bool parseCallbackReturnContract(const json::Object &obj, const std::string &context,
+                                 CallbackReturnContract &out, std::string &err) {
+  if (!checkKeys(obj, {"kind", "scalar_type"}, context, err))
+    return false;
+  std::optional<StringRef> kind;
+  if (!requireStr(obj, "kind", context, kind, err))
+    return false;
+  if (!kind || (*kind != "void" && *kind != "scalar" && *kind != "function_pointer")) {
+    err = context + ".kind: must be \"void\", \"scalar\", or \"function_pointer\"";
+    return false;
+  }
+  out.kind = kind->str();
+  if (*kind == "scalar") {
+    std::optional<StringRef> st;
+    if (!requireStr(obj, "scalar_type", context, st, err))
+      return false;
+    if (!st || (*st != "int32" && *st != "int64" && *st != "float32" && *st != "float64")) {
+      err = context +
+            ".scalar_type: must be \"int32\", \"int64\", \"float32\", or "
+            "\"float64\" (required for kind=\"scalar\")";
+      return false;
+    }
+    out.scalarType = st->str();
+  } else if (obj.get("scalar_type")) {
+    err = context + ": kind=\"" + kind->str() + "\" must not carry 'scalar_type'";
+    return false;
+  }
+  return true;
+}
+
+bool parseCallbackSignature(const json::Object &obj, const std::string &context,
+                            CallbackSignature &out, std::string &err) {
+  if (!checkKeys(obj, {"params", "ret", "lifetime", "nullable", "reentry_policy"},
+                 context, err))
+    return false;
+  const json::Value *paramsV = obj.get("params");
+  if (!paramsV) {
+    err = context + ": missing 'params'";
+    return false;
+  }
+  const json::Array *paramsArr = paramsV->getAsArray();
+  if (!paramsArr) {
+    err = context + ".params: must be an array";
+    return false;
+  }
+  for (size_t i = 0; i < paramsArr->size(); ++i) {
+    const json::Object *po = (*paramsArr)[i].getAsObject();
+    if (!po) {
+      err = context + ".params[" + std::to_string(i) + "]: must be an object";
+      return false;
+    }
+    CallbackParamContract pc;
+    if (!parseCallbackParamContract(*po, context + ".params[" + std::to_string(i) + "]",
+                                    pc, err))
+      return false;
+    out.params.push_back(std::move(pc));
+  }
+  // A from_arg size_arg_index must name an EXISTING callback parameter --
+  // checkable now that the full params array is known, unlike an ordinary
+  // function's FromArg (validated separately, against the real DWARF
+  // signature, once applied to a specific call site).
+  for (size_t i = 0; i < out.params.size(); ++i) {
+    if (out.params[i].sizeKind == "from_arg" &&
+        (out.params[i].sizeArgIndex < 0 ||
+         (size_t)out.params[i].sizeArgIndex >= out.params.size())) {
+      err = context + ".params[" + std::to_string(i) +
+            "].size_arg_index: " + std::to_string(out.params[i].sizeArgIndex) +
+            " does not name an existing callback parameter (callback has " +
+            std::to_string(out.params.size()) + " parameter(s))";
+      return false;
+    }
+  }
+  const json::Object *retObj = nullptr;
+  if (!requireObj(obj, "ret", context, retObj, err))
+    return false;
+  if (!retObj) {
+    err = context + ": missing 'ret'";
+    return false;
+  }
+  if (!parseCallbackReturnContract(*retObj, context + ".ret", out.ret, err))
+    return false;
+  std::optional<StringRef> lifetime;
+  if (!requireStr(obj, "lifetime", context, lifetime, err))
+    return false;
+  if (!lifetime || (*lifetime != "during_call" && *lifetime != "retained")) {
+    err = context + ".lifetime: must be \"during_call\" or \"retained\"";
+    return false;
+  }
+  out.lifetime = lifetime->str();
+  std::optional<bool> nullable;
+  if (!requireBool(obj, "nullable", context, nullable, err))
+    return false;
+  if (!nullable) {
+    err = context + ": missing boolean 'nullable'";
+    return false;
+  }
+  out.nullable = *nullable;
+  // Closed vocabulary, not a free-form string: the runtime's own
+  // ReentryPolicy enum (threei::lib_handler_table_v2) implements exactly
+  // one variant today, SameThreadOnly. Accepting any other value here
+  // (an empty string, a plausible-looking but unimplemented name like
+  // "any_thread", or a typo) would let this tool emit
+  // "decision":"marshal" for a callback contract the runtime consumer
+  // rejects outright at registration time -- the same class of bug as
+  // accepting max_delegation_hops=2 when only 0/1 are implemented.
+  std::optional<StringRef> reentry;
+  if (!requireStr(obj, "reentry_policy", context, reentry, err))
+    return false;
+  if (!reentry || *reentry != "same_thread_only") {
+    err = context + ".reentry_policy: must be \"same_thread_only\" (the "
+          "only reentry policy this runtime implements)";
+    return false;
+  }
+  out.reentryPolicy = reentry->str();
+  return true;
+}
+
 } // namespace
 
 bool loadConfig(const std::string &path, Config &out, std::string &err) {
@@ -217,7 +453,7 @@ bool loadConfig(const std::string &path, Config &out, std::string &err) {
   }
   if (!checkKeys(*root,
                  {"config_version", "profile_name", "analysis", "coverage",
-                  "contracts"},
+                  "callback_signatures", "contracts"},
                  path, err))
     return false;
 
@@ -320,6 +556,25 @@ bool loadConfig(const std::string &path, Config &out, std::string &err) {
     }
   }
 
+  const json::Object *cs = nullptr;
+  if (!requireObj(*root, "callback_signatures", path, cs, err))
+    return false;
+  if (cs) {
+    for (auto &skv : *cs) {
+      std::string sigId = StringRef(skv.first).str();
+      const json::Object *sobj = skv.second.getAsObject();
+      if (!sobj) {
+        err = path + ".callback_signatures." + sigId + ": must be an object";
+        return false;
+      }
+      CallbackSignature sig;
+      if (!parseCallbackSignature(*sobj, path + ".callback_signatures." + sigId,
+                                  sig, err))
+        return false;
+      cfg.callbackSignatures[sigId] = std::move(sig);
+    }
+  }
+
   const json::Object *co = nullptr;
   if (!requireObj(*root, "contracts", path, co, err))
     return false;
@@ -350,11 +605,40 @@ bool loadConfig(const std::string &path, Config &out, std::string &err) {
                 ": must be an object";
           return false;
         }
-        StrideVectorContract sv;
         std::string ctx = path + ".contracts." + fname + "." + argKey;
-        if (!parseStrideVectorContract(*aobj, ctx, sv, err))
-          return false;
-        fc[(int)argIdx] = sv;
+        FunctionContractEntry entry;
+        // Discriminated by which shape's keys are present: a callback
+        // reference names "callback_signature" and nothing else; every
+        // other shape is the existing StrideVector contract. Checked
+        // BEFORE the StrideVector parse so a typo'd StrideVector field
+        // alongside "callback_signature" is caught as an unknown key by
+        // checkKeys below, not silently absorbed by the wrong parser.
+        if (aobj->get("callback_signature")) {
+          if (!checkKeys(*aobj, {"callback_signature"}, ctx, err))
+            return false;
+          std::optional<StringRef> sigId;
+          if (!requireStr(*aobj, "callback_signature", ctx, sigId, err))
+            return false;
+          if (!sigId || sigId->empty()) {
+            err = ctx + ".callback_signature: must be a non-empty string";
+            return false;
+          }
+          // "unknown callback signature id" is checked right here
+          // against the registry parsed just above, rather than left
+          // for a downstream consumer to discover a dangling reference.
+          if (!cfg.callbackSignatures.count(sigId->str())) {
+            err = ctx + ".callback_signature: unknown callback signature id '" +
+                  sigId->str() + "' (not defined in callback_signatures)";
+            return false;
+          }
+          entry.callback = CallbackRef{sigId->str()};
+        } else {
+          StrideVectorContract sv;
+          if (!parseStrideVectorContract(*aobj, ctx, sv, err))
+            return false;
+          entry.strideVector = std::move(sv);
+        }
+        fc[(int)argIdx] = std::move(entry);
       }
       cfg.contracts[fname] = std::move(fc);
     }

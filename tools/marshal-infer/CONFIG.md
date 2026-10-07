@@ -160,6 +160,168 @@ against OpenBLAS's real binary once `infer_openblas.sh` analyzes it at
 the mechanism remains available for the library's still-unresolved cases
 (see "Why `contracts` exists" below).
 
+## Callback contracts (function-pointer arguments)
+
+A function-pointer argument (a callback) has no body to analyze
+the way an ordinary pointer's extent can be — nothing here attempts to
+read what the callback itself does. It is resolvable only via a
+**reviewed callback contract**, in the same spirit as a `contracts`
+StrideVector entry: a human asserts the callback's shape, and it is
+checked against the real DWARF signature before it is ever applied. A
+function-pointer argument with no matching contract force_locals the
+whole function, with a warning naming the argument — the same
+fail-closed default an ordinary unresolved pointer gets.
+
+A callback's shape is declared ONCE in the top-level `callback_signatures`
+registry, keyed by an arbitrary id, and referenced BY ID from a
+`contracts` entry — so a signature shared across many call sites (e.g.
+every OpenBLAS function taking an XERBLA-shaped error handler) is written
+once, not repeated per call site, and "unknown callback signature id" is
+a real, checkable load-time error.
+
+```jsonc
+{
+  "config_version": 1,
+
+  "callback_signatures": {
+    "xerbla_handler": {
+      // One entry per parameter of the CALLBACK's own signature, in the
+      // same per-argument vocabulary an ordinary function parameter
+      // uses. "ptr" REQUIRES both "dir" and "size_kind" -- there is no
+      // partial/placeholder pointer entry; an incomplete pointer
+      // classification is rejected outright, not downgraded to a residue.
+      "params": [
+        { "kind": "ptr", "dir": "in", "size_kind": "from_arg",
+          "size_arg_index": 2 },   // index into THIS signature's OWN
+                                    // params, never the host function's
+        { "kind": "ptr", "dir": "inout", "size_kind": "const",
+          "const_size": 4 },
+        { "kind": "scalar", "scalar_type": "int32" } // REQUIRED for
+                                    // kind=="scalar" (forbidden for
+                                    // kind=="ptr", which always lowers
+                                    // to a flat i32 address): the EXACT
+                                    // raw wasm value-type slot, since
+                                    // "some scalar" is not enough for the
+                                    // runtime descriptor to generate a
+                                    // correct call -- an int and a
+                                    // double both say "scalar" but need
+                                    // completely different lowering.
+      ],
+      // Same vocabulary as "size_kind" above: "const" (+ const_size),
+      // "from_arg" (+ size_arg_index), "cstr", or "stride_vector"
+      // (+ size_operand/stride_operand/stride_elem_size, same shape as
+      // an ordinary StrideVector contract's operands).
+      "ret": { "kind": "void" },   // "void" | "scalar" (+ scalar_type:
+                                    // "int32"|"int64"|"float32"|"float64")
+                                    // | "function_pointer" (a callback
+                                    // that itself returns a callback;
+                                    // accepted by the schema so it
+                                    // doesn't change shape once that
+                                    // case is supported, not consumed
+                                    // by anything yet)
+      "lifetime": "retained",      // "during_call" | "retained" --
+                                    // recorded for the runtime side, not
+                                    // interpreted by this loader
+      "nullable": true,
+      "reentry_policy": "same_thread_only" // CLOSED vocabulary -- the
+                                    // only value this build accepts,
+                                    // matching the runtime's own
+                                    // ReentryPolicy enum
+                                    // (threei::lib_handler_table_v2).
+                                    // Any other string (including empty)
+                                    // is a hard config-load error: it
+                                    // would otherwise let this tool emit
+                                    // "decision":"marshal" for a contract
+                                    // the runtime consumer rejects
+                                    // outright at registration time.
+    }
+  },
+
+  "contracts": {
+    "cblas_xerbla": {
+      "0": { "callback_signature": "xerbla_handler" }
+    }
+  }
+}
+```
+
+A `contracts` entry is discriminated by shape: `{"callback_signature": "..."}`
+and nothing else names a callback reference; the ordinary
+`size_operand`/`stride_operand`/`const_size`/`dir` shape names a
+StrideVector contract instead (see the schema above). An argument is
+structurally one or the other, never both.
+
+### Callback validation, at two different times
+
+Exactly like an ordinary StrideVector contract, a callback contract is
+checked twice:
+
+- **At config-load time** (`loadConfig`, no bitcode read yet): every
+  field in `callback_signatures` against its own closed schema (a `"ptr"`
+  parameter has both `dir` and `size_kind`, and no `scalar_type`; a
+  `"scalar"` parameter has `scalar_type` and no pointer-only field; a
+  `from_arg`'s `size_arg_index` names an existing parameter WITHIN THE
+  SAME SIGNATURE; `reentry_policy` is exactly `"same_thread_only"` — the
+  only value the runtime's `ReentryPolicy` enum implements today; any
+  other string, including empty, is rejected the same as a malformed
+  field, not accepted as a free-form label) — and a `contracts`
+  entry's `callback_signature` id is registered in `callback_signatures`.
+  An unregistered id is rejected here as "unknown callback signature id",
+  never deferred to the point of use.
+- **Once the target function's real, lowered signature is known**
+  (`validateContractAgainstSignature` in Infer.cpp, called from
+  `buildRecord` in main.cpp, same as the StrideVector path): the target
+  argument must actually BE a function pointer (a `Pointer` node whose
+  child is `NodeKind::Function`, ParamTree.h); the signature's declared
+  parameter count and each parameter's `"scalar"`/`"ptr"` kind must match
+  the callback's REAL DWARF parameter list; a declared `"scalar"`
+  parameter's `scalar_type` must additionally match the EXACT raw wasm
+  value-type the real parameter lowers to (`classifyScalarAbiType` in
+  Infer.cpp: `float`→`float32`, `double`→`float64`, else by width —
+  ≤4 bytes→`int32`, 8 bytes→`int64`; `long double`/fp128 classifies as
+  nothing, since it splits into two raw slots and can never match a
+  single `scalar_type`); the declared return shape
+  (`"void"`/`"scalar"`/`"function_pointer"`) must match the real return
+  type, with the same exact-`scalar_type` check for a declared `"scalar"`
+  return. Any mismatch is "callback ABI mismatch" — a hard configuration
+  error, exactly like an out-of-range StrideVector operand: a signature
+  that no longer matches the real callback would otherwise be baked into
+  the emitted JSON as if it had been verified against this function,
+  when it was verified against a different (or no longer existing) shape.
+  "Some scalar" is deliberately not accepted as a proxy for "the right
+  scalar" here — a contract declaring `scalar_type: "float64"` against a
+  real `int` parameter is a real, checkable ABI mismatch, not a detail
+  the runtime could safely discover for itself at dispatch time.
+
+A resolved callback argument is emitted in the output JSON as its own
+canonical kind (`"kind":"callback"`), carrying `signature_id`/
+`lifetime`/`nullable`/`reentry_policy` and the resolved per-parameter and
+return classification inline — not recursed into via `"pointee"` the way
+an ordinary pointer's pointee is, since what the runtime needs to invoke
+it is the reviewed contract, not a DWARF-driven child tree.
+
+### Nested function pointers are never resolvable, and never copied
+
+`callback_signatures`/`contracts` resolve a function pointer ONLY at the
+top level of a function's own parameter list — there is no mechanism to
+attach a reviewed contract to a function pointer reached through a
+struct field (a vtable-shaped `struct { void (*cb)(int); ... }`
+argument) or any other nesting. Such a field is always residue: the
+struct it's part of force_locals the whole function, with a warning
+naming the field, exactly the same fail-closed outcome an unresolved
+struct field of any other kind gets. It is NEVER classified as a
+constant-sized copyable blob of bytes — a function pointer's value is a
+function-table index with no meaning outside the cage that produced it,
+so copying it byte-for-byte into another cage would hand that cage
+garbage it would silently trust. This is enforced in two independent
+places: `annotateComposite` (Infer.cpp) explicitly rejects a
+function-pointer field rather than falling through to the generic
+"pointer to scalar" classification, and `treeHasUnmappable`'s own final
+safety-net walk independently treats ANY `Pointer` node whose pointee is
+`NodeKind::Function` as unmappable — checked by pointee KIND directly,
+never by `sizeKind` — unless that specific node was itself resolved via
+a top-level callback contract (`isCallback`).
+
 ## Why analyze at a different optimization level than the shipped library
 
 `infer_openblas.sh` compiles the bitcode it feeds marshal-infer at a
@@ -472,5 +634,7 @@ nothing but a human noticing the number looked different.
   (`factored_bound_pos.c`/`factored_bound_neg.c`), the single-element
   fallback's required full local visibility (`dynamic_extent.c`), contract
   application + provenance, contract-vs-signature validation, and
-  stale/never-applied contracts (all hard errors), and coverage-threshold
-  enforcement.
+  stale/never-applied contracts (all hard errors), coverage-threshold
+  enforcement, and the callback-contract extension's own schema
+  round-trip, malformed-input, and ABI-lowering/mismatch tests
+  (`callback_contract.c`).

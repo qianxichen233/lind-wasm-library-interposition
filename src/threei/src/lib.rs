@@ -18,7 +18,8 @@ pub use lib_handler_table::{
 pub use lib_handler_table_v2::{
     add_v2_registration_ref, copy_lib_handler_table_v2_to_cage, get_lib_handler_v2,
     get_v2_registration_by_id, register_lib_handler_v2, register_lib_handler_v2_entry,
-    release_v2_registration_refs, rm_cage_from_lib_handler_table_v2, V2Registration,
+    release_v2_registration_refs, rm_cage_from_lib_handler_table_v2, CallbackArgContract,
+    CallbackLifetime, CallbackParamKind, CallbackRetKind, CallbackSignature, V2Registration,
 };
 pub use threei::*;
 pub use threei_const::*;

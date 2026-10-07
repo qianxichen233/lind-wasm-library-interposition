@@ -31,6 +31,19 @@ enum class NodeKind {
   Struct,  // composite record; children = fields
   Union,   // composite union; children = arms
   Array,   // fixed/!fixed array; child = element type
+  // A function type, reached as a pointer's pointee (a function-pointer
+  // argument -- the callback case).
+  // children[0] = the function's own return type tree (built the same
+  // way a void return is elsewhere: kind=Unknown, typeName="void");
+  // children[1:] = the function's own parameter type trees, in order --
+  // the SAME convention buildFunctionTrees already uses for the outer
+  // function being analyzed, reused here for the nested callback type.
+  // Not marshalable as ordinary data; a Pointer node whose pointee is
+  // NodeKind::Function is only resolvable via a reviewed callback
+  // contract (Config.h's CallbackRef/CallbackSignature) -- see
+  // TreeNode::isCallback below -- never by the ordinary pointer-sizing
+  // analysis.
+  Function,
   Unknown, // void* / unresolved / cycle-cut — residue
 };
 
@@ -116,6 +129,46 @@ struct ExtentOperand {
 enum class Confidence { Proven, Configured };
 const char *confidenceName(Confidence c);
 
+// One callback parameter's RESOLVED marshalling classification -- the
+// function-pointer analog of an ordinary pointer argument's dir/sizeKind
+// fields, but describing a parameter of the CALLBACK's own signature
+// rather than the host function's. Converted from Config.h's
+// CallbackParamContract by Infer.cpp (mirroring extentOperandFromContract/
+// dirFromContract's existing StrideVector conversion) once a reviewed
+// contract resolves the owning Pointer node -- see TreeNode::isCallback.
+// Always Confidence::Configured in effect: nothing infers a callback
+// body's own pointer bounds -- a callback parameter is resolvable only
+// via a reviewed contract.
+struct CallbackParamClassification {
+  bool isPointer = false;
+  Dir dir = Dir::NA;
+  SizeKind sizeKind = SizeKind::NA;
+  uint64_t constSize = 0;          // sizeKind==Const
+  int sizeArgIndex = -1;           // sizeKind==FromArg: index into the
+                                   // CALLBACK's own param list, never the
+                                   // host function's
+  ExtentOperand sizeOperand;       // sizeKind==StrideVector
+  ExtentOperand strideOperand;     // sizeKind==StrideVector
+  uint64_t strideElemSize = 0;     // sizeKind==StrideVector: per-element bytes
+  // "int32"|"int64"|"float32"|"float64" -- !isPointer only. The exact raw
+  // wasm value-type slot this scalar parameter occupies, validated
+  // against the callback's real DWARF parameter type before being
+  // trusted (Infer.cpp's classifyScalarAbiType) -- "some scalar" is not
+  // enough for the runtime descriptor to generate a correct call.
+  std::string scalarType;
+};
+
+// A callback's own return classification. FunctionPointer (a callback
+// that itself returns a callback) is represented so the schema does not
+// change shape once that case is supported, but nothing consumes it yet.
+enum class CallbackRetKind { Void, Scalar, FunctionPointer };
+const char *callbackRetKindName(CallbackRetKind k);
+
+struct CallbackReturnClassification {
+  CallbackRetKind kind = CallbackRetKind::Void;
+  std::string scalarType; // "int32"|"int64"|"float32"|"float64" when Scalar
+};
+
 // What the return value is / how it must be translated.
 enum class RetKind {
   Void,
@@ -183,6 +236,25 @@ struct TreeNode {
   // table, never deep-copy the pointee). E.g. FILE*, z_stream's state, toy_ctx.
   bool isHandle = false;
   std::string handleClass;  // canonical grouping key (the pointee type name)
+
+  // For Pointer nodes whose pointee is NodeKind::Function (a function-
+  // pointer argument): this argument resolved via a reviewed callback
+  // contract (Config.h's CallbackRef/CallbackSignature). Mutually
+  // exclusive with isHandle. These fields are COPIED from the resolved
+  // CallbackSignature at the point the contract is applied (Infer.cpp),
+  // the same "copy, don't keep a Config back-reference" convention
+  // sizeOperand/strideOperand/constSize already use for StrideVector --
+  // main.cpp's emission needs nothing beyond this node. A function-
+  // pointer argument with NO matching contract is left with isCallback
+  // false and falls through to the ordinary "unresolvable pointee —
+  // force_local" path, exactly as an opaque void* would.
+  bool isCallback = false;
+  std::string callbackSignatureId;
+  std::string callbackLifetime;      // "during_call" | "retained"
+  bool callbackNullable = false;
+  std::string callbackReentryPolicy;
+  std::vector<CallbackParamClassification> callbackParams;
+  CallbackReturnClassification callbackRet;
 
   // For Pointer-to-struct nodes: const-sized flat blit, inner pointers left
   // untranslated (not chased). Advisory — the copy uses the existing const path.
